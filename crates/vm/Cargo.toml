@@ -1,0 +1,9 @@
+[package]
+name = "vm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "net", "rt-multi-thread", "macros", "time", "io-util", "fs", "sync", "signal"] }
+qapi = { version = "0.15", features = ["qmp"] }
+thiserror = "2"

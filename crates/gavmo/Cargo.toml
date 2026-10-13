@@ -1,0 +1,62 @@
+[package]
+name = "gavmo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.8.0" }
+leptos_router = { version = "0.8.0" }
+leptos_meta = { version = "0.8.0" }
+serde = { version = "1", features = ["derive"] }
+
+# ssr-only (native server build) dependencies. None of these must ever be
+# pulled into the wasm32 hydrate build — see crates/gavmo/plan.md §5.
+axum = { version = "0.8.0", optional = true }
+leptos_axum = { version = "0.8.0", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "sync", "macros"], optional = true }
+serde_json = { version = "1", optional = true }
+dirs = { version = "6", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+vm = { path = "../vm", optional = true }
+
+# hydrate-only (wasm32 browser build) dependencies.
+console_error_panic_hook = { version = "0.1", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+hydrate = [
+    "leptos/hydrate",
+    "dep:console_error_panic_hook",
+    "dep:wasm-bindgen",
+]
+ssr = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:leptos_axum",
+    "dep:serde_json",
+    "dep:dirs",
+    "dep:uuid",
+    "dep:vm",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+    "leptos_axum/default",
+]
+
+[package.metadata.leptos]
+output-name = "gavmo"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "style/main.css"
+assets-dir = "public"
+site-addr = "127.0.0.1:3000"
+reload-port = 3001
+browserquery = "defaults"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
+lib-profile-release = "wasm-release"

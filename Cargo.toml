@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Size-optimized profile for the cargo-leptos WASM bundle in release mode.
+# Must live at the workspace root so cargo honors it for the member crate.
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = "abort"
