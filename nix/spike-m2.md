@@ -4,6 +4,11 @@
 > spike run on real NixOS/KVM hardware (no QEMU/KVM in the dev sandbox or workbench
 > sidecar) to prove the in-guest `nixos-rebuild` mechanism before committing to it as
 > the M2 implementation.
+>
+> **Status: ✅ spike complete, all rungs green on real NixOS/KVM hardware.** See §9
+> for the recorded results. §§1–7 are kept as-written (the plan as it was run);
+> §8's implementation has since been built — see `nix/base/configuration.nix`'s
+> `gavmo-rebuild` service and `environment.etc."gavmo/system"`.
 
 ## 0. Decisions already made (not re-litigated by this spike)
 
@@ -193,9 +198,17 @@ NR="nixos-rebuild --extra-experimental-features 'nix-command flakes'"
 3. **`gavmo-rebuild.service`**, ordered **before** `gavmo-opencode`: runs
    `nixos-rebuild test --flake /etc/gavmo/system#gavmo --impure`. On success, start
    `opencode web` in the now-activated system; on failure, surface the Nix error to
-   console/journal (and a daemon-visible status — don't fail silently), and either
-   degrade to the base config or mark the workspace failed (UX choice to make once
-   we see real failure modes).
+   console/journal (and a daemon-visible status — don't fail silently). **Resolved
+   as strict, not degrade:** `gavmo-opencode` both `after`s AND `requires`s this
+   service — a broken `gavmo.nix` means opencode never starts at all, rather than
+   silently falling back to the base config and letting the agent run with tools
+   it believes exist but doesn't (e.g. a `gavmo.nix` enabling Docker that failed to
+   build shouldn't leave an agent free to try `docker` commands against a system
+   that never got it). The debug console's getty units are also ordered
+   (`after`-only, so a failed rebuild is still debuggable) behind this service, so
+   a manual QEMU session doesn't drop into a shell mid-rebuild either — purely a
+   manual-testing nicety, irrelevant to the real product which has no interactive
+   console.
 4. **Daemon/UI (M3 surface):** add a "rebuilding env" status distinct from today's
    "`opencode` answering on the forwarded port" ready signal, and widen
    `BOOT_HEALTH_TIMEOUT` per R5's timings. Likely needs a small guest-side status
@@ -211,4 +224,140 @@ NR="nixos-rebuild --extra-experimental-features 'nix-command flakes'"
    that doc with what actually ships (`test`, not `switch`; the `vm` crate itself
    likely needs no code change, since the mechanism is entirely guest-side via the
    new systemd service — confirm this during implementation).
+
+## 9. Recorded results (real NixOS/KVM hardware)
+
+All rungs run against the Phase 1 `nix/base` refactor (`commonModules` +
+`nixosConfigurations.gavmo` + `disk.nix`), booted from the base image with
+`/workspace` = the gavmo repo itself, per §4's Setup.
+
+| Rung | Result |
+|---|---|
+| R1 (sanity build) | Implicitly covered by R2 succeeding first try — skipped as a separate step. |
+| **R2** — `nixos-rebuild build --flake /tmp/system#gavmo --impure` | ✅ **Green on the first attempt.** `disk.nix`'s replicated subset of `nixos-generators`' qcow format module matched the booted system with no iteration needed — the single biggest predicted risk did not materialize. |
+| **R3** — `./result/bin/switch-to-configuration test` | ✅ Clean activation. `gavmo-opencode` was **not even restarted** (same PID, continuous uptime), `/workspace` 9p mount stayed intact, and `opencode web` kept answering on the host-forwarded port throughout. No bootloader writes, no wedge. |
+| **R4** — sample `gavmo.nix` (`pkgs.jq` + `virtualisation.docker.enable`) | ✅ Full pass. `jq` landed on `PATH`; `docker.service`/`docker.socket` started live (new units, no reboot); `docker run --rm hello-world` succeeded end-to-end (image pull + container run). This is the proof point that justifies `gavmo.nix` over a devShell — a devShell cannot start a root daemon. |
+| **R5** — timings | Warm no-op rebuild: **2.3s**. One-line `gavmo.nix` package add: **4.2s build + 0.8s activate**. The R4 Docker-adding rebuild (new service + its full dependency closure): **< 30s total**. All comfortably inside the existing 5-minute `BOOT_HEALTH_TIMEOUT` (`crates/vm/src/handle.rs`) — **no timeout change was needed.** |
+
+**Verdict: V1–V4 all met.** Decision gate (§7) resolves to: proceed with the
+`gavmo.nix` rebuild mechanism as designed, implementation per §8 (now built).
+
+## 10. Bugs found validating the *baked* mechanism (Phase 3), and fixes
+
+§9's rungs ran the manual `cp -r /workspace/nix/base /tmp/system` loop (a plain
+filesystem copy). Once the real mechanism — `environment.etc."gavmo/system".source
+= ./.` baking the flake into the image, plus the `gavmo-rebuild.service` — was
+built and tested against an actual `nix build ./nix/base`, more issues surfaced
+that the manual loop couldn't have caught (the first two immediately; the third
+only once the §11 strict-failure/fast-fail path was exercised against a real
+abrupt VM kill):
+
+1. **Untracked files are invisible to flakes.** `disk.nix` was a new, not-yet-
+   `git add`ed file. Flakes only copy **git-tracked** files into their source
+   tree, so `/etc/gavmo/system` baked without it, and the in-guest rebuild failed
+   with `path '…/disk.nix' does not exist`. The manual spike loop used a plain
+   `cp -r` (no git involved), so it never hit this. **Fix:** `git add
+   nix/base/disk.nix` — staging is sufficient, no commit required. **Lesson:**
+   any new file added under `nix/base/` must be staged before `nix build`/the
+   in-guest rebuild will see it.
+2. **`network.target` isn't real connectivity.** `gavmo-rebuild` initially
+   ordered after only `network.target` (matching `gavmo-opencode`'s existing,
+   deliberate choice — see that service's comment). But `gavmo-rebuild` actually
+   needs to **fetch** packages a `gavmo.nix` adds that aren't already in the base
+   image's store (the sample's `jq` + `virtualisation.docker.enable` wasn't).
+   Running at ~3.8s into boot, before DHCP completed, it failed with `warning:
+   you don't have Internet access`. The manual spike loop ran long after boot
+   had settled, so it never hit this either. **Fix:** `gavmo-rebuild.service` now
+   `wants`/`after`s `network-online.target` instead. Accepted tradeoff: a worst-
+   case DHCP failure could stall this service up to systemd's default
+   wait-online timeout (~90s) — bounded and acceptable since `gavmo-opencode`
+   only orders after *this service's completion*, not after network-online
+   directly, so a stall eats into, not past, the 5-minute `BOOT_HEALTH_TIMEOUT`.
+3. **Nix's own cache isn't crash-safe, and lives on the persistent overlay by
+   default.** Surfaced only after the §11/strict-mode work landed: Nix runs its
+   fetcher-cache and eval-cache SQLite DBs under `~/.cache/nix` with `pragma
+   synchronous = off` (durability traded for speed — explicitly **not**
+   crash-safe). Our own fast-fail path (`RunningVm::boot` dropping the VM via
+   `kill_on_drop` on a detected `RebuildFailed`) — or simply a developer's
+   manual `Ctrl-a x` — can abruptly power off the guest mid-write to one of
+   these DBs. Because `/root/.cache/nix` sat on the **persistent** overlay disk
+   (same as everything else under `/root`), a half-written cache file survived
+   reboot and broke **every subsequent rebuild attempt** — including with a
+   perfectly valid `gavmo.nix` — with `error: executing SQLite statement
+   'pragma synchronous = off': file is not a database`. This is strictly worse
+   than the original failure: a workspace could get permanently stuck even
+   after the repo's `gavmo.nix` was fixed, with no obvious connection between
+   "I fixed my config" and "it's still broken." **Fix:** mount
+   `/root/.cache/nix` as `tmpfs` (RAM-backed, wiped every boot) — an abrupt
+   kill can still leave a half-written file, but it's in RAM and evaporates
+   with the crash, so there's never a persistent corrupt copy to poison a
+   later boot. Deliberately scoped to just `/root/.cache/nix`, not all of
+   `/root/.cache`: `/nix/store` (the actual expensive build cache) and
+   OpenCode's session SQLite (`/root/.local/share` — crash-safe, normal SQLite
+   settings, never at risk here) are untouched and stay persistent exactly as
+   before. **Self-healing property:** because the tmpfs mounts *over* the
+   existing path, it shadows (doesn't need to delete) whatever corrupt file is
+   already on an affected overlay — rebuilding the image and re-opening an
+   already-broken workspace fixes it with no manual `rm` required.
+4. **A successful rebuild doesn't mean the agent can see what it installed.**
+   Surfaced via dogfooding, after §11's validation below had already declared
+   victory on a `gavmo.nix` adding `pkgs.jq` — that validation only checked
+   that `nixos-rebuild test` *succeeded* (i.e. `jq` landed in
+   `/run/current-system/sw/bin`), not that the **agent** could actually run
+   it. It couldn't: `gavmo-opencode` runs as a systemd service, and services
+   get only systemd's minimal default `PATH` (coreutils/findutils/etc), never
+   `/run/current-system/sw/bin` — that directory only lands on a shell's
+   `PATH` via `/etc/profile`, which only **login** shells source. The debug
+   getty (a login shell) saw `jq` fine; the agent (a bare `ExecStart`, not a
+   login shell) got `jq: command not found` from every `bash`/`sh` call it
+   made, despite `jq` being correctly installed. This defeats the README's
+   "Customizing your repo's VM" promise that `environment.systemPackages`
+   doubles as the project's tools — the tools were there, just invisible to
+   the one consumer that mattered. (`environment.variables`/
+   `environment.sessionVariables` from a `gavmo.nix` had the same blind spot,
+   for the same underlying reason.) **Fix:** `gavmo-opencode`'s `ExecStart`
+   now sources `/etc/profile` itself (via NixOS's `script` option, same
+   pattern `gavmo-rebuild` already uses, rather than a raw `ExecStart`
+   string with its own `$VAR`/quoting rules) before `exec`ing opencode, then
+   re-prepends the `xdg-open` no-op shim that `/etc/profile`'s `PATH` reset
+   would otherwise have dropped. `environment.sessionVariables` is merged
+   into the service's own `environment=` directly, since it's PAM-delivered
+   and `/etc/profile` sourcing wouldn't pick it up. **Lesson:** "the rebuild
+   succeeded" and "the agent can use what the rebuild installed" are
+   different claims — a spike/test validating M2 needs to check from
+   *inside an agent session*, not just the rebuild's own exit code.
+
+All four fixed in `nix/base/configuration.nix`; re-validated with the **actual**
+baked image (not the manual `/tmp/system` copy).
+
+## 11. End-to-end validation of the baked mechanism, and a strictness hardening
+
+With both §10 fixes applied, a full boot with a sample `gavmo.nix`
+(`pkgs.jq` + `virtualisation.docker.enable`) on the real baked image (not the
+manual `/tmp/system` loop) passed completely: `gavmo-rebuild` started after
+real connectivity was up, fetched `jq` + moby/docker (~153 MiB) from
+`cache.nixos.org`, built the system closure, ran `switch-to-configuration
+test`, brought up `docker.socket` live, and **only then** started
+`gavmo-opencode` — all in ~24s including the package downloads, comfortably
+inside `BOOT_HEALTH_TIMEOUT`. `jq` and `docker` both worked from the shell
+afterward.
+
+This also surfaced a product decision that the original §8 plan had left open
+("degrade to base, or mark failed"): **resolved as strict** (see §8's updated
+text) — `gavmo-opencode` now both `after`s and `requires`s `gavmo-rebuild`, so
+a failing `gavmo.nix` blocks the agent entirely rather than silently running
+it against an environment missing its declared tools. The debug console's
+getty units got the same `after`-only treatment for the same reason a human
+manually testing shouldn't land on a shell mid-rebuild either (not relevant to
+the real product, which has no interactive console).
+
+**Follow-up debt from strict mode — resolved.** The gap this left (a failing
+`gavmo.nix` surfacing only as a generic 5-minute `BOOT_HEALTH_TIMEOUT`, with
+the real Nix error unreachable once console logging was turned off) is closed:
+`gavmo-rebuild.service` now writes a timestamped log + failure marker into
+`/workspace/.gavmo/vm/` (host-visible — see `nix/base/configuration.nix`'s
+`gavmo-rebuild` comment block), `crates/vm::RunningVm::boot` races that marker
+against the health probe for a fast (seconds, not minutes) failure, and
+`crates/gavmo` surfaces it as a `BuildFailed` status with an in-UI "View build
+log" action. Full details in `gavmo-mvp-plan.md`'s M2 section.
 </content>

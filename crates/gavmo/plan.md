@@ -197,7 +197,13 @@ version bump if "Open UI" stops deep-linking.
 ## 10. Explicitly out of scope for this slice
 
 - `gavmo.nix` / per-repo rebuild (M2 — deferred, separate milestone).
-- A "Reset" button (stop + delete the VM overlay disk) — Open/Stop/Status only for now.
+- A "Reset" button (stop + delete the VM overlay disk) — Open/Stop/Status only for
+  this M3 slice. **Added later**, outside this milestone, as the escape hatch for
+  "an overlay's backing file is pinned at creation time (`vm::disk::ensure_overlay`),
+  so rebuilding the base image does nothing for a workspace that already has one" —
+  see `gavmo-mvp-plan.md`'s "Reset workspace button" entry. Implemented in
+  `AppState::reset_workspace` (`crates/gavmo/src/registry.rs`) and the
+  `WorkspaceRow` confirm-toggle in `crates/gavmo/src/app.rs`.
 - Automating the base-image build (`nix build`) — still a manual step; the daemon only
   consumes an already-built qcow2 path.
 - Any non-Linux support.
@@ -208,8 +214,10 @@ version bump if "Open UI" stops deep-linking.
 
 - **In the sidecar:** the entire UI/server-function layer builds and runs via
   `cargo leptos build` / `cargo leptos watch` — no KVM needed for this.
-  `registry.rs`'s `OPENCODE_WORKSPACE_SESSION_PATH` derivation has a `cargo test`
-  covering it (`cargo test -p gavmo --features ssr --no-default-features`).
+  `registry.rs`'s `OPENCODE_WORKSPACE_SESSION_PATH` derivation, the build-log
+  filename validation, and `reset_workspace`'s idempotent-delete step
+  (`remove_dir_all_idempotent`) all have `cargo test` coverage
+  (`cargo test -p gavmo --features ssr --no-default-features`).
 - **On the real NixOS host — ✅ done:** the full `open_workspace` →
   `vm::RunningVm::boot()` → browser → OpenCode flow, driven through the daemon's UI
   (not just the `crates/vm/examples/boot.rs` CLI example), confirmed working

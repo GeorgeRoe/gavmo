@@ -34,6 +34,17 @@ pub enum Error {
 
     #[error("vm did not become healthy within {0:?}")]
     HealthTimeout(Duration),
+
+    /// The guest's `gavmo-rebuild` service (M2 — see
+    /// `nix/base/configuration.nix`) failed to apply the repo's `gavmo.nix`.
+    /// Detected via the `rebuild-failed` marker file in `VmConfig::state_dir`
+    /// (host-visible over the 9p `/workspace` share), which the guest writes
+    /// instead of ever starting opencode — this resolves much faster than
+    /// waiting out [`Error::HealthTimeout`]. `log_file` is the filename
+    /// (relative to `state_dir`) of the full `nixos-rebuild` output, for the
+    /// caller to surface/read.
+    #[error("gavmo.nix failed to build - see {log_file}")]
+    RebuildFailed { log_file: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use vm::{RunningVm, VmConfig, VmStatus};
+use vm::{Error as VmError, RunningVm, VmConfig, VmStatus};
 
 use crate::app::{WorkspaceInfo, WorkspaceStatus};
 
@@ -88,6 +88,13 @@ enum VmSlot {
     /// The last boot attempt failed; kept around so the reason is visible
     /// in the UI until the next `open_workspace` call replaces it.
     Failed(String),
+    /// M2: the repo's `gavmo.nix` failed to build (`vm::Error::RebuildFailed`,
+    /// detected within seconds via the guest's failure marker rather than a
+    /// full boot-health timeout — see `nix/base/configuration.nix`'s
+    /// `gavmo-rebuild` service). `log` is the failed run's log filename
+    /// (relative to the workspace's `.gavmo/vm` state dir), fetchable via
+    /// [`AppState::read_build_log`].
+    BuildFailed { log: String },
 }
 
 impl AppState {
@@ -167,8 +174,11 @@ impl AppState {
             match running.get(id) {
                 // Already booting or running: nothing to do.
                 Some(VmSlot::Booting | VmSlot::Running(_)) => return Ok(()),
-                // No entry, or the last attempt failed: (re)boot below.
-                Some(VmSlot::Failed(_)) | None => {}
+                // No entry, or the last attempt failed (generically or a
+                // broken `gavmo.nix`): (re)boot below. Retrying after
+                // `BuildFailed` is the expected path once the user fixes
+                // `gavmo.nix`.
+                Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
             }
             running.insert(id.to_string(), VmSlot::Booting);
         }
@@ -207,7 +217,13 @@ impl AppState {
                     let _ = vm.stop().await;
                 }
                 Err(e) if still_wanted => {
-                    running.insert(id, VmSlot::Failed(e.to_string()));
+                    let slot = match &e {
+                        VmError::RebuildFailed { log_file } => VmSlot::BuildFailed {
+                            log: log_file.clone(),
+                        },
+                        _ => VmSlot::Failed(e.to_string()),
+                    };
+                    running.insert(id, slot);
                 }
                 Err(_) => {}
             }
@@ -225,15 +241,52 @@ impl AppState {
         let slot = self.inner.running.lock().await.remove(id);
         match slot {
             Some(VmSlot::Running(vm)) => vm.stop().await.map_err(|e| e.to_string()),
-            Some(VmSlot::Booting | VmSlot::Failed(_)) | None => Ok(()),
+            Some(VmSlot::Booting | VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => Ok(()),
         }
+    }
+
+    /// Stops the VM for a workspace (if running/booting) and deletes its
+    /// entire persistent state dir (`<repo>/.gavmo/vm` — the overlay disk,
+    /// console log, QMP socket, and any M2 rebuild log/marker). The next
+    /// `open_workspace` recreates a fresh overlay from the **current** base
+    /// image.
+    ///
+    /// This is the general recovery/escape-hatch action for a wedged
+    /// workspace, and specifically the fix for "the base image was rebuilt
+    /// but this workspace's overlay is still pinned to the old one" (see
+    /// `vm::disk::ensure_overlay` — an overlay's backing file is fixed at
+    /// creation time; rebuilding the base image alone does nothing for
+    /// workspaces that already have an overlay).
+    ///
+    /// **Destructive**: discards OpenCode's session history and the warm
+    /// `/nix` store cache for this workspace. No undo. The caller (a
+    /// `#[server]` function) is expected to have already gotten explicit
+    /// user confirmation — this method itself does not prompt.
+    ///
+    /// If the workspace is `Booting`, the `Booting` marker is removed
+    /// immediately (same eventually-consistent handling as
+    /// [`Self::stop_workspace`]) so a fresh boot can start right away,
+    /// rather than blocking on the in-flight boot. If that boot was about to
+    /// succeed, `open_workspace`'s background task will notice it's no
+    /// longer wanted and stop the VM itself — there's a small, accepted
+    /// window where that cleanup could still be touching the overlay this
+    /// deletes. Only the `Running` case can be made fully race-free (we
+    /// `stop()` and wait for qemu to actually exit before touching its
+    /// disk), which is why it's handled specially below.
+    pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
+        let slot = self.inner.running.lock().await.remove(id);
+        if let Some(VmSlot::Running(vm)) = slot {
+            let _ = vm.stop().await;
+        }
+
+        remove_dir_all_idempotent(&Self::state_dir_for(id)).await
     }
 
     /// Builds the per-VM [`VmConfig`] for a workspace path, allocating a
     /// fresh host port from the OS.
     fn vm_config(&self, id: &str) -> io::Result<VmConfig> {
         let repo_dir = PathBuf::from(id);
-        let state_dir = repo_dir.join(".gavmo").join("vm");
+        let state_dir = Self::state_dir_for(id);
         let workspace_id = repo_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -251,6 +304,57 @@ impl AppState {
             host_port,
         })
     }
+
+    /// The conventional per-workspace state dir (`<repo>/.gavmo/vm` — see
+    /// `vm::VmConfig::state_dir` / `plan.md`). A free function of `id` rather
+    /// than something stored, since [`Self::read_build_log`] needs it even
+    /// when there's no live `VmConfig` in scope (a `BuildFailed` slot can
+    /// outlive the boot attempt that produced it).
+    fn state_dir_for(id: &str) -> PathBuf {
+        PathBuf::from(id).join(".gavmo").join("vm")
+    }
+
+    /// Reads a build-failure log written by the guest's M2 `gavmo-rebuild`
+    /// service (`nix/base/configuration.nix`) for the UI's "view build log"
+    /// action. `log` must be exactly the filename reported in a workspace's
+    /// `BuildFailed` status — validated strictly (see
+    /// [`is_safe_rebuild_log_filename`]) since it becomes part of a
+    /// filesystem path and nothing else constrains what a client can send a
+    /// server function.
+    pub async fn read_build_log(&self, id: &str, log: &str) -> io::Result<String> {
+        if !is_safe_rebuild_log_filename(log) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid build log filename",
+            ));
+        }
+        tokio::fs::read_to_string(Self::state_dir_for(id).join(log)).await
+    }
+}
+
+/// Deletes a directory tree, treating "already gone" as success rather than
+/// an error. Used by [`AppState::reset_workspace`] for `<repo>/.gavmo/vm`:
+/// a workspace that was never opened (or was already reset) has no state
+/// dir at all, and that's a perfectly fine outcome for a "make sure this is
+/// gone" action — not a failure the caller needs to handle specially.
+async fn remove_dir_all_idempotent(path: &Path) -> io::Result<()> {
+    match tokio::fs::remove_dir_all(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()), // already gone
+        Err(e) => Err(e),
+    }
+}
+
+/// `true` only for filenames shaped exactly like what `gavmo-rebuild` writes
+/// (`rebuild-<UTC timestamp>.log` — see `nix/base/configuration.nix`): no
+/// path separators, no `..`, nothing that could escape the workspace's state
+/// dir via a crafted server-function argument.
+fn is_safe_rebuild_log_filename(name: &str) -> bool {
+    name.starts_with("rebuild-")
+        && name.ends_with(".log")
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
 }
 
 /// Maps a [`VmSlot`] to the serializable view type shared with the browser,
@@ -264,6 +368,7 @@ async fn slot_status(slot: &mut VmSlot) -> WorkspaceStatus {
         VmSlot::Failed(reason) => WorkspaceStatus::Failed {
             reason: reason.clone(),
         },
+        VmSlot::BuildFailed { log } => WorkspaceStatus::BuildFailed { log: log.clone() },
     }
 }
 
@@ -367,5 +472,94 @@ mod tests {
                 url: "http://127.0.0.1:4096/L3dvcmtzcGFjZQ/session".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn to_status_maps_rebuild_failed_to_build_failed() {
+        let err = VmError::RebuildFailed {
+            log_file: "rebuild-2026-01-01T00-00-00Z.log".to_string(),
+        };
+        // Mirrors the `match &e` in `open_workspace`'s background task -
+        // exercised directly here since that task itself isn't unit-testable
+        // without a real `RunningVm::boot`.
+        let slot = match &err {
+            VmError::RebuildFailed { log_file } => VmSlot::BuildFailed {
+                log: log_file.clone(),
+            },
+            _ => VmSlot::Failed(err.to_string()),
+        };
+        assert!(matches!(
+            slot,
+            VmSlot::BuildFailed { log } if log == "rebuild-2026-01-01T00-00-00Z.log"
+        ));
+    }
+
+    /// Guards the one real attack surface in `read_build_log`: a client
+    /// fully controls the `log` argument of a `#[server]` function, and it
+    /// becomes part of a filesystem path.
+    #[test]
+    fn rebuild_log_filename_safety() {
+        // Shaped exactly like what `gavmo-rebuild` writes.
+        assert!(is_safe_rebuild_log_filename(
+            "rebuild-2026-10-13T10-10-32Z.log"
+        ));
+
+        // Path traversal / escape attempts.
+        assert!(!is_safe_rebuild_log_filename("../../../etc/passwd"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-../../secret.log"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-foo/../bar.log"));
+        assert!(!is_safe_rebuild_log_filename(
+            "/etc/gavmo/system/flake.nix"
+        ));
+        assert!(!is_safe_rebuild_log_filename("rebuild-foo\\bar.log"));
+
+        // Wrong shape entirely.
+        assert!(!is_safe_rebuild_log_filename("not-a-rebuild-log.txt"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-no-extension"));
+        assert!(!is_safe_rebuild_log_filename(""));
+    }
+
+    /// A unique scratch dir under the OS temp dir, named with the test's own
+    /// identity (PID + a monotonic counter) so concurrent `cargo test`
+    /// threads can't collide. No `tempfile` crate dependency needed for
+    /// this one narrow use.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "gavmo-test-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// [`AppState::reset_workspace`]'s core guarantee, exercised directly on
+    /// [`remove_dir_all_idempotent`] (the `AppState` method itself also
+    /// touches the `running` map and the real registry dir, which isn't
+    /// worth standing up just to test "delete this directory tree"):
+    /// deletes a populated state dir, including nested files, in one shot.
+    #[tokio::test]
+    async fn remove_dir_all_idempotent_deletes_an_existing_tree() {
+        let dir = unique_temp_dir("reset-exists");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("disk.qcow2"), b"fake overlay")
+            .await
+            .unwrap();
+
+        remove_dir_all_idempotent(&dir).await.unwrap();
+
+        assert!(!dir.exists());
+    }
+
+    /// The other half of "delete this directory tree" being a safe,
+    /// idempotent escape hatch: a workspace that was never opened (or was
+    /// already reset) has no state dir at all, and that must be `Ok(())`,
+    /// not a `NotFound` error the UI would otherwise have to special-case.
+    #[tokio::test]
+    async fn remove_dir_all_idempotent_is_a_noop_when_already_gone() {
+        let dir = unique_temp_dir("reset-missing");
+        assert!(!dir.exists());
+
+        remove_dir_all_idempotent(&dir).await.unwrap();
     }
 }

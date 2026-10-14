@@ -59,4 +59,15 @@ impl VmConfig {
     pub fn console_log_path(&self) -> PathBuf {
         self.state_dir.join("console.log")
     }
+
+    /// Path to the M2 `gavmo-rebuild` failure marker (see
+    /// `nix/base/configuration.nix`). Written by the guest, inside
+    /// `state_dir`, only when a repo's `gavmo.nix` fails to build — its
+    /// *contents* are the filename (also under `state_dir`) of the full
+    /// `nixos-rebuild` log. Host-visible because `state_dir` is conventionally
+    /// `<repo>/.gavmo/vm`, which is `/workspace/.gavmo/vm` from the guest's
+    /// side of the 9p share.
+    pub fn rebuild_failed_marker_path(&self) -> PathBuf {
+        self.state_dir.join("rebuild-failed")
+    }
 }

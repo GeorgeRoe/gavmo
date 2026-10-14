@@ -4,7 +4,15 @@
 //! definition of healthy. This is a minimal raw HTTP probe rather than a
 //! full HTTP client, since we don't otherwise need an HTTP client
 //! dependency in this crate.
+//!
+//! During boot we also race that probe against the M2 `gavmo-rebuild`
+//! failure marker (see `VmConfig::rebuild_failed_marker_path` and
+//! `nix/base/configuration.nix`) — a repo's broken `gavmo.nix` means
+//! opencode will never start, so waiting for [`Error::HealthTimeout`] alone
+//! would take the full boot timeout to report what's actually a fast,
+//! already-known failure.
 
+use std::path::Path;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,14 +24,26 @@ use crate::error::{Error, Result};
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Polls `127.0.0.1:port` with a minimal HTTP GET until it responds or
-/// `overall_timeout` elapses.
-pub async fn wait_for_http(port: u16, overall_timeout: Duration) -> Result<()> {
+/// Polls `127.0.0.1:port` until `opencode web` answers, the `gavmo-rebuild`
+/// failure marker at `marker_path` appears, or `overall_timeout` elapses —
+/// whichever comes first.
+///
+/// The marker file's contents are the filename (relative to the marker's own
+/// parent directory, i.e. `VmConfig::state_dir`) of the full `nixos-rebuild`
+/// log, which is threaded through as [`Error::RebuildFailed::log_file`] for
+/// the caller to surface.
+pub async fn wait_for_ready(port: u16, marker_path: &Path, overall_timeout: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + overall_timeout;
 
     loop {
         if probe_once(port).await {
             return Ok(());
+        }
+
+        if let Ok(contents) = tokio::fs::read_to_string(marker_path).await {
+            return Err(Error::RebuildFailed {
+                log_file: contents.trim().to_string(),
+            });
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -83,9 +103,44 @@ mod tests {
         assert!(!probe_once(1).await);
     }
 
+    /// A nonexistent marker path must never be mistaken for a failure —
+    /// `read_to_string` erroring (NotFound) is the expected "no marker yet"
+    /// state, not something that should short-circuit the wait.
     #[tokio::test]
-    async fn wait_for_http_times_out_when_nothing_ever_responds() {
-        let result = wait_for_http(1, Duration::from_millis(600)).await;
+    async fn wait_for_ready_times_out_when_nothing_ever_responds_and_no_marker_appears() {
+        let dir = std::env::temp_dir().join(format!(
+            "gavmo-health-test-{}-{}",
+            std::process::id(),
+            "notimeout"
+        ));
+        let marker = dir.join("rebuild-failed"); // deliberately never created
+
+        let result = wait_for_ready(1, &marker, Duration::from_millis(600)).await;
         assert!(matches!(result, Err(Error::HealthTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_detects_the_rebuild_failure_marker_before_the_timeout() {
+        let dir = std::env::temp_dir().join(format!(
+            "gavmo-health-test-{}-{}",
+            std::process::id(),
+            "marker"
+        ));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let marker = dir.join("rebuild-failed");
+        tokio::fs::write(&marker, "rebuild-2026-01-01T00-00-00Z.log\n")
+            .await
+            .unwrap();
+
+        // Port 1 never answers; a long overall_timeout proves the marker
+        // check — not a timeout — is what resolves this.
+        let result = wait_for_ready(1, &marker, Duration::from_secs(30)).await;
+        assert!(matches!(
+            result,
+            Err(Error::RebuildFailed { log_file })
+                if log_file == "rebuild-2026-01-01T00-00-00Z.log"
+        ));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

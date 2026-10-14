@@ -58,7 +58,7 @@ This is the fixed interface between this crate (host side) and the NixOS base im
 | workspace share | 9p, `mount_tag=workspace` → guest mounts `/workspace`, `cache=none,msize=1048576,rw` |
 | creds share | 9p, `mount_tag=gcloud`, `readonly=on` → guest `/etc/gavmo/gcloud`, read-only; `GOOGLE_APPLICATION_CREDENTIALS` points inside |
 | guest OpenCode port | fixed `7080`; guest runs `opencode web --hostname 0.0.0.0 --port 7080` |
-| bootstrap | guest reads `/workspace/gavmo.nix` → runs `nixos-rebuild switch` → launches `opencode web` |
+| bootstrap | guest reads `/workspace/gavmo.nix` → runs `nixos-rebuild test` → launches `opencode web` (M2, entirely guest-side — see `nix/spike-m2.md`; no `vm`-crate code change expected) |
 | control channel | QMP over a unix socket at `.gavmo/vm/qmp.sock` |
 
 Cache mode, `msize`, and mount tags are **guest-side mount options** baked into the

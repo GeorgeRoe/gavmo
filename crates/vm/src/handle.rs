@@ -5,12 +5,21 @@ use tokio::process::Child;
 use crate::config::VmConfig;
 use crate::disk::ensure_overlay;
 use crate::error::Result;
-use crate::health::{probe_once, wait_for_http};
+use crate::health::{probe_once, wait_for_ready};
 use crate::qemu::spawn_qemu;
 use crate::qmp;
 use crate::share::{NinePShare, ShareBackend, ShareSpec};
 
 /// How long to wait for `opencode web` to become reachable during boot.
+///
+/// Also covers M2's `gavmo-rebuild` step (in-guest `nixos-rebuild test`,
+/// which runs before `opencode web` starts if the repo has a `gavmo.nix` —
+/// see `nix/base/configuration.nix` and `nix/spike-m2.md`). The M2 spike's
+/// recorded timings (`nix/spike-m2.md` §9) found this adds only seconds to
+/// low tens-of-seconds even when pulling in a whole new service (Docker),
+/// comfortably inside the existing budget below — no widening needed based
+/// on that evidence. Revisit if a real repo's `gavmo.nix` proves much
+/// heavier (e.g. a large toolchain fetch on a slow link).
 const BOOT_HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long to wait for a graceful ACPI shutdown before force-killing.
@@ -74,11 +83,27 @@ impl RunningVm {
         let shares: Vec<(&dyn ShareBackend, ShareSpec)> =
             vec![(&nine_p, workspace_share), (&nine_p, gcloud_share)];
 
+        // Clear a stale M2 failure marker from a previous boot attempt
+        // before this one starts, so `wait_for_ready` below can't mistake
+        // leftover state for this boot's own result. `ensure_overlay` above
+        // already created `state_dir`, so this is just a best-effort remove
+        // (ignore "doesn't exist", which is the common case).
+        let _ = tokio::fs::remove_file(cfg.rebuild_failed_marker_path()).await;
+
         let (qemu, helpers) = spawn_qemu(&cfg, &shares).await?;
         let host_port = cfg.host_port;
+        let marker_path = cfg.rebuild_failed_marker_path();
         let vm = RunningVm { cfg, qemu, helpers };
 
-        wait_for_http(host_port, BOOT_HEALTH_TIMEOUT).await?;
+        // Races opencode's port answering against the guest's M2
+        // rebuild-failure marker appearing — see `health::wait_for_ready`
+        // and `nix/base/configuration.nix`'s `gavmo-rebuild` service. On
+        // `Err`, `vm` is dropped here without calling `stop()`; its `Child`
+        // has `kill_on_drop` set (see `qemu::spawn_qemu`), so the qemu
+        // process is still torn down — the failure log on the host's
+        // `state_dir` is unaffected since it's written to disk, not held by
+        // the dying guest process.
+        wait_for_ready(host_port, &marker_path, BOOT_HEALTH_TIMEOUT).await?;
 
         Ok(vm)
     }

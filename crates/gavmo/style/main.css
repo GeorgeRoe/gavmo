@@ -65,6 +65,28 @@ button.primary {
   color: #fff;
 }
 
+button.danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--err);
+  color: #fff;
+}
+
+.reset-confirm {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.reset-confirm-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 .ws {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -158,4 +180,35 @@ a {
   color: var(--err);
   font-size: 0.85rem;
   margin: 0.5rem 0;
+}
+
+.build-log-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  margin-top: 1rem;
+}
+
+.build-log-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.5rem;
+}
+
+.build-log {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
