@@ -36,7 +36,7 @@ A **Linux-only, solo proof-of-concept** that proves one loop end-to-end:
 - 9p `/workspace` (live host repo dir, read-write) and `/etc/gavmo/gcloud` (read-only ADC).
 - Vertex AI via mounted ADC credentials.
 - `opencode web` port-forwarded to the host.
-- Lifecycle: Open / Stop / Status / Reset (with live status polling in the UI).
+- Lifecycle: Open / Stop / Status / Reset / Remove (with live status polling in the UI).
 - Multiple concurrent workspaces.
 - Per-workspace state: VM overlay disk under the repo's `.gavmo/` (gitignored).
 
@@ -390,6 +390,92 @@ the only fix was deleting `.gavmo/vm` by hand on the host.
   rebuild attempt even after fixing the `gavmo.nix` that caused the original
   failure. Fixed by mounting `/root/.cache/nix` as `tmpfs` (wiped every boot) —
   see `nix/spike-m2.md` §10 finding 3 and `nix/base/configuration.nix`.
+
+### Robustness/UX polish pass ✅ done
+
+A follow-up pass on the control panel, after dogfooding surfaced both a real race
+condition and some rough UX edges. All in `crates/gavmo/src/registry.rs` /
+`crates/gavmo/src/app.rs` / `crates/gavmo/style/main.css`:
+
+- **Race-free Reset/Stop during a `Booting` VM.** `VmSlot::Booting` previously
+  carried no handle, so reset/stop could only remove the in-memory marker and
+  rely on the in-flight boot task to *eventually* notice and clean up itself —
+  reset in particular could delete `.gavmo/vm` while that cleanup (or the boot
+  itself) was still touching the overlay. `VmSlot::Booting` now carries the
+  boot task's own `tokio::task::JoinHandle`; `stop_workspace`/`reset_workspace`
+  `abort()` it and `await` the result, so qemu is *guaranteed* gone (via
+  `kill_on_drop` on an aborted boot, or the task's own graceful self-stop if it
+  won the race) before either function returns. Covered by two tests
+  (`stop_workspace_aborts_an_in_flight_boot_promptly`,
+  `reset_workspace_aborts_an_in_flight_boot_before_deleting_state`) that spawn
+  a deliberately never-finishing dummy boot task and assert the call returns
+  well within a bounded timeout rather than hanging. Accepted tradeoff: `stop`
+  can now rarely block up to `SHUTDOWN_TIMEOUT` + `QUIT_TIMEOUT` (~35s) if it
+  races a boot that wins and completes a graceful shutdown instead of being
+  cleanly aborted — judged better than the previous instant-but-not-actually-
+  stopped-yet return.
+- **Remove a workspace.** No way previously existed to un-add a mistaken
+  workspace. `AppState::remove_workspace` stops the VM (reusing the now
+  race-free `stop_workspace`) and drops it from the registry —
+  **non-destructive**, unlike Reset: `.gavmo/vm` is left untouched, so
+  re-adding the same path later finds its old overlay/session history again.
+  Same inline two-step confirm UI pattern as Reset (its own
+  `confirming_remove` signal; opening one confirm closes the other).
+  Deliberately not unit-tested directly: unlike `reset_workspace`, it calls
+  `save_registry`, which would write the real shared
+  `~/.local/share/gavmo/workspaces.json` from a test run.
+- **Buttons follow live status, not just a local busy flag.** Open/Stop/Reset
+  used to only disable for the ~couple-hundred-ms of their own fire-and-forget
+  call, leaving all three clickable throughout an entire multi-minute boot —
+  which was also how a user could reach Reset while `Booting` and hit the race
+  above. Disabled state now also keys off the polled `ws.status` (Open: off
+  while `Booting`/`Running`; Stop: off unless one of those; Reset: off while
+  `Booting`, belt-and-suspenders with the fix above).
+- **Stop/Reset/Remove failures are visible.** Previously only `Open`'s failure
+  reached the UI; a failed `stop`/`reset` just logged to the browser console.
+  Generalized into one shared `action_error` per row.
+- **Workspace rows show a name, not just a path.** The repo basename is now
+  the bold primary label, with the full absolute path as muted secondary
+  text underneath (full path kept — it's still the workspace's real identity,
+  see `WorkspaceRecord`).
+- **Folder picker accepts a typed path.** The click-through browser hides
+  dotfiles/dirs and had no way to jump straight to a known location; a text
+  input + "Go" (plus Enter) now sets the browser's current directory directly,
+  reusing `browse_dir`'s existing canonicalization/error handling.
+- **A boot-in-progress hint.** A static note under a `Booting` row ("first
+  boot can take a few minutes…") — deliberately static rather than a live
+  elapsed-time counter, since rows are recreated wholesale on every ~3s poll
+  (see `OpenBuildLog`'s doc comment in `app.rs`) and a real timer would need
+  the same kind of state-lifted-to-`HomePage` treatment that required.
+
+  **Superseded by the grid redesign immediately below** — the "rows are
+  recreated wholesale" constraint this bullet (and `OpenBuildLog`) worked
+  around no longer exists; `WorkspaceCard`s are now mounted once and never
+  torn down by polling, so this tradeoff doesn't apply to the hint, or
+  anything else, anymore.
+
+### Grid redesign + stable-card rendering ✅ done
+
+Replaced the single-column workspace list with a grid of compact, expand-on-click
+`WorkspaceCard`s, visually restyled around aihero.dev's collapsed-border
+section/grid technique (a dark, info-dense control panel borrowing that site's
+*border/typography language*, not its marketing-page layout). Full technical
+writeup — the rendering-architecture fix this required (stable, poll-surviving
+cards via a keyed `<For>` + per-card `Memo`), the `StoredValue<String>` fix for a
+genuine Rust borrow-checker wall hit along the way, and the CSS technique itself —
+lives in `crates/gavmo/plan.md` §13.
+
+In short: `OpenBuildLog`'s lift-state-to-`HomePage` workaround is gone (no longer
+needed — cards survive polling on their own now), the list is now a responsive
+grid (`repeat(auto-fill, minmax(260px, 1fr))`) with single-pixel hairlines between
+cards, and an expanded card spans the full grid width to host its (taller,
+variable-height) detail panel without making the grid ragged.
+
+**Deliberately deferred to a follow-up phase:** a live "what's this VM doing" view
+inside an expanded card — streaming the guest's boot console while `Booting`,
+host-side CPU/mem/uptime stats while `Running`. The stable per-card architecture
+above was built with this in mind (each `WorkspaceCard` is now a natural, stable
+place to poll its own live data) but the feature itself isn't built yet.
 
 ## 5. Actual layout (as of M3)
 

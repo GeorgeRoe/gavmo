@@ -204,6 +204,11 @@ version bump if "Open UI" stops deep-linking.
   see `gavmo-mvp-plan.md`'s "Reset workspace button" entry. Implemented in
   `AppState::reset_workspace` (`crates/gavmo/src/registry.rs`) and the
   `WorkspaceRow` confirm-toggle in `crates/gavmo/src/app.rs`.
+- A "Remove" action (forget a workspace without touching its disk state), live-
+  status-aware button disabling, and surfaced stop/reset errors — all **added
+  later**, outside this milestone, in the same robustness/UX pass as a race-free
+  fix for Reset/Stop during an in-flight boot. See `gavmo-mvp-plan.md`'s
+  "Robustness/UX polish pass" entry.
 - Automating the base-image build (`nix build`) — still a manual step; the daemon only
   consumes an already-built qcow2 path.
 - Any non-Linux support.
@@ -217,7 +222,13 @@ version bump if "Open UI" stops deep-linking.
   `registry.rs`'s `OPENCODE_WORKSPACE_SESSION_PATH` derivation, the build-log
   filename validation, and `reset_workspace`'s idempotent-delete step
   (`remove_dir_all_idempotent`) all have `cargo test` coverage
-  (`cargo test -p gavmo --features ssr --no-default-features`).
+  (`cargo test -p gavmo --features ssr --no-default-features`). The
+  race-free-abort guarantee for `stop_workspace`/`reset_workspace` during a
+  `Booting` VM is also covered this way — by spawning a dummy boot task that
+  sleeps far longer than any sane test timeout and asserting the call returns
+  promptly (`stop_workspace_aborts_an_in_flight_boot_promptly`,
+  `reset_workspace_aborts_an_in_flight_boot_before_deleting_state`) — real
+  `qemu`/KVM isn't needed to exercise the abort/await mechanism itself.
 - **On the real NixOS host — ✅ done:** the full `open_workspace` →
   `vm::RunningVm::boot()` → browser → OpenCode flow, driven through the daemon's UI
   (not just the `crates/vm/examples/boot.rs` CLI example), confirmed working
@@ -250,3 +261,84 @@ piece of opencode-web UX work in the same arc — patching opencode's own source
 several useful web-UI panels are on by default. See `gavmo-mvp-plan.md`'s **M1.6** for
 that; it's not part of this crate's scope but pairs naturally with the §9 deep-link
 (both exist to make the opencode web UI a better experience by default).
+
+## 13. Grid redesign + stable-card rendering ✅ done
+
+A visual/structural rework of §8's single-column workspace list, done in two parts:
+a rendering-architecture fix that was a prerequisite for the second part, and the
+grid/visual restyle itself (inspired by aihero.dev's collapsed-border section/card
+technique — see `gavmo-mvp-plan.md` for the fuller writeup of that research).
+
+**Rendering architecture: cards are now mounted once and never torn down by
+polling.** The original list rendered via `<Transition>` + `Suspend` over a
+`Resource` — on every ~3s poll, the resource resolved to a *brand new* value and
+the whole row list was rebuilt from scratch. Any state local to a row (the build-log
+viewer, in the old `OpenBuildLog`) had to be lifted up to `HomePage` to survive that
+rebuild — a workaround, not a fix, and one that would have had to be repeated for
+expand-on-click state and (later) any live view. Replaced with:
+- `HomePage` copies each resolved `Resource` value into a persistent
+  `RwSignal<Vec<WorkspaceInfo>>` via an `Effect`, and renders via a **keyed
+  `<For>`** over just the ids. `<For>` then diffs by key instead of rebuilding
+  wholesale — an existing id's `WorkspaceCard` is never unmounted just because
+  its status changed.
+- Each `WorkspaceCard` derives its own live status via a `Memo` that looks itself
+  up by id in that same shared signal — so status/path stay reactive without the
+  card itself being recreated.
+- Net effect: `expanded`, `busy`, the confirm toggles, and the build-log viewer's
+  fetched text are now ordinary signals declared once inside `WorkspaceCard` — no
+  more lifting state up to `HomePage`. `OpenBuildLog` is deleted.
+- Accepted tradeoff: this list no longer participates in SSR streaming (`Effect`s
+  are client-only), so the server-rendered HTML always shows "Loading…" until
+  hydration runs once. Not worth avoiding for a localhost-only control panel with
+  no SEO/first-paint stakes; see the doc comment on `workspaces` in `app.rs`.
+
+**The `StoredValue<String>` fix for nested `move` closures.** Converting the
+detail section into `<Show when=move || expanded.get()>...</Show>` (needed for
+expand-on-click) surfaced a real, somewhat surprising Rust borrow-checker wall:
+`Show`'s children must implement `Fn` (callable repeatedly, since `when` can flip
+back and forth), but several of its descendant reactive closures (the Reset/Remove
+confirm toggles, the build-log button) were themselves nested `move` closures each
+needing their own owned copy of `id: String`. A `move` closure captures referenced
+variables *by value* regardless of whether its body only needs a reference — so an
+inner `move` closure referencing `id` moves it out of whatever outer `move` closure
+already captured it, leaving the outer closure with nothing for its *next*
+invocation (`error[E0525]: ...only implements FnOnce`). No amount of
+`let id = id.clone()` immediately before the inner closure fixes this once there
+are two or more levels of nesting, because the clone itself is what the inner
+`move` closure's capture consumes.
+
+Fix: `WorkspaceCard` now holds `id` as `StoredValue<String>` (`leptos::prelude`),
+not a plain `String`. `StoredValue<T>` is `Copy` regardless of `T`, backed by the
+reactive runtime's own arena — so *any* number of nested `move` closures can
+freely capture the handle itself (trivial, non-destructive, like copying an
+integer) and independently call `.get_value()` for a fresh owned clone whenever
+they actually run. This incidentally made `open`/`stop`/`reset`/`remove`
+themselves `Copy` too (every one of their captures — `id`, the `RwSignal`s,
+`Callback`) — removing the `let x = x.clone();` boilerplate those closures
+previously needed wherever they were referenced from inside a reactively
+re-evaluated branch.
+
+**Visual restyle, aihero-style.** `crates/gavmo/style/main.css` rewritten around:
+- A single `.panel` outer frame (one border, rounded, `overflow: hidden`) with
+  `.section`s stacked inside sharing hairlines via `.section + .section { border-top
+  }` — never a doubled border between adjacent sections.
+- `.ws-grid`: the same collapsed-border idea generalized to two dimensions — the
+  grid container's own background *is* the border colour, each `.ws-card` is
+  opaque, and a `1px` `gap` lets exactly one pixel of the container show between
+  cells in every direction.
+- Mono/uppercase/tracked treatment for the status `.badge` (aihero's small-stat-
+  label look), muted secondary `.path` text under a bold `.name`.
+- An expanded `.ws-card.expanded` spans every grid column (`grid-column: 1 / -1`)
+  rather than stretching its row — the reason a tall, variable-height detail panel
+  (today's actions/build-log, tomorrow's live view) doesn't make the grid ragged.
+
+System font stacks only (`system-ui` / `ui-monospace`) — no fetched webfonts, to
+keep this fully offline-capable.
+
+**Explicitly deferred to a follow-up (Phase 3, not yet built):** the live
+"what's this VM doing" view inside an expanded card — a streaming tail of the
+guest's serial console (`vm::VmConfig::console_log_path`) while `Booting`, and
+host-side CPU/mem/uptime stats (via the qemu child's pid + `/proc`) while
+`Running`. The `<Show>`/`StoredValue` groundwork above was deliberately built to
+make this addition straightforward later: `WorkspaceCard`'s detail section is
+already a stable, per-card mount point that can poll its own data independently.

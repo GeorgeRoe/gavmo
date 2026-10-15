@@ -79,8 +79,17 @@ struct Inner {
 /// the server function returns immediately; the live status poll picks up
 /// the transition from `Booting` to `Running`/`Failed`.
 enum VmSlot {
-    /// `RunningVm::boot` is in progress.
-    Booting,
+    /// `RunningVm::boot` is in progress, in the task tracked by this handle.
+    /// Carrying the handle (rather than a bare marker, as this used to be)
+    /// is what makes [`AppState::stop_workspace`]/[`AppState::reset_workspace`]
+    /// race-free against an in-flight boot: `handle.abort()` cancels the
+    /// boot task at its next await point, which drops any `RunningVm`
+    /// constructed so far — and `RunningVm`'s `Child` has `kill_on_drop` set
+    /// (`vm::handle`), so qemu is torn down either way. Awaiting the handle
+    /// afterwards then guarantees qemu is actually gone (not just "asked to
+    /// stop") before the caller proceeds — e.g. before `reset_workspace`
+    /// touches the overlay this VM might otherwise still be writing to.
+    Booting(tokio::task::JoinHandle<()>),
     /// Booted and (as of the last check) healthy. Boxed: `RunningVm` is
     /// much larger than the other variants (it owns a `tokio::process::Child`
     /// plus helper-process handles), and this enum lives in a `HashMap`.
@@ -169,48 +178,59 @@ impl AppState {
     /// callers should poll `status`/`list` to observe the transition from
     /// `Booting` to `Running`/`Failed`.
     pub async fn open_workspace(&self, id: &str) -> Result<(), String> {
-        {
-            let mut running = self.inner.running.lock().await;
-            match running.get(id) {
-                // Already booting or running: nothing to do.
-                Some(VmSlot::Booting | VmSlot::Running(_)) => return Ok(()),
-                // No entry, or the last attempt failed (generically or a
-                // broken `gavmo.nix`): (re)boot below. Retrying after
-                // `BuildFailed` is the expected path once the user fixes
-                // `gavmo.nix`.
-                Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
-            }
-            running.insert(id.to_string(), VmSlot::Booting);
+        // The whole check -> build-config -> spawn -> insert sequence runs
+        // under one continuously-held lock (no `.await` in between: the
+        // status check and `vm_config` are both synchronous, and
+        // `tokio::spawn` itself doesn't await the spawned future's body —
+        // it just queues it and returns the handle). This preserves the
+        // same TOCTOU-free guarantee the old "check-then-insert-a-bare-
+        // marker" version had: two concurrent `open_workspace` calls for
+        // the same `id` can never both decide to boot.
+        let mut running = self.inner.running.lock().await;
+        match running.get(id) {
+            // Already booting or running: nothing to do.
+            Some(VmSlot::Booting(_) | VmSlot::Running(_)) => return Ok(()),
+            // No entry, or the last attempt failed (generically or a
+            // broken `gavmo.nix`): (re)boot below. Retrying after
+            // `BuildFailed` is the expected path once the user fixes
+            // `gavmo.nix`.
+            Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
         }
 
         let cfg = match self.vm_config(id) {
             Ok(cfg) => cfg,
             Err(e) => {
                 let reason = e.to_string();
-                self.inner
-                    .running
-                    .lock()
-                    .await
-                    .insert(id.to_string(), VmSlot::Failed(reason.clone()));
+                running.insert(id.to_string(), VmSlot::Failed(reason.clone()));
                 return Err(reason);
             }
         };
 
         let state = self.clone();
-        let id = id.to_string();
-        tokio::spawn(async move {
+        let task_id = id.to_string();
+        let handle = tokio::spawn(async move {
             let result = RunningVm::boot(cfg).await;
             let mut running = state.inner.running.lock().await;
 
-            // If the slot is no longer `Booting` (e.g. the user pressed
-            // Stop while we were booting, or another open raced us), don't
-            // resurrect it in the map — but if we *did* successfully boot a
-            // VM, shut it down rather than leaking a running qemu process
-            // with no handle anywhere.
-            let still_wanted = matches!(running.get(&id), Some(VmSlot::Booting));
+            // If the slot is no longer `Booting` (e.g. `stop`/`reset` raced
+            // us — though those now `abort()` this very task first, so
+            // reaching here with `still_wanted == false` mainly covers a
+            // *different* open superseding us, not a stop/reset — or this
+            // task itself was the loser of that race before `abort` even
+            // registers), don't resurrect it in the map — but if we *did*
+            // successfully boot a VM, shut it down rather than leaking a
+            // running qemu process with no handle anywhere. Deliberately a
+            // simple slot-variant check, not a task-identity comparison
+            // (e.g. via `tokio::task::id()`): closing that last sliver —
+            // another boot already having replaced us with its own
+            // `Booting(handle2)` by the time we get here — is accepted as
+            // out of scope for this pass, consistent with other small
+            // accepted races already documented in this file (see
+            // `alloc_port`).
+            let still_wanted = matches!(running.get(&task_id), Some(VmSlot::Booting(_)));
             match result {
                 Ok(vm) if still_wanted => {
-                    running.insert(id, VmSlot::Running(Box::new(vm)));
+                    running.insert(task_id, VmSlot::Running(Box::new(vm)));
                 }
                 Ok(vm) => {
                     drop(running);
@@ -223,26 +243,64 @@ impl AppState {
                         },
                         _ => VmSlot::Failed(e.to_string()),
                     };
-                    running.insert(id, slot);
+                    running.insert(task_id, slot);
                 }
                 Err(_) => {}
             }
         });
 
+        running.insert(id.to_string(), VmSlot::Booting(handle));
+
         Ok(())
     }
 
     /// Stops the VM for a workspace and drops it from the running map. A
-    /// no-op if it isn't currently running or booting. If a boot is still
-    /// in flight, removing the `Booting` marker here signals the
-    /// background task (see `open_workspace`) to shut the VM down once it
-    /// finishes, instead of registering it as running.
+    /// no-op if it isn't currently running or booting.
+    ///
+    /// If a boot is still in flight, this `abort()`s its task and awaits
+    /// it before returning — so by the time this call returns, qemu is
+    /// guaranteed to actually be gone, not just "asked to stop eventually".
+    /// Two things can happen inside that awaited task, both of which tear
+    /// qemu down: the abort takes effect at the task's next await point,
+    /// dropping any `RunningVm` constructed so far (whose `Child` has
+    /// `kill_on_drop` set); or the task was already past `RunningVm::boot`
+    /// and racing us to its own tail, in which case it notices the slot is
+    /// no longer `Booting` and performs its own graceful `vm.stop()` before
+    /// returning. The latter case means this call can — rarely, only when
+    /// a boot happens to succeed in the same instant it's being stopped —
+    /// block for up to `SHUTDOWN_TIMEOUT` + `QUIT_TIMEOUT`
+    /// (`vm::handle`'s constants, ~35s worst case) rather than returning
+    /// instantly; accepted, since "stop" blocking until actually stopped is
+    /// arguably more correct than the previous fire-and-forget behavior.
     pub async fn stop_workspace(&self, id: &str) -> Result<(), String> {
         let slot = self.inner.running.lock().await.remove(id);
         match slot {
             Some(VmSlot::Running(vm)) => vm.stop().await.map_err(|e| e.to_string()),
-            Some(VmSlot::Booting | VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => Ok(()),
+            Some(VmSlot::Booting(handle)) => {
+                handle.abort();
+                // Expected to be `Err` (cancelled) in the common case; if
+                // the task won the race and ran to completion instead
+                // (see doc comment above), it returns `Ok(())` - either
+                // way there's nothing more for us to do here.
+                let _ = handle.await;
+                Ok(())
+            }
+            Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => Ok(()),
         }
+    }
+
+    /// Stops the VM for a workspace (if running/booting) and forgets it —
+    /// drops it from the registry entirely, so it no longer appears in the
+    /// control panel. **Non-destructive**, unlike [`Self::reset_workspace`]:
+    /// nothing under `.gavmo/vm` is deleted, so re-adding the same path
+    /// later will find its old overlay (and OpenCode session history)
+    /// again. A no-op if `id` isn't a known workspace.
+    pub async fn remove_workspace(&self, id: &str) -> Result<(), String> {
+        self.stop_workspace(id).await?;
+
+        let mut registry = self.inner.registry.lock().await;
+        registry.workspaces.retain(|w| w.path != id);
+        save_registry(&self.inner.registry_path, &registry).map_err(|e| e.to_string())
     }
 
     /// Stops the VM for a workspace (if running/booting) and deletes its
@@ -263,20 +321,24 @@ impl AppState {
     /// `#[server]` function) is expected to have already gotten explicit
     /// user confirmation — this method itself does not prompt.
     ///
-    /// If the workspace is `Booting`, the `Booting` marker is removed
-    /// immediately (same eventually-consistent handling as
-    /// [`Self::stop_workspace`]) so a fresh boot can start right away,
-    /// rather than blocking on the in-flight boot. If that boot was about to
-    /// succeed, `open_workspace`'s background task will notice it's no
-    /// longer wanted and stop the VM itself — there's a small, accepted
-    /// window where that cleanup could still be touching the overlay this
-    /// deletes. Only the `Running` case can be made fully race-free (we
-    /// `stop()` and wait for qemu to actually exit before touching its
-    /// disk), which is why it's handled specially below.
+    /// Race-free against an in-flight boot: if the workspace is `Booting`,
+    /// its task is `abort()`ed and awaited (same mechanism as
+    /// [`Self::stop_workspace`] — see its doc comment for exactly what that
+    /// guarantees and the rare bounded-wait tradeoff it accepts) before this
+    /// function ever touches the overlay, so qemu is guaranteed to no
+    /// longer be running — and therefore not still writing to
+    /// `.gavmo/vm` — by the time it's deleted below.
     pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
         let slot = self.inner.running.lock().await.remove(id);
-        if let Some(VmSlot::Running(vm)) = slot {
-            let _ = vm.stop().await;
+        match slot {
+            Some(VmSlot::Running(vm)) => {
+                let _ = vm.stop().await;
+            }
+            Some(VmSlot::Booting(handle)) => {
+                handle.abort();
+                let _ = handle.await;
+            }
+            Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
         }
 
         remove_dir_all_idempotent(&Self::state_dir_for(id)).await
@@ -363,7 +425,7 @@ fn is_safe_rebuild_log_filename(name: &str) -> bool {
 /// last poll).
 async fn slot_status(slot: &mut VmSlot) -> WorkspaceStatus {
     match slot {
-        VmSlot::Booting => WorkspaceStatus::Booting,
+        VmSlot::Booting(_) => WorkspaceStatus::Booting,
         VmSlot::Running(vm) => to_status(vm.status().await),
         VmSlot::Failed(reason) => WorkspaceStatus::Failed {
             reason: reason.clone(),
@@ -561,5 +623,91 @@ mod tests {
         assert!(!dir.exists());
 
         remove_dir_all_idempotent(&dir).await.unwrap();
+    }
+
+    /// A throwaway [`AppState`] for exercising `stop_workspace`/
+    /// `reset_workspace`'s interaction with the `running` map directly.
+    /// Unlike a `remove_workspace`/`add_workspace` test (which would
+    /// persist to the *real*, shared `~/.local/share/gavmo/workspaces.json`
+    /// via `save_registry` — not something a unit test should touch),
+    /// `AppState::new` only *reads* that file, and neither method under
+    /// test here touches the registry at all (only `self.inner.running`
+    /// and, for `reset`, a throwaway temp dir) — so standing one up is
+    /// safe. The base-image/gcloud-dir paths are never used by the code
+    /// paths under test (no real `RunningVm::boot` happens in either test
+    /// below), so placeholder paths are fine.
+    fn test_app_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/nonexistent/gavmo-test-base.qcow2"),
+            PathBuf::from("/nonexistent/gavmo-test-gcloud"),
+        )
+        .expect("AppState::new only touches the real registry file, which is harmless to read")
+    }
+
+    /// A `VmSlot::Booting` wrapping a task that sleeps far longer than any
+    /// sane test timeout, standing in for an in-flight `RunningVm::boot`
+    /// call. Used to prove `stop_workspace`/`reset_workspace` actually
+    /// `abort()` it (returning promptly) rather than waiting for it to
+    /// finish naturally.
+    fn never_finishing_boot_slot() -> VmSlot {
+        VmSlot::Booting(tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        }))
+    }
+
+    /// The core of R1 (see `VmSlot::Booting`'s doc comment): `stop_workspace`
+    /// on a `Booting` slot must `abort()` the boot task and return once it's
+    /// actually gone, not leave it running in the background. Bounded by an
+    /// outer `timeout` so a regression back to "wait for the boot to finish
+    /// naturally" fails this test instead of hanging the test suite.
+    #[tokio::test]
+    async fn stop_workspace_aborts_an_in_flight_boot_promptly() {
+        let state = test_app_state();
+        let id = "stop-workspace-aborts-an-in-flight-boot-promptly";
+        state
+            .inner
+            .running
+            .lock()
+            .await
+            .insert(id.to_string(), never_finishing_boot_slot());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), state.stop_workspace(id))
+            .await
+            .expect("stop_workspace should abort the in-flight boot promptly, not wait for it")
+            .unwrap();
+
+        assert!(state.inner.running.lock().await.get(id).is_none());
+    }
+
+    /// The other half of R1: `reset_workspace` must abort an in-flight boot
+    /// *before* touching the overlay, so by the time it deletes
+    /// `.gavmo/vm`, nothing (qemu included) is still writing to it. Proven
+    /// here by actually populating a throwaway state dir and asserting it's
+    /// gone afterward, combined with the same promptness bound as above.
+    #[tokio::test]
+    async fn reset_workspace_aborts_an_in_flight_boot_before_deleting_state() {
+        let repo_dir = unique_temp_dir("reset-abort-repo");
+        let state_dir = repo_dir.join(".gavmo").join("vm");
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(state_dir.join("disk.qcow2"), b"fake overlay")
+            .await
+            .unwrap();
+        let id = repo_dir.to_string_lossy().into_owned();
+
+        let state = test_app_state();
+        state
+            .inner
+            .running
+            .lock()
+            .await
+            .insert(id.clone(), never_finishing_boot_slot());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), state.reset_workspace(&id))
+            .await
+            .expect("reset_workspace should abort the in-flight boot promptly, not wait for it")
+            .unwrap();
+
+        assert!(!state_dir.exists());
+        assert!(state.inner.running.lock().await.get(&id).is_none());
     }
 }
