@@ -11,17 +11,26 @@ use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use vm::{Error as VmError, RunningVm, VmConfig, VmStatus};
 
-use crate::app::{WorkspaceInfo, WorkspaceStatus};
+use crate::app::{VmStats, WorkspaceInfo, WorkspaceStatus};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 /// Default guest vCPU count.
 const DEFAULT_VCPUS: u32 = 4;
+
+/// How long to wait between the two `/proc` samples [`AppState::vm_stats`]
+/// takes to compute a CPU percentage (see `vm::stats::cpu_percent_per_core`
+/// — it needs a delta between two points in time). Short enough to keep a
+/// single poll snappy, long enough that normal scheduler-tick granularity
+/// (conventionally ~10ms per jiffy) doesn't dominate the measurement with
+/// noise.
+const CPU_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Appended to a running VM's base URL so "Open UI" lands the user directly
 /// in a new opencode session scoped to the guest's `/workspace` mount,
@@ -413,6 +422,62 @@ impl AppState {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Host-side resource usage for a `Running` workspace's VM — CPU
+    /// (top-style, per-core percentage), memory (RSS vs. the configured
+    /// cap), uptime, overlay disk size, and the forwarded host port. For
+    /// the live stats panel in the detail modal, polled while `Running`
+    /// the same way [`Self::read_console_log`] is polled while `Booting`.
+    ///
+    /// Returns `None` whenever there's nothing meaningful to show: the
+    /// workspace isn't `Running`, its qemu process has already exited
+    /// (`RunningVm::qemu_pid` returning `None`), or a `/proc` read failed
+    /// (e.g. the process exited in the narrow window between this
+    /// function grabbing its pid and actually sampling it) — all treated
+    /// as "no stats this tick" rather than an error a caller needs to
+    /// handle specially, consistent with this being a best-effort,
+    /// frequently-repolled display rather than a one-shot query.
+    ///
+    /// Deliberately does **not** hold the `running` lock across the
+    /// `CPU_SAMPLE_INTERVAL` sleep between the two `/proc` samples this
+    /// needs (see `vm::stats::cpu_percent_per_core`) — it copies out the
+    /// handful of `Copy` values it needs from the `RunningVm` up front and
+    /// releases the lock before sampling, so a concurrent `stop`/`reset`
+    /// for this (or any other) workspace is never blocked behind a stats
+    /// poll in flight.
+    pub async fn vm_stats(&self, id: &str) -> Option<VmStats> {
+        let (pid, uptime_secs, mem_cap_mib, vcpus, host_port) = {
+            let mut running = self.inner.running.lock().await;
+            match running.get_mut(id) {
+                Some(VmSlot::Running(vm)) => (
+                    vm.qemu_pid()?,
+                    vm.uptime().as_secs(),
+                    vm.memory_mib(),
+                    vm.vcpus(),
+                    vm.host_port(),
+                ),
+                _ => return None,
+            }
+        };
+
+        let disk_bytes =
+            vm::stats::file_size_or_zero(&Self::state_dir_for(id).join("disk.qcow2")).ok()?;
+
+        let prev = vm::stats::sample(pid).ok()?;
+        tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
+        let cur = vm::stats::sample(pid).ok()?;
+        let cpu_percent = vm::stats::cpu_percent_per_core(prev, cur);
+
+        Some(VmStats {
+            cpu_percent,
+            vcpus,
+            mem_bytes: cur.rss_bytes,
+            mem_cap_bytes: u64::from(mem_cap_mib) * 1024 * 1024,
+            uptime_secs,
+            disk_bytes,
+            host_port,
+        })
     }
 }
 

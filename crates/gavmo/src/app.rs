@@ -39,6 +39,35 @@ pub enum WorkspaceStatus {
     BuildFailed { log: String },
 }
 
+/// Host-side resource usage for a `Running` workspace's VM, shown in the
+/// detail modal's live stats panel (see `registry::AppState::vm_stats`).
+/// `None` from the server function means "nothing to show right now" (not
+/// `Running`, or the qemu process just exited) rather than an error.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VmStats {
+    /// Top-style CPU usage: `0` idle, `100` per fully-busy core, up to
+    /// `vcpus * 100` if every core is saturated.
+    pub cpu_percent: f32,
+    /// Configured guest vCPU count — the denominator `cpu_percent` is
+    /// scaled against.
+    pub vcpus: u32,
+    /// Host-side resident memory (RSS) of the qemu process, in bytes. This
+    /// is qemu's actual host footprint (guest pages it has touched, plus
+    /// its own overhead) — not a guest-internal "memory used" figure.
+    pub mem_bytes: u64,
+    /// The configured guest memory cap, in bytes (`VmConfig::memory_mib`),
+    /// shown alongside `mem_bytes` for context.
+    pub mem_cap_bytes: u64,
+    /// How long the qemu process has existed, in seconds (from spawn, not
+    /// from when it first became healthy — see `vm::RunningVm::uptime`).
+    pub uptime_secs: u64,
+    /// Size of the persistent overlay disk (`.gavmo/vm/disk.qcow2`), in
+    /// bytes.
+    pub disk_bytes: u64,
+    /// The host port `opencode web` is forwarded to.
+    pub host_port: u16,
+}
+
 /// A directory listing for the folder picker.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DirListing {
@@ -100,6 +129,19 @@ pub async fn read_console_log(id: String) -> Result<String, ServerFnError> {
         .read_console_log(&id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+/// Fetches host-side resource usage (CPU/memory/uptime/disk) for a
+/// workspace's VM — see `registry::AppState::vm_stats`. Polled by the
+/// modal's stats panel while a workspace is `Running`, mirroring
+/// `read_console_log`'s polling pattern for the `Booting` boot console.
+/// `Ok(None)` is the normal "nothing to show right now" case (not
+/// `Running`, or the process just exited) — distinct from `Err`, which
+/// means the request itself failed.
+#[server]
+pub async fn poll_vm_stats(id: String) -> Result<Option<VmStats>, ServerFnError> {
+    let state = app_state()?;
+    Ok(state.vm_stats(&id).await)
 }
 
 #[server]
@@ -940,6 +982,51 @@ fn WorkspaceModal(
         }
     });
 
+    // Live host-side resource stats (CPU/memory/uptime/disk) for this
+    // workspace's VM — see `registry::AppState::vm_stats`. Same
+    // start/stop-polling shape as the boot console above, but gated on
+    // `Running` instead of `Booting` (there's nothing meaningful to show
+    // in any other state — `vm_stats` itself returns `None` then too).
+    // Each poll's own request takes ~`CPU_SAMPLE_INTERVAL` to resolve (the
+    // server needs two `/proc` samples a beat apart to compute a CPU
+    // delta - see `registry.rs`), so this polls less frequently than the
+    // boot console's 1s tick to avoid overlapping requests piling up.
+    let vm_stats = RwSignal::new(None::<VmStats>);
+    let stats_interval = StoredValue::new(None::<IntervalHandle>);
+
+    let fetch_stats = move || {
+        let id = id.get_value();
+        leptos::task::spawn_local(async move {
+            if let Ok(stats) = poll_vm_stats(id).await {
+                vm_stats.set(stats);
+            }
+        });
+    };
+
+    Effect::new(move |_| {
+        let running = matches!(card_info.get().status, WorkspaceStatus::Running { .. });
+        let already_polling = stats_interval.get_value().is_some();
+
+        if running && !already_polling {
+            fetch_stats();
+            let handle =
+                set_interval_with_handle(fetch_stats, std::time::Duration::from_secs(2)).ok();
+            stats_interval.set_value(handle);
+        } else if !running && already_polling {
+            stats_interval.update_value(|h| {
+                if let Some(h) = h.take() {
+                    h.clear();
+                }
+            });
+            vm_stats.set(None);
+        }
+    });
+    on_cleanup(move || {
+        if let Some(h) = stats_interval.get_value() {
+            h.clear();
+        }
+    });
+
     // Every capture below (`id`, `busy`, `action_error`, `on_changed`) is
     // now `Copy`, which makes these closures themselves `Copy` too - no
     // `.clone()` dance needed anywhere they're used, including from inside
@@ -1206,6 +1293,60 @@ fn WorkspaceModal(
                         </div>
                     })
                 }}
+                // Live host-side resource stats: visible only while
+                // `Running` *and* a poll has actually resolved at least
+                // once (`vm_stats` starts `None` and the first poll takes
+                // a beat - see `fetch_stats`/`CPU_SAMPLE_INTERVAL` - so
+                // there'd otherwise be an empty flash right as the modal
+                // for a running workspace opens).
+                {move || vm_stats.get().map(|s| view! {
+                    <div class="stats-panel">
+                        <div class="stat-row">
+                            <span class="stat-label">"CPU"</span>
+                            <div class="stat-bar">
+                                <div
+                                    class="stat-bar-fill"
+                                    style:width=format!(
+                                        "{}%",
+                                        (s.cpu_percent / (s.vcpus.max(1) as f32 * 100.0) * 100.0)
+                                            .clamp(0.0, 100.0)
+                                    )
+                                ></div>
+                            </div>
+                            <span class="stat-value">
+                                {format!("{:.0}% / {} vCPU", s.cpu_percent, s.vcpus)}
+                            </span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">"Memory"</span>
+                            <div class="stat-bar">
+                                <div
+                                    class="stat-bar-fill"
+                                    style:width=format!(
+                                        "{}%",
+                                        (s.mem_bytes as f32 / s.mem_cap_bytes.max(1) as f32 * 100.0)
+                                            .clamp(0.0, 100.0)
+                                    )
+                                ></div>
+                            </div>
+                            <span class="stat-value">
+                                {format!("{} / {}", format_bytes(s.mem_bytes), format_bytes(s.mem_cap_bytes))}
+                            </span>
+                        </div>
+                        <div class="stat-row stat-row--plain">
+                            <span class="stat-label">"Uptime"</span>
+                            <span class="stat-value">{format_uptime(s.uptime_secs)}</span>
+                        </div>
+                        <div class="stat-row stat-row--plain">
+                            <span class="stat-label">"Disk"</span>
+                            <span class="stat-value">{format_bytes(s.disk_bytes)}</span>
+                        </div>
+                        <div class="stat-row stat-row--plain">
+                            <span class="stat-label">"Port"</span>
+                            <span class="stat-value">{s.host_port.to_string()}</span>
+                        </div>
+                    </div>
+                })}
                 {move || action_error.get().map(|e| view! {
                     <p class="error">{e}</p>
                 })}
@@ -1237,6 +1378,47 @@ fn status_view(status: &WorkspaceStatus) -> (&'static str, String, Option<String
         // user, just a more specific/actionable one (see `WorkspaceRow`'s
         // "View build log" button for the specific part).
         WorkspaceStatus::BuildFailed { .. } => ("failed", "gavmo.nix build failed".into(), None),
+    }
+}
+
+/// Formats a byte count the way a human skimming a stats panel wants:
+/// whole-number KiB, one decimal for MiB/GiB. Binary (1024-based) units,
+/// matching how RSS/overlay-disk sizes are actually measured.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{bytes} B")
+    } else if b < MIB {
+        format!("{:.0} KiB", b / KIB)
+    } else if b < GIB {
+        format!("{:.1} MiB", b / MIB)
+    } else {
+        format!("{:.2} GiB", b / GIB)
+    }
+}
+
+/// Formats a duration in seconds as a compact, human-readable uptime
+/// (`"45s"`, `"3m 12s"`, `"2h 05m"`, `"1d 03h"`) — always the two most
+/// significant units, never more, so it stays short in a compact stats
+/// panel.
+fn format_uptime(total_secs: u64) -> String {
+    let days = total_secs / 86_400;
+    let hours = (total_secs % 86_400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if days > 0 {
+        format!("{days}d {hours:02}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins:02}m")
+    } else if mins > 0 {
+        format!("{mins}m {secs:02}s")
+    } else {
+        format!("{secs}s")
     }
 }
 
@@ -1328,5 +1510,28 @@ fn FolderBrowser(on_added: Callback<()>) -> impl IntoView {
                 })}
             </Suspense>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn format_bytes_picks_the_right_unit() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2 KiB");
+        assert_eq!(format_bytes(1_572_864), "1.5 MiB"); // 1.5 MiB
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GiB");
+    }
+
+    #[test]
+    fn format_uptime_shows_the_two_most_significant_units() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(192), "3m 12s");
+        assert_eq!(format_uptime(7_500), "2h 05m");
+        assert_eq!(format_uptime(97_200), "1d 03h");
     }
 }

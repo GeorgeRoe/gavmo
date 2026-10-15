@@ -334,11 +334,32 @@ re-evaluated branch.
 
 System font stacks only (`system-ui` / `ui-monospace`) — no fetched webfonts, to
 keep this fully offline-capable.
+**The live "what's this VM doing" view — ✅ done, in two parts:**
 
-**Explicitly deferred to a follow-up (Phase 3, not yet built):** the live
-"what's this VM doing" view inside an expanded card — a streaming tail of the
-guest's serial console (`vm::VmConfig::console_log_path`) while `Booting`, and
-host-side CPU/mem/uptime stats (via the qemu child's pid + `/proc`) while
-`Running`. The `<Show>`/`StoredValue` groundwork above was deliberately built to
-make this addition straightforward later: `WorkspaceCard`'s detail section is
-already a stable, per-card mount point that can poll its own data independently.
+- **Boot console** (`Show systemd boot sequence in UI`): a streaming tail of
+  the guest's serial console (`vm::VmConfig::console_log_path`) while
+  `Booting`, sanitized server-side (`registry::sanitize_console` strips the
+  raw capture's ANSI/VT escapes down to plain text) and polled once a second
+  via `read_console_log`. Stays visible through the tail end of the log once
+  boot settles, rather than vanishing the instant status flips.
+- **Host-side resource stats** (this entry): CPU/memory/uptime/disk/port
+  while `Running`, polled every 2s via `poll_vm_stats`
+  (`registry::AppState::vm_stats`). The `vm` crate grew a small
+  `stats` module (`crates/vm/src/stats.rs`) of pure, unit-tested `/proc`
+  parsers — `RunningVm` already owned the qemu `Child` the pid comes from,
+  plus a new `started: Instant` (set at spawn, not at "first healthy", so
+  first-boot/`gavmo.nix`-rebuild time counts as uptime like a user watching
+  the console would expect). CPU is computed top-style
+  (`0..vcpus*100`) from two `/proc` samples ~500ms apart
+  (`CPU_SAMPLE_INTERVAL`) — taken **after** releasing the `running` map's
+  lock, so a stats poll in flight never blocks a concurrent stop/reset. The
+  ratio of jiffy deltas cancels out the kernel's tick rate, so no
+  `sysconf(_SC_CLK_TCK)`/libc dependency was needed. Memory is shown as the
+  qemu process's actual host RSS (not a guest-internal figure) against the
+  configured `memory_mib` cap.
+
+Both reuse the same start/stop-polling-on-status-change shape (a
+`StoredValue<Option<IntervalHandle>>` + `on_cleanup`), just gated on
+different `WorkspaceStatus` variants — confirming the `<Show>`/`StoredValue`
+groundwork from the grid redesign did make this a straightforward addition,
+as predicted.

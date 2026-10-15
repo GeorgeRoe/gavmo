@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::Child;
 
@@ -59,6 +59,12 @@ pub struct RunningVm {
     cfg: VmConfig,
     qemu: Child,
     helpers: Vec<Child>,
+    /// When the qemu process was spawned — *not* when `opencode web`
+    /// first answered (which can be minutes later on a first boot, or a
+    /// `gavmo.nix` rebuild). Used for [`Self::uptime`], so "uptime" means
+    /// "how long has this VM existed", matching what a user watching the
+    /// live boot console would expect, not "how long has it been healthy".
+    started: Instant,
 }
 
 impl RunningVm {
@@ -93,7 +99,12 @@ impl RunningVm {
         let (qemu, helpers) = spawn_qemu(&cfg, &shares).await?;
         let host_port = cfg.host_port;
         let marker_path = cfg.rebuild_failed_marker_path();
-        let vm = RunningVm { cfg, qemu, helpers };
+        let vm = RunningVm {
+            cfg,
+            qemu,
+            helpers,
+            started: Instant::now(),
+        };
 
         // Races opencode's port answering against the guest's M2
         // rebuild-failure marker appearing — see `health::wait_for_ready`
@@ -180,5 +191,40 @@ impl RunningVm {
     /// The workspace this VM belongs to.
     pub fn workspace_id(&self) -> &str {
         &self.cfg.workspace_id
+    }
+
+    /// How long ago this VM's qemu process was spawned (see `started`'s
+    /// doc comment for why this is measured from spawn, not from first
+    /// becoming healthy).
+    pub fn uptime(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// The host OS pid of the qemu process, for host-side resource stats
+    /// (see `crate::stats`). `None` only if the process has already exited
+    /// (per `tokio::process::Child::id`'s own doc comment) — in practice
+    /// this doesn't happen for a `RunningVm` still held by the caller
+    /// without `stop()` having been called, but isn't ruled out by the
+    /// type system either.
+    pub fn qemu_pid(&self) -> Option<u32> {
+        self.qemu.id()
+    }
+
+    /// Configured guest memory, in MiB — used by the stats panel to show
+    /// resident memory against the configured cap.
+    pub fn memory_mib(&self) -> u32 {
+        self.cfg.memory_mib
+    }
+
+    /// Configured guest vCPU count — used by the stats panel to show CPU
+    /// usage against the configured core count.
+    pub fn vcpus(&self) -> u32 {
+        self.cfg.vcpus
+    }
+
+    /// Path to this VM's persistent overlay disk, for the stats panel's
+    /// disk-size reading (see `crate::stats::file_size_or_zero`).
+    pub fn disk_path(&self) -> std::path::PathBuf {
+        self.cfg.disk_path()
     }
 }

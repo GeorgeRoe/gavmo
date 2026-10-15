@@ -14,6 +14,7 @@ mod health;
 mod qemu;
 mod qmp;
 mod share;
+pub mod stats;
 
 pub use config::{GUEST_OPENCODE_PORT, VmConfig};
 pub use error::{Error, Result};

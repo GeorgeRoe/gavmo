@@ -432,3 +432,58 @@ button.danger:hover:not(:disabled) {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* --- Live host-side stats -------------------------------------------------
+ * Shown in a running workspace's modal - see `app.rs`'s `WorkspaceModal`
+ * (`poll_vm_stats` poll) and `registry::AppState::vm_stats`. Same bordered-
+ * box language as `.build-log-panel`/`.console-panel`, but a row-based
+ * layout (label / bar / value) rather than a block of monospace text. */
+.stats-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr auto;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* Rows with no bar (uptime/disk/port) - just a label/value pair, still
+ * aligned to the same label column as the bar rows above them. */
+.stat-row--plain {
+  grid-template-columns: 4.5rem auto;
+}
+
+.stat-label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.stat-value {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.stat-bar {
+  height: 0.4rem;
+  background: var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.stat-bar-fill {
+  height: 100%;
+  background: var(--accent);
+}
