@@ -404,3 +404,31 @@ button.danger:hover:not(:disabled) {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* --- Live boot console ---------------------------------------------------
+ * Shown in a booting workspace's modal while systemd/the kernel boots - see
+ * `app.rs`'s `WorkspaceModal` (`read_console_log` poll) and
+ * `registry::sanitize_console` (which strips the raw serial capture's ANSI
+ * escapes down to this plain text). A near-black background (rather than
+ * `.build-log-panel`'s neutral `--bg`) gives it a distinct "live terminal"
+ * feel from the static build-log viewer, even though both are plain
+ * monochrome text. */
+.console-panel {
+  background: #0b0d10;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.console-log {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: #c9d1d9;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

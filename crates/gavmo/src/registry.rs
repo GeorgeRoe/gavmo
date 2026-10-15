@@ -392,6 +392,28 @@ impl AppState {
         }
         tokio::fs::read_to_string(Self::state_dir_for(id).join(log)).await
     }
+
+    /// Reads and sanitizes the guest's boot console log (`console.log`
+    /// under the workspace's state dir — see `vm::VmConfig::console_log_path`)
+    /// for the live boot-console panel. The file doesn't exist until qemu
+    /// has actually been spawned for this workspace at least once, so
+    /// "not found" is treated as an empty log rather than an error — a
+    /// perfectly normal state to poll (e.g. in the instant between
+    /// `open_workspace` returning and the boot task actually spawning
+    /// qemu), not a failure the caller needs to handle specially.
+    ///
+    /// Unlike `read_build_log`, `log` isn't a client-supplied filename —
+    /// the path is always this one fixed name — so there's no filename
+    /// validation to do here; `id` is the same registry-known workspace
+    /// path `state_dir_for` already uses elsewhere.
+    pub async fn read_console_log(&self, id: &str) -> io::Result<String> {
+        let path = Self::state_dir_for(id).join("console.log");
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(sanitize_console(&bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Deletes a directory tree, treating "already gone" as success rather than
@@ -417,6 +439,95 @@ fn is_safe_rebuild_log_filename(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains("..")
+}
+
+/// Strips terminal control sequences out of a raw serial-console capture
+/// (ANSI/VT colors, cursor moves, OSC title-setting, etc. — see
+/// `qemu::build_qemu_args`'s `-serial file:...` redirect, which captures
+/// the guest's console byte-for-byte, escape sequences included) down to
+/// plain, readable text suitable for a `<pre>` in the UI. Also normalizes
+/// line endings (`\r\n`/bare `\r` -> `\n`, and bare `\r` used as its own
+/// line separator — common in boot logs for status lines that get
+/// overwritten in place on a real terminal).
+///
+/// Deliberately *stripping* rather than translating to styled HTML: this
+/// is plain-text-only, so a bare `\r` with no following `\n` is still
+/// treated as a line break (there is no "overwrite the previous line"
+/// concept left once colors/cursor-moves are gone) rather than losing that
+/// output entirely.
+///
+/// Invalid UTF-8 (shouldn't normally happen - this is text the guest's
+/// console actually printed - but a stray binary byte mid-boot is possible)
+/// is replaced via `String::from_utf8_lossy` rather than erroring, since a
+/// slightly-mangled live boot log is far more useful than none at all.
+fn sanitize_console(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // ESC - the start of some control sequence. Figure out
+                // which kind and skip exactly it, leaving the cursor right
+                // after the sequence so surrounding text is preserved.
+                match chars.peek() {
+                    // CSI: `ESC [ ... final` where `final` is `@`-`~`
+                    // (0x40-0x7E) - e.g. `ESC[0;32m` (SGR color).
+                    Some('[') => {
+                        chars.next();
+                        for c in chars.by_ref() {
+                            if ('\u{40}'..='\u{7e}').contains(&c) {
+                                break;
+                            }
+                        }
+                    }
+                    // String-type sequences, all terminated the same way
+                    // (BEL, or the two-byte ST `ESC \`) regardless of which
+                    // one introduces them: OSC (`]` - e.g. terminal
+                    // title-setting), DCS (`P` - e.g. GRUB's
+                    // `ESC P + q <hex> ESC \` seen in real boot captures),
+                    // APC (`_`), PM (`^`).
+                    Some(']') | Some('P') | Some('_') | Some('^') => {
+                        chars.next();
+                        while let Some(&c) = chars.peek() {
+                            if c == '\u{7}' {
+                                chars.next();
+                                break;
+                            }
+                            if c == '\u{1b}' {
+                                chars.next();
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            chars.next();
+                        }
+                    }
+                    // Any other two-byte escape (e.g. `ESC c` - full
+                    // reset, `ESC 7`/`ESC 8` - save/restore cursor): just
+                    // swallow the one byte that follows ESC.
+                    Some(_) => {
+                        chars.next();
+                    }
+                    None => {}
+                }
+            }
+            // A bare `\r` (not already consumed as part of `\r\n` by the
+            // match arm below) stands in for a line break once cursor
+            // control is gone - see doc comment above.
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            c => out.push(c),
+        }
+    }
+
+    out
 }
 
 /// Maps a [`VmSlot`] to the serializable view type shared with the browser,
@@ -484,6 +595,72 @@ fn save_registry(path: &Path, registry: &Registry) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real-shaped snippet from an actual `console.log` capture (systemd's
+    /// colored `[  OK  ]` status lines use SGR color + bold, `\r\n` line
+    /// endings) should come out as the plain text a human would read on a
+    /// real terminal.
+    #[test]
+    fn sanitize_console_strips_systemd_sgr_color_sequences() {
+        let raw = "[\u{1b}[0;32m  OK  \u{1b}[0m] Started \u{1b}[0;1;39mJournal Service\u{1b}[0m.\r\n";
+        assert_eq!(
+            sanitize_console(raw.as_bytes()),
+            "[  OK  ] Started Journal Service.\n"
+        );
+    }
+
+    /// OSC sequences (e.g. terminal title-setting, seen in real boot logs
+    /// right as systemd takes over the console) are skipped in their
+    /// entirety, whether terminated by BEL or the two-byte ST (`ESC \`).
+    #[test]
+    fn sanitize_console_strips_osc_sequences() {
+        let bel_terminated = "before\u{1b}]0;some title\u{7}after\n";
+        assert_eq!(sanitize_console(bel_terminated.as_bytes()), "beforeafter\n");
+
+        let st_terminated = "before\u{1b}]0;some title\u{1b}\\after\n";
+        assert_eq!(sanitize_console(st_terminated.as_bytes()), "beforeafter\n");
+    }
+
+    /// DCS sequences (`ESC P ... ST`) — seen in real captures from GRUB's
+    /// terminal-capability probing (`ESC P + q <hex> ESC \`) — are stripped
+    /// in their entirety, same as OSC.
+    #[test]
+    fn sanitize_console_strips_dcs_sequences() {
+        assert_eq!(
+            sanitize_console("before\u{1b}P+q6E616D65\u{1b}\\after\n".as_bytes()),
+            "beforeafter\n"
+        );
+    }
+
+    /// Other two-byte escapes (full reset `ESC c`, cursor save/restore
+    /// `ESC 7`/`ESC 8` — all seen in the GRUB/early-boot portion of a real
+    /// capture) are swallowed without disturbing surrounding text.
+    #[test]
+    fn sanitize_console_strips_other_two_byte_escapes() {
+        assert_eq!(
+            sanitize_console("a\u{1b}cb\u{1b}7c\u{1b}8d".as_bytes()),
+            "abcd"
+        );
+    }
+
+    /// A bare `\r` (no following `\n`) still becomes a line break — the
+    /// right behavior once cursor-control sequences are gone, since
+    /// there's no "overwrite the previous line" concept left to honor; the
+    /// output would otherwise run two unrelated status lines together.
+    #[test]
+    fn sanitize_console_treats_bare_cr_as_a_line_break() {
+        assert_eq!(sanitize_console(b"one\rtwo\r\nthree"), "one\ntwo\nthree");
+    }
+
+    /// Plain text with no escapes or special line endings passes through
+    /// unchanged.
+    #[test]
+    fn sanitize_console_passes_plain_text_through() {
+        assert_eq!(
+            sanitize_console(b"Booting from Hard Disk...\n"),
+            "Booting from Hard Disk...\n"
+        );
+    }
 
     /// URL-safe base64, no padding — a std-only reimplementation of
     /// opencode's `base64Encode` (`packages/core/src/util/encode.ts`:

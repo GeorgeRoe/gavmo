@@ -86,6 +86,22 @@ pub async fn read_build_log(id: String, log: String) -> Result<String, ServerFnE
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+/// Fetches the guest's boot console (kernel + systemd output), sanitized
+/// for display — see `registry::AppState::read_console_log`. Polled by the
+/// modal's console panel while a workspace is `Booting`; unlike
+/// `read_build_log`, there's no client-controlled filename here (the
+/// console log always lives at a fixed path under the workspace's state
+/// dir), so no separate validation is needed beyond `id` itself already
+/// being a registry-known workspace path.
+#[server]
+pub async fn read_console_log(id: String) -> Result<String, ServerFnError> {
+    let state = app_state()?;
+    state
+        .read_console_log(&id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
 #[server]
 pub async fn add_workspace(path: String) -> Result<(), ServerFnError> {
     let state = app_state()?;
@@ -292,6 +308,21 @@ fn set_card_vt_name(el: &web_sys::HtmlElement, name: Option<&str>) {
     #[cfg(not(feature = "hydrate"))]
     {
         let _ = (el, name);
+    }
+}
+
+/// Scrolls an element to the bottom of its content (`scroll_top =
+/// scroll_height`) — used to keep the live boot-console panel pinned to
+/// the newest output as it streams in, same way a real terminal would. A
+/// no-op under `ssr`, for the same reason as [`click_target`].
+fn scroll_to_bottom(el: &web_sys::HtmlPreElement) {
+    #[cfg(feature = "hydrate")]
+    {
+        el.set_scroll_top(el.scroll_height());
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = el;
     }
 }
 
@@ -841,6 +872,74 @@ fn WorkspaceModal(
     let build_log_open = RwSignal::new(false);
     let build_log_content = RwSignal::new(None::<Result<String, String>>);
 
+    // Live boot console: the guest's serial output (kernel + systemd,
+    // already sanitized server-side — see `registry::sanitize_console`),
+    // polled once a second via `read_console_log` while this workspace is
+    // `Booting`. `console_ref` is the mounted `<pre>` the auto-scroll
+    // `Effect` further down keeps pinned to the bottom, same pairing
+    // `set_card_vt_name` uses for the view-transition morph elsewhere in
+    // this file.
+    let console_text = RwSignal::new(String::new());
+    let console_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
+    // Holds the running interval's handle (see `fetch_console` below) so
+    // it can be torn down the moment this workspace stops `Booting` —
+    // including when the whole modal unmounts, via the `on_cleanup` this
+    // same handle is registered with. Not holding onto a finished boot's
+    // interval forever is the whole point: with no stop condition, this
+    // would otherwise keep silently polling a workspace long after its
+    // console had anything new to say.
+    let console_interval = StoredValue::new(None::<IntervalHandle>);
+
+    let fetch_console = move || {
+        let id = id.get_value();
+        leptos::task::spawn_local(async move {
+            if let Ok(text) = read_console_log(id).await {
+                console_text.set(text);
+            }
+        });
+    };
+
+    // Starts polling the instant this workspace becomes `Booting`, and
+    // stops the moment it settles into anything else — but not before one
+    // last fetch, so the panel ends up showing the actual tail of the log
+    // (e.g. the OpenCode startup line) rather than whatever it last showed
+    // mid-poll a second earlier.
+    Effect::new(move |_| {
+        let booting = matches!(card_info.get().status, WorkspaceStatus::Booting);
+        let already_polling = console_interval.get_value().is_some();
+
+        if booting && !already_polling {
+            fetch_console();
+            let handle =
+                set_interval_with_handle(fetch_console, std::time::Duration::from_secs(1)).ok();
+            console_interval.set_value(handle);
+        } else if !booting && already_polling {
+            console_interval.update_value(|h| {
+                if let Some(h) = h.take() {
+                    h.clear();
+                }
+            });
+            fetch_console();
+        }
+    });
+    on_cleanup(move || {
+        if let Some(h) = console_interval.get_value() {
+            h.clear();
+        }
+    });
+
+    // Keeps the console panel scrolled to the bottom as new output
+    // arrives, same way a real terminal would — otherwise a user watching
+    // a multi-minute boot would have to keep manually re-scrolling every
+    // second. A no-op under `ssr` (there's no DOM to scroll), same as
+    // `click_target`/`set_card_vt_name` elsewhere in this file.
+    Effect::new(move |_| {
+        console_text.track();
+        if let Some(el) = console_ref.get() {
+            scroll_to_bottom(&el);
+        }
+    });
+
     // Every capture below (`id`, `busy`, `action_error`, `on_changed`) is
     // now `Copy`, which makes these closures themselves `Copy` too - no
     // `.clone()` dance needed anywhere they're used, including from inside
@@ -1079,6 +1178,34 @@ fn WorkspaceModal(
                         " needs to fetch or build new packages."
                     </p>
                 })}
+                // Live boot console: visible for as long as there's
+                // something to show — from the moment this workspace
+                // starts `Booting` (even before the first poll resolves,
+                // via the placeholder text below) through to the tail end
+                // of the log fetched right as it settles into
+                // `Running`/`Failed`/`BuildFailed` (see the `Effect` above
+                // that drives `console_text`). Kept visible after boot
+                // finishes rather than disappearing the instant status
+                // flips, so the log doesn't vanish out from under a user
+                // still reading it.
+                {move || {
+                    let booting = matches!(card_info.get().status, WorkspaceStatus::Booting);
+                    let has_content = !console_text.get().is_empty();
+                    (booting || has_content).then(|| view! {
+                        <div class="console-panel">
+                            <pre class="console-log" node_ref=console_ref>
+                                {move || {
+                                    let text = console_text.get();
+                                    if text.is_empty() {
+                                        "Waiting for boot console output…".to_string()
+                                    } else {
+                                        text
+                                    }
+                                }}
+                            </pre>
+                        </div>
+                    })
+                }}
                 {move || action_error.get().map(|e| view! {
                     <p class="error">{e}</p>
                 })}

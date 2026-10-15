@@ -45,7 +45,11 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # (`app.rs`'s `click_target`/`set_card_vt_name`) are still `hydrate`-gated
 # internally; nothing here ever runs on the server (there's no click event
 # loop in SSR to begin with).
-web-sys = { version = "0.3", optional = true, features = ["HtmlElement", "CssStyleDeclaration"] }
+#
+# `Element` additionally gives `app.rs`'s console-log auto-scroll
+# (`scroll_top`/`scroll_height`) a typed target for the `<pre>`'s `NodeRef`
+# - same cross-target-safe, `hydrate`-gated-internally story as above.
+web-sys = { version = "0.3", optional = true, features = ["HtmlElement", "CssStyleDeclaration", "Element"] }
 
 [features]
 hydrate = [
