@@ -34,6 +34,20 @@ main {
   padding: 2rem 1.25rem 4rem;
 }
 
+/* --- Floating layout ---------------------------------------------------
+ * No containing panel: the title/toolbar and every card sit directly on
+ * `body`'s own background. Still square/flat (`--radius: 0` throughout,
+ * no shadows) - "floating" here just means nothing draws a surrounding
+ * frame or shares borders between elements; each piece stands on its own
+ * with real gaps around it. */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
 h1 {
   font-size: 1.15rem;
   font-weight: 700;
@@ -51,35 +65,6 @@ code {
 
 a {
   color: var(--accent);
-}
-
-/* --- The outer frame + collapsed-border section stack ---------------------
- * Each `.section` carries no border of its own; a hairline only appears
- * *between* two adjacent sections (`.section + .section`), so stacking any
- * number of them never doubles up a border the way two independently-
- * bordered boxes would. The outer `.panel` supplies the one surrounding
- * border + `overflow: hidden` (square corners throughout, see `--radius`). */
-.panel {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-
-.section {
-  padding: 1.1rem 1.25rem;
-}
-
-.section + .section {
-  border-top: 1px solid var(--border);
-}
-
-.section-header {
-  background: var(--band);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
 }
 
 .toolbar {
@@ -169,67 +154,22 @@ button.danger:hover:not(:disabled) {
   margin: 0.5rem 0;
 }
 
-/* --- Workspace grid ---------------------------------------------------
- * Hairline separators drawn with real borders, not the background-bleed
- * trick `.panel`/`.section` use (container painted the border colour, 1px
- * `gap` letting it show between opaque cells) - that trick paints the
- * *entire* grid rectangle, including cells no card occupies.
- *
- * Each `.ws-card` owns its *own* right+bottom border (not a top+left
- * scheme relying on the next card over/down to close the line - that
- * approach silently drops hairlines wherever the grid's last row is
- * partial, e.g. an `auto-fit` grid with 4 cards in 3 columns leaves row 2
- * with 2 empty trailing cells and nothing to draw row 1's bottom border or
- * row 2 card 1's right border; see
- * https://stackoverflow.com/a/35678354 for the general technique). With
- * every interior hairline drawn by a real card regardless of what is or
- * isn't next to it, a partial last row's trailing empty cells end up
- * outlined (closed by the row above's cards + the panel frame, below)
- * rather than missing borders - the accepted tradeoff, since a responsive
- * `auto-fit` grid's column count varies with width and so can't target
- * "the last card in each row" with simple `:nth-child` selectors instead.
- *
- * `.section-grid`'s inset padding is zeroed out so this grid can span the
- * full body of `.panel` edge-to-edge, which means the grid's border scheme
- * now meets `.panel`'s own surrounding border directly. The grid overlaps
- * its right/bottom edge cards onto that border with a 1px negative margin
- * (clipped by `.panel`'s `overflow: hidden`) to collapse each pair into
- * one crisp line; the top/left edges don't need the same treatment since
- * they're already supplied by the `.section + .section` separator and
- * `.panel`'s own border, with no card border meeting them there to double
- * up against. */
-.section-grid {
-  padding: 0;
-}
-
-.section-grid > .error {
-  padding-left: 1.25rem;
-  padding-right: 1.25rem;
-}
-
+/* --- Workspace grid -----------------------------------------------------
+ * Floating cards: each is its own standalone square box (full border, not
+ * a shared/collapsed hairline), with a real `gap` between them instead of
+ * edges touching. Still flat - no shadow, no radius - "floating" here
+ * just means every card stands on its own against `body`'s background
+ * rather than tiling edge-to-edge inside a frame. */
 .ws-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  margin: 0 -1px -1px 0;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.75rem;
 }
 
 .ws-card {
   background: var(--panel);
-  border-right: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-}
-
-/* An expanded card spans every column - a tall, variable-height detail
- * panel (actions, build log, live-view in a later phase) would otherwise
- * make the grid row ragged; spanning turns it into a full-width strip
- * instead, with the still-compact cards continuing in the row(s) below. */
-.ws-card.expanded {
-  grid-column: 1 / -1;
-}
-
-.ws-card-header {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   display: flex;
   align-items: center;
   gap: 0.75rem;
@@ -237,15 +177,8 @@ button.danger:hover:not(:disabled) {
   cursor: pointer;
 }
 
-.ws-card-header:hover {
-  background: color-mix(in srgb, var(--accent) 6%, transparent);
-}
-
-.ws-card-detail {
-  padding: 0 1rem 1rem;
-  /* Not a click target itself (the header is) - `cursor: default` avoids
-   * implying the whole expanded area is clickable the way the header is. */
-  cursor: default;
+.ws-card:hover {
+  border-color: var(--accent);
 }
 
 .ws-id {
@@ -268,14 +201,6 @@ button.danger:hover:not(:disabled) {
   word-break: break-all;
 }
 
-.chevron {
-  color: var(--muted);
-  font-size: 0.75rem;
-  width: 1em;
-  text-align: center;
-  flex-shrink: 0;
-}
-
 .hint {
   margin: 0.75rem 0 0;
   font-size: 0.8rem;
@@ -291,9 +216,9 @@ button.danger:hover:not(:disabled) {
 }
 
 /* --- Folder browser -----------------------------------------------------
- * Lives inside its own `.section`, which already supplies padding/the
- * collapsed hairline above/below it - no separate bordered box needed on
- * top of that. */
+ * Lives inside a `Modal`'s `.modal-body`, which already supplies the
+ * panel's padding/border - no separate bordered box needed on top of
+ * that. */
 .browser {
   display: flex;
   flex-direction: column;
@@ -358,6 +283,116 @@ button.danger:hover:not(:disabled) {
   border-radius: var(--radius);
   padding: 0.75rem;
   margin-top: 0.75rem;
+}
+
+/* --- Modal: backdrop + panel ---------------------------------------------
+ * A dimmed backdrop plus a centered, standalone square panel - same flat
+ * aesthetic as everything else (`--radius: 0`, a plain 1px border, no
+ * shadow).
+ *
+ * Two different open/close motions share this one panel style:
+ *  - The workspace detail modal has a real card to morph from, so its
+ *    motion is the browser's native View Transition - the card itself
+ *    grows into this exact box (see `app.rs`'s `vt_name`/
+ *    `start_view_transition` and the `::view-transition-*` rules below).
+ *    No CSS mount animation is applied to it directly - the morph *is*
+ *    the animation.
+ *  - The "add workspace" folder picker has no card to morph from, so it
+ *    keeps a plain CSS mount animation instead (`.modal--plain`, using the
+ *    `modal-glide` keyframe below) - a stylized open, not a pixel-exact
+ *    grow from anything. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  z-index: 100;
+  animation: modal-fade 0.18s ease both;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 100%;
+  max-width: 640px;
+  max-height: 100%;
+  overflow: auto;
+}
+
+.modal--plain {
+  animation: modal-glide 0.22s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.modal-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--band);
+}
+
+.modal-bar h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.modal-close {
+  flex-shrink: 0;
+  line-height: 1;
+  padding: 0.3rem 0.6rem;
+  font-size: 1rem;
+}
+
+.modal-body {
+  padding: 1rem;
+}
+
+.ws-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-bottom: 0.75rem;
+}
+
+@keyframes modal-fade {
+  from { opacity: 0; }
+}
+
+@keyframes modal-glide {
+  from {
+    opacity: 0;
+    transform: translateY(18px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop,
+  .modal--plain {
+    animation: none;
+  }
+
+  /* Belt-and-suspenders for the native morph itself: `start_view_transition`
+   * doesn't check `prefers-reduced-motion` in JS, so this is what actually
+   * disables the card<->modal grow/shrink animation for users who've asked
+   * for reduced motion - the DOM update still happens (instantly), just
+   * without the transition's own generated animation. */
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
 }
 
 .build-log {

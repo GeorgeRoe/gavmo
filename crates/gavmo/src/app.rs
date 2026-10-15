@@ -225,13 +225,166 @@ pub fn App() -> impl IntoView {
         <Stylesheet id="leptos" href="/pkg/gavmo.css"/>
         <Title text="GAVMO"/>
         <Router>
-            <main>
+            <main class="page">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
                 </Routes>
             </main>
         </Router>
     }
+}
+
+// ---------------------------------------------------------------------------
+// Card <-> modal morph: the View Transitions API.
+// ---------------------------------------------------------------------------
+
+/// A stable, CSS-ident-safe `view-transition-name` derived from a
+/// workspace's id. Ids are absolute filesystem paths (see
+/// `WorkspaceInfo::id`), which aren't valid CSS idents on their own - this
+/// hashes the id into a short, always-valid name instead.
+fn vt_name(id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    // The `ws-vt-` prefix guarantees a valid CSS identifier (must not
+    // start with a digit) regardless of the hash's own leading hex digit.
+    format!("ws-vt-{:x}", hasher.finish())
+}
+
+/// Extracts the DOM element a click event's listener is attached to
+/// (`current_target`, not `target` - correct even if the click actually
+/// landed on, and bubbled up from, a child element). Always `None` under
+/// `ssr`: there's no click event loop in server-side rendering to begin
+/// with, so this is dead code there, never actually invoked - it's written
+/// this way (one shared signature, `hydrate`-gated body) purely so
+/// `WorkspaceCard`'s `on:click` handler - itself shared, compiled-for-both-
+/// targets view code - doesn't need its own `#[cfg]` split.
+fn click_target(ev: &web_sys::MouseEvent) -> Option<web_sys::HtmlElement> {
+    #[cfg(feature = "hydrate")]
+    {
+        use wasm_bindgen::JsCast;
+        ev.current_target()?.dyn_into::<web_sys::HtmlElement>().ok()
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = ev;
+        None
+    }
+}
+
+/// Directly sets or clears (bypassing Leptos's reactive `style:` system -
+/// see [`start_view_transition`]'s doc comment for why) a card's inline
+/// `view-transition-name`; `name: None` clears it back to the default
+/// (`auto`). A no-op under `ssr`, for the same reason as [`click_target`].
+fn set_card_vt_name(el: &web_sys::HtmlElement, name: Option<&str>) {
+    #[cfg(feature = "hydrate")]
+    {
+        let style = el.style();
+        match name {
+            Some(name) => {
+                let _ = style.set_property("view-transition-name", name);
+            }
+            None => {
+                let _ = style.remove_property("view-transition-name");
+            }
+        }
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = (el, name);
+    }
+}
+
+/// Runs `update` - a Leptos signal write - wrapped in a View Transition
+/// when the browser supports `document.startViewTransition`, so whatever
+/// DOM change it causes (here: a card turning into the detail modal, or
+/// back) morphs instead of popping instantly; `on_finished` runs once the
+/// *entire* animated transition has completed (not just the DOM update
+/// itself - see below). Falls back to just calling both directly, in
+/// order, when the API isn't available - an **instant** open/close on
+/// older browsers, not an error.
+///
+/// Looked up dynamically via `js_sys::Reflect` rather than a typed web-sys
+/// binding - the exact approach `leptos_router` itself uses for its own
+/// route transitions (see its private `view_transition` module) - which
+/// avoids needing `--cfg=web_sys_unstable_apis` at all.
+///
+/// The one thing genuinely specific to *this* call site, rather than just
+/// copied from the router: Leptos signal writes don't patch the DOM
+/// synchronously - a `RenderEffect` re-run is scheduled on the reactive
+/// executor and only actually runs on a later "tick" (see
+/// `reactive_graph::effect::render_effect`). `startViewTransition`'s own
+/// callback is expected to return a thenable that it awaits *before*
+/// snapshotting the "new" state, so this runs `update()` (the signal
+/// write) and then awaits `leptos::task::tick()` to give the executor a
+/// turn to actually run the resulting render effect - mounting/unmounting
+/// the modal - before the promise resolves and the browser captures the
+/// after-snapshot.
+///
+/// `on_finished` exists for exactly one reason: the *closing* morph needs
+/// to hand a card's `view-transition-name` back to it for the post-close
+/// snapshot (see `WorkspaceCard`/`set_card_vt_name`), but that name must
+/// then be released again - otherwise it would linger on that card and get
+/// incorrectly swept into some later, unrelated transition for a
+/// *different* card. `.finished` (unlike the callback's own promise) only
+/// resolves once the whole animation has actually played out, which is the
+/// right moment to release it.
+#[cfg(feature = "hydrate")]
+fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOnce() + 'static) {
+    use js_sys::Reflect;
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    use wasm_bindgen_futures::{future_to_promise, JsFuture};
+
+    let document = document();
+    let svt = Reflect::get(&document, &JsValue::from_str("startViewTransition"))
+        .and_then(|f| f.dyn_into::<js_sys::Function>());
+
+    let Ok(svt) = svt else {
+        // Not supported in this browser - just apply both directly.
+        update();
+        on_finished();
+        return;
+    };
+
+    let cb = Closure::once_into_js(move || {
+        future_to_promise(async move {
+            update();
+            leptos::task::tick().await;
+            Ok(JsValue::UNDEFINED)
+        })
+    });
+    match svt.call1(document.unchecked_ref(), &cb) {
+        Ok(view_transition) => {
+            let finished = Reflect::get(&view_transition, &JsValue::from_str("finished"))
+                .ok()
+                .and_then(|p| p.dyn_into::<js_sys::Promise>().ok());
+            match finished {
+                Some(finished) => {
+                    leptos::task::spawn_local(async move {
+                        let _ = JsFuture::from(finished).await;
+                        on_finished();
+                    });
+                }
+                // Shouldn't happen (every real `ViewTransition` has a
+                // `finished` property) - fail safe by running the
+                // cleanup immediately rather than leaking it forever.
+                None => on_finished(),
+            }
+        }
+        // `svt` was just confirmed callable above; a call failing here
+        // would mean the document became inactive between the two calls -
+        // vanishingly unlikely for a click handler in a localhost control
+        // panel. `update` is already consumed inside `cb`, uncalled, in
+        // this case; not worth a recovery path for it, but `on_finished`
+        // is still ours to run so its cleanup isn't silently lost.
+        Err(_) => on_finished(),
+    }
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn start_view_transition(update: impl FnOnce(), on_finished: impl FnOnce()) {
+    update();
+    on_finished();
 }
 
 #[component]
@@ -320,95 +473,327 @@ fn HomePage() -> impl IntoView {
     let show_browser = RwSignal::new(false);
     let on_changed = Callback::new(move |()| reload());
 
+    // The currently open workspace's id, if any - drives the single detail
+    // modal below. At most one workspace is ever "open" at a time (opening
+    // a card replaces whatever was previously selected), unlike the old
+    // per-card inline `expanded` state, which let any number of cards be
+    // expanded simultaneously.
+    let selected = RwSignal::new(None::<String>);
+
+    // The DOM element of whichever `WorkspaceCard` is currently open (set
+    // directly by its `on:click`, alongside the matching
+    // `view-transition-name` it stamps onto that same element - see
+    // `click_target`/`set_card_vt_name`). Stashed here so the *closing*
+    // morph, triggered from inside the modal rather than the card, can
+    // still get back to the exact element it needs to hand the name back
+    // to. `None` whenever no workspace is selected.
+    let open_card_el = StoredValue::new(None::<web_sys::HtmlElement>);
+
     view! {
-        <div class="panel">
-            <section class="section section-header">
-                <h1>"GAVMO"</h1>
-                <div class="toolbar">
+        <header class="topbar">
+            <h1>"GAVMO"</h1>
+            <button class="primary" on:click=move |_| show_browser.set(true)>
+                "Add workspace"
+            </button>
+        </header>
+
+        <Show
+            // `<Show>` memoizes this boolean (leptos's `show.rs`
+            // wraps `when` in an `ArcMemo`), so the `<div class="ws-
+            // grid"><For/></div>` subtree below is only torn down
+            // and rebuilt when the list flips empty<->non-empty -
+            // *not* on every 3s poll that leaves it non-empty. That
+            // stability is what actually keeps `<For>` (and every
+            // card's local state) alive across polls - the stable
+            // `workspaces` signal above is necessary for `<For>` to
+            // diff correctly, but isn't sufficient on its own if
+            // something reading `workspaces` wraps `<For>` itself.
+            // The previous `{move || if workspaces.get().is_empty()
+            // {...} else {<For/>}}` did exactly that: its own
+            // condition read `workspaces`, so it re-ran (and
+            // remounted the whole grid) on every poll, and right
+            // after any in-card action too (via `on_changed` ->
+            // `reload()`).
+            when=move || !workspaces.with(Vec::is_empty)
+            fallback=move || view! {
+                <p class="empty">
+                    {move || if loaded.get() {
+                        "No workspaces yet. Click \"Add workspace\" to pick a repo."
+                    } else {
+                        "Loading…"
+                    }}
+                </p>
+            }
+        >
+            <div class="ws-grid">
+                <For
+                    // Braced (not bare `move || ...`): the
+                    // turbofish in `::<Vec<_>>()` contains
+                    // `<`/`>`, which the view! macro's
+                    // RSX-style attribute parser otherwise
+                    // misreads as tag syntax.
+                    each={move || workspaces.get().into_iter().map(|w| w.id).collect::<Vec<_>>()}
+                    key=|id| id.clone()
+                    let:id
+                >
+                    <WorkspaceCard id workspaces selected open_card_el/>
+                </For>
+            </div>
+        </Show>
+        {move || fetch_error.get().map(|e| view! {
+            <p class="error">"Failed to refresh workspaces: " {e}</p>
+        })}
+
+        // The detail modal - mounted only while a workspace is selected.
+        // Captured with `get_untracked()` inside the (otherwise static,
+        // non-reactive) closure below: `selected` only ever transitions
+        // `None <-> Some(id)` (never `Some(a) -> Some(b)` directly, since
+        // the backdrop blocks clicks on other cards while open), so the id
+        // is stable for the modal's whole mounted lifetime and doesn't need
+        // to react to further changes in `selected` itself.
+        <Show when=move || selected.get().is_some() fallback=|| ()>
+            {move || {
+                let id = selected.get_untracked().expect("selected is Some");
+                let name = vt_name(&id);
+                view! {
+                    <WorkspaceModal
+                        id
+                        workspaces
+                        on_changed
+                        on_close=Callback::new(move |()| {
+                            // Captured *locally*, once, right as closing
+                            // starts - rather than re-reading
+                            // `open_card_el` later from inside the
+                            // closures below - so a fast reopen (of a
+                            // *different* card) racing this same close's
+                            // own async cleanup can never stomp on each
+                            // other: `open_card_el` is immediately cleared
+                            // here, freeing a new `WorkspaceCard` click to
+                            // overwrite it safely, while this close's own
+                            // two closures keep working with the one
+                            // element they captured up front.
+                            let el = open_card_el.get_value();
+                            open_card_el.set_value(None);
+                            let el_for_cleanup = el.clone();
+                            let name = name.clone();
+                            start_view_transition(
+                                move || {
+                                    // New (post-close) snapshot: hand the
+                                    // name back to the card so the modal
+                                    // can morph back into it.
+                                    if let Some(el) = &el {
+                                        set_card_vt_name(el, Some(&name));
+                                    }
+                                    selected.set(None);
+                                },
+                                move || {
+                                    let el = el_for_cleanup;
+                                    // The whole close animation is done -
+                                    // release the name again so it doesn't
+                                    // linger on this card and get swept
+                                    // into some later, unrelated
+                                    // transition for a *different* card.
+                                    if let Some(el) = &el {
+                                        set_card_vt_name(el, None);
+                                    }
+                                },
+                            );
+                        })
+                    />
+                }
+            }}
+        </Show>
+
+        // The "add workspace" folder picker, in the same modal shell.
+        <Show when=move || show_browser.get() fallback=|| ()>
+            <Modal on_close=Callback::new(move |()| show_browser.set(false)) title="Add workspace".to_string()>
+                <FolderBrowser on_added=Callback::new(move |()| {
+                    show_browser.set(false);
+                    reload();
+                })/>
+            </Modal>
+        </Show>
+    }
+}
+
+/// A floating modal: a dimmed full-screen backdrop plus a centered square
+/// panel. Clicking the backdrop or the close button, or pressing Escape,
+/// all invoke `on_close`. Used for both the workspace detail view
+/// ([`WorkspaceModal`]) and the "add workspace" folder picker.
+///
+/// `vt_name`, when `Some`, is applied to the panel as its
+/// `view-transition-name` - this is what lets [`WorkspaceModal`] morph out
+/// of (and back into) the card that opened it (see [`start_view_transition`]
+/// and `vt_name`'s own doc comment). The folder picker passes `None`: it
+/// has no corresponding card to morph from, so it just pops in/out with the
+/// browser's default root crossfade like any other DOM change.
+#[component]
+fn Modal(
+    on_close: Callback<()>,
+    title: String,
+    #[prop(optional_no_strip)] vt_name: Option<String>,
+    children: Children,
+) -> impl IntoView {
+    // Escape-to-close. `window_event_listener` is a no-op on the server
+    // (see its `is_server()` check) and is cleaned up via `on_cleanup` when
+    // this component's owner is disposed - i.e. whenever the `<Show>` above
+    // unmounts it, which is exactly when the listener should stop existing.
+    let handle = window_event_listener(leptos::ev::keydown, move |ev| {
+        if ev.key() == "Escape" {
+            on_close.run(());
+        }
+    });
+    on_cleanup(move || handle.remove());
+
+    // Whether this modal has a card to morph from. When `true`, the panel
+    // relies entirely on the native View Transition morph (driven by
+    // `vt_name` below) for its open/close motion; when `false` (the folder
+    // picker), there's no corresponding card, so it keeps the plain CSS
+    // mount animation (`.modal--plain`) instead. Read before `vt_name` is
+    // moved into the `style:` binding just below.
+    let morphing = vt_name.is_some();
+
+    view! {
+        <div class="modal-backdrop" on:click=move |_| on_close.run(())>
+            <div
+                class="modal"
+                class:modal--plain=!morphing
+                style:view-transition-name=vt_name
+                on:click=|ev| ev.stop_propagation()
+            >
+                <div class="modal-bar">
+                    <h2>{title}</h2>
                     <button
-                        class="primary"
-                        on:click=move |_| show_browser.update(|v| *v = !*v)
+                        class="modal-close"
+                        aria-label="Close"
+                        on:click=move |_| on_close.run(())
                     >
-                        {move || if show_browser.get() { "Close picker" } else { "Add workspace" }}
+                        "×"
                     </button>
                 </div>
-            </section>
-
-            <Show when=move || show_browser.get() fallback=|| ()>
-                <section class="section">
-                    <FolderBrowser on_added=Callback::new(move |()| {
-                        show_browser.set(false);
-                        reload();
-                    })/>
-                </section>
-            </Show>
-
-            <section class="section section-grid">
-                <Show
-                    // `<Show>` memoizes this boolean (leptos's `show.rs`
-                    // wraps `when` in an `ArcMemo`), so the `<div class="ws-
-                    // grid"><For/></div>` subtree below is only torn down
-                    // and rebuilt when the list flips empty<->non-empty -
-                    // *not* on every 3s poll that leaves it non-empty. That
-                    // stability is what actually keeps `<For>` (and every
-                    // card's local state: expanded, confirm toggles, the
-                    // build-log viewer) alive across polls - the stable
-                    // `workspaces` signal above is necessary for `<For>` to
-                    // diff correctly, but isn't sufficient on its own if
-                    // something reading `workspaces` wraps `<For>` itself.
-                    // The previous `{move || if workspaces.get().is_empty()
-                    // {...} else {<For/>}}` did exactly that: its own
-                    // condition read `workspaces`, so it re-ran (and
-                    // remounted the whole grid, collapsing any expanded
-                    // card) on every poll, and right after any in-card
-                    // action too (via `on_changed` -> `reload()`).
-                    when=move || !workspaces.with(Vec::is_empty)
-                    fallback=move || view! {
-                        <p class="empty">
-                            {move || if loaded.get() {
-                                "No workspaces yet. Click \"Add workspace\" to pick a repo."
-                            } else {
-                                "Loading…"
-                            }}
-                        </p>
-                    }
-                >
-                    <div class="ws-grid">
-                        <For
-                            // Braced (not bare `move || ...`): the
-                            // turbofish in `::<Vec<_>>()` contains
-                            // `<`/`>`, which the view! macro's
-                            // RSX-style attribute parser otherwise
-                            // misreads as tag syntax.
-                            each={move || workspaces.get().into_iter().map(|w| w.id).collect::<Vec<_>>()}
-                            key=|id| id.clone()
-                            let:id
-                        >
-                            <WorkspaceCard id workspaces on_changed/>
-                        </For>
-                    </div>
-                </Show>
-                {move || fetch_error.get().map(|e| view! {
-                    <p class="error">"Failed to refresh workspaces: " {e}</p>
-                })}
-            </section>
+                <div class="modal-body">
+                    {children()}
+                </div>
+            </div>
         </div>
     }
 }
 
-/// One workspace's card in the grid: a compact header (always visible) that
-/// expands on click into the full detail/actions panel. Mounted once per
-/// `id` by `<For>` in `HomePage` and never torn down while the id remains
-/// in the list (see `HomePage`'s doc comment on `workspaces`) - so every
-/// signal declared here (`expanded`, `busy`, confirm toggles, the build-log
-/// viewer) persists across every live-status poll, not just one.
+/// One workspace's card in the grid: just the compact, always-visible
+/// summary (badge + name + path). Mounted once per `id` by `<For>` in
+/// `HomePage` and never torn down while the id remains in the list (see
+/// `HomePage`'s doc comment on `workspaces`). Clicking it opens
+/// [`WorkspaceModal`] - all of the former inline detail/actions panel now
+/// lives there instead, as a single floating modal shared across every
+/// card rather than per-card state.
 #[component]
 fn WorkspaceCard(
     id: String,
     workspaces: RwSignal<Vec<WorkspaceInfo>>,
-    on_changed: Callback<()>,
+    selected: RwSignal<Option<String>>,
+    open_card_el: StoredValue<Option<web_sys::HtmlElement>>,
 ) -> impl IntoView {
-    // A `Copy` handle to this card's id, even though `String` itself isn't.
+    let id = StoredValue::new(id);
+
+    // This card's own reactive slice of the shared `workspaces` list - the
+    // mechanism that lets status/path update live without the card itself
+    // being recreated. Falls back to `Stopped` with this card's own `id` as
+    // a placeholder path in the narrow window between this workspace being
+    // removed from `workspaces` (e.g. via Remove) and `<For>` unmounting
+    // this card in response to that same change - both happen off the same
+    // signal in the same reactive pass, so this is never visible for more
+    // than a frame, if at all.
+    let card_info = Memo::new(move |_| {
+        let current_id = id.get_value();
+        workspaces.get().into_iter().find(|w| w.id == current_id).unwrap_or_else(|| WorkspaceInfo {
+            id: current_id.clone(),
+            path: current_id,
+            status: WorkspaceStatus::Stopped,
+        })
+    });
+
+    view! {
+        <div
+            class="ws-card"
+            // No `view-transition-name` in steady state - only the one
+            // card actually being opened/closed at any given moment ever
+            // carries one (set directly below, bypassing Leptos entirely;
+            // see `start_view_transition`'s doc comment for why). Giving
+            // *every* card a permanent name here instead was the first
+            // version of this - and it was wrong: a `view-transition-name`
+            // pulls an element into its own composited layer for the
+            // *entire* duration of *any* transition happening anywhere on
+            // the page, regardless of whether that element is actually
+            // involved. With every card permanently named, opening one
+            // card lifted *all the others* (and nothing else) above the
+            // backdrop's dimming layer for the whole animation, so they
+            // visibly only caught up to the dimmed look once the real DOM
+            // took back over at the end - the "other cards gray out late"
+            // bug. Scoping the name to just the one involved card - set
+            // right before the transition starts, cleared right after -
+            // keeps every uninvolved card (and the "Add workspace" button)
+            // correctly part of the plain, un-lifted root snapshot, so the
+            // backdrop dims everything in one synchronized pass like any
+            // ordinary DOM change would.
+            on:click=move |ev| {
+                let clicked = id.get_value();
+                let name = vt_name(&clicked);
+                let el = click_target(&ev);
+                if let Some(el) = &el {
+                    // Old snapshot: this card must already show the name
+                    // - set synchronously, *before* `start_view_transition`
+                    // (and the browser, inside it) captures it.
+                    set_card_vt_name(el, Some(&name));
+                }
+                open_card_el.set_value(el.clone());
+                start_view_transition(
+                    move || {
+                        // New snapshot: the modal claims the name now -
+                        // this card must give it up, or the snapshot
+                        // would have two elements sharing one name.
+                        if let Some(el) = &el {
+                            set_card_vt_name(el, None);
+                        }
+                        selected.set(Some(clicked));
+                    },
+                    // Nothing to release once *opening* finishes - the
+                    // card legitimately stays unnamed for as long as the
+                    // modal remains open; see the `on_close` handler in
+                    // `HomePage` for the matching close-side cleanup.
+                    || {},
+                );
+            }
+        >
+            {move || {
+                let (badge_class, badge_text, _) = status_view(&card_info.get().status);
+                view! { <span class=format!("badge {badge_class}")>{badge_text}</span> }
+            }}
+            <div class="ws-id">
+                <span class="name">
+                    {move || {
+                        let path = card_info.get().path;
+                        path.rsplit('/').next().unwrap_or(&path).to_string()
+                    }}
+                </span>
+                <span class="path">{move || card_info.get().path}</span>
+            </div>
+        </div>
+    }
+}
+
+/// The detail/actions view for one workspace, shown as the content of the
+/// floating modal (see `HomePage`'s `selected` signal and `Modal`). Mounted
+/// fresh each time a card is opened, and unmounted when it's closed - all
+/// local state here (`busy`, confirm toggles, the build-log viewer) starts
+/// over on each open, same as the rest of the modal's content would.
+#[component]
+fn WorkspaceModal(
+    id: String,
+    workspaces: RwSignal<Vec<WorkspaceInfo>>,
+    on_changed: Callback<()>,
+    on_close: Callback<()>,
+) -> impl IntoView {
+    // A `Copy` handle to this modal's id, even though `String` itself isn't.
     // Below, several closures end up nested multiple levels deep inside
     // `<Show>`'s children (which - like any Leptos reactive content - must
     // stay callable repeatedly, not just once). A *plain* `String` moved
@@ -427,14 +812,13 @@ fn WorkspaceCard(
     // `String` whenever it actually runs.
     let id = StoredValue::new(id);
 
-    // This card's own reactive slice of the shared `workspaces` list - the
-    // mechanism that lets status/path update live without the card itself
-    // (and all the state below) being recreated. Falls back to `Stopped`
-    // with this card's own `id` as a placeholder path in the narrow window
+    // This modal's own reactive slice of the shared `workspaces` list - the
+    // mechanism that lets status update live while the modal is open,
+    // without the modal itself being recreated. Falls back to `Stopped`
+    // with this modal's own `id` as a placeholder path in the narrow window
     // between this workspace being removed from `workspaces` (e.g. via
-    // Remove) and `<For>` unmounting this card in response to that same
-    // change - both happen off the same signal in the same reactive pass,
-    // so this is never visible for more than a frame, if at all.
+    // Remove) and `on_changed`/the caller closing the modal in response to
+    // that same change.
     let card_info = Memo::new(move |_| {
         let current_id = id.get_value();
         workspaces.get().into_iter().find(|w| w.id == current_id).unwrap_or_else(|| WorkspaceInfo {
@@ -444,7 +828,6 @@ fn WorkspaceCard(
         })
     });
 
-    let expanded = RwSignal::new(false);
     let busy = RwSignal::new(false);
     // Shared across open/stop/reset/remove: whichever of them last failed.
     let action_error = RwSignal::new(None::<String>);
@@ -529,190 +912,188 @@ fn WorkspaceCard(
         });
     };
 
+    // The modal's title - the path's last segment, same as the card's
+    // name. Computed once (untracked) since the modal is mounted fresh per
+    // open; a workspace's path/name doesn't change while it's open.
+    let title = {
+        let path = card_info.get_untracked().path;
+        path.rsplit('/').next().unwrap_or(&path).to_string()
+    };
+
+    // Same name the clicked `WorkspaceCard` just handed off (see its
+    // `style:view-transition-name`) - claiming it here is what makes the
+    // browser morph that card into this modal, and back again on close.
+    let vt_name = Some(vt_name(&id.get_value()));
+
     view! {
-        <div class="ws-card" class:expanded=move || expanded.get()>
-            <div class="ws-card-header" on:click=move |_| expanded.update(|e| *e = !*e)>
+        <Modal on_close title vt_name>
+            <div class="ws-modal-head">
                 {move || {
                     let (badge_class, badge_text, _) = status_view(&card_info.get().status);
                     view! { <span class=format!("badge {badge_class}")>{badge_text}</span> }
                 }}
-                <div class="ws-id">
-                    <span class="name">
-                        {move || {
-                            let path = card_info.get().path;
-                            path.rsplit('/').next().unwrap_or(&path).to_string()
-                        }}
-                    </span>
-                    <span class="path">{move || card_info.get().path}</span>
-                </div>
-                <span class="chevron" aria-hidden="true">
-                    {move || if expanded.get() { "▾" } else { "▸" }}
-                </span>
+                <span class="path">{move || card_info.get().path}</span>
             </div>
-            <Show when=move || expanded.get()>
-                <div class="ws-card-detail" on:click=|ev| ev.stop_propagation()>
-                    <div class="actions">
-                        {move || status_view(&card_info.get().status).2.map(|u| view! {
-                            <a href=u target="_blank" rel="noreferrer">
-                                <button>"Open UI"</button>
-                            </a>
-                        })}
-                        // M2: if the last boot attempt failed because the
-                        // repo's `gavmo.nix` didn't build, offer an
-                        // on-demand viewer for the full `nixos-rebuild` log
-                        // (`vm::Error::RebuildFailed` /
-                        // `AppState::read_build_log`).
-                        {move || matches!(card_info.get().status, WorkspaceStatus::BuildFailed { .. }).then(|| view! {
-                            <button on:click=move |_| {
-                                if build_log_open.get_untracked() {
-                                    build_log_open.set(false);
-                                    return;
-                                }
-                                let WorkspaceStatus::BuildFailed { log } = card_info.get_untracked().status else {
-                                    return;
-                                };
-                                build_log_open.set(true);
-                                build_log_content.set(None); // "Loading…" until the fetch below resolves
-                                let id = id.get_value();
-                                leptos::task::spawn_local(async move {
-                                    let result = read_build_log(id, log).await.map_err(|e| e.to_string());
-                                    build_log_content.set(Some(result));
-                                });
-                            }>
-                                {move || if build_log_open.get() { "Hide build log" } else { "View build log" }}
-                            </button>
-                        })}
-                        // U3: a single Start/Stop toggle rather than two
-                        // separate buttons - the live status always maps to
-                        // exactly one valid action, so there's no need for
-                        // per-status disabling the way the old two-button
-                        // version needed (disabled states followed the live
-                        // poll, not just `busy` - previously both stayed
-                        // clickable for the ~3s between a fire-and-forget
-                        // action returning and the next poll picking up the
-                        // real status, which was exactly how a user could
-                        // reach Reset while still `Booting` and hit the R1
-                        // race that was paired with fixing). "Stop" while
-                        // Booting/Running (lets an in-progress boot be
-                        // cancelled, same as the old standalone Stop did);
-                        // "Start" otherwise - idle, or retrying after
-                        // Failed/BuildFailed. Disabled only while this
-                        // card's own `busy` action is in flight.
-                        <button
-                            on:click=move |ev| {
-                                if matches!(
-                                    card_info.get_untracked().status,
-                                    WorkspaceStatus::Booting | WorkspaceStatus::Running { .. }
-                                ) {
-                                    stop(ev);
-                                } else {
-                                    open(ev);
-                                }
+                <div class="actions">
+                    {move || status_view(&card_info.get().status).2.map(|u| view! {
+                        <a href=u target="_blank" rel="noreferrer">
+                            <button>"Open UI"</button>
+                        </a>
+                    })}
+                    // M2: if the last boot attempt failed because the
+                    // repo's `gavmo.nix` didn't build, offer an
+                    // on-demand viewer for the full `nixos-rebuild` log
+                    // (`vm::Error::RebuildFailed` /
+                    // `AppState::read_build_log`).
+                    {move || matches!(card_info.get().status, WorkspaceStatus::BuildFailed { .. }).then(|| view! {
+                        <button on:click=move |_| {
+                            if build_log_open.get_untracked() {
+                                build_log_open.set(false);
+                                return;
                             }
-                            disabled=move || busy.get()
-                        >
-                            {move || if matches!(
-                                card_info.get().status,
+                            let WorkspaceStatus::BuildFailed { log } = card_info.get_untracked().status else {
+                                return;
+                            };
+                            build_log_open.set(true);
+                            build_log_content.set(None); // "Loading…" until the fetch below resolves
+                            let id = id.get_value();
+                            leptos::task::spawn_local(async move {
+                                let result = read_build_log(id, log).await.map_err(|e| e.to_string());
+                                build_log_content.set(Some(result));
+                            });
+                        }>
+                            {move || if build_log_open.get() { "Hide build log" } else { "View build log" }}
+                        </button>
+                    })}
+                    // U3: a single Start/Stop toggle rather than two
+                    // separate buttons - the live status always maps to
+                    // exactly one valid action, so there's no need for
+                    // per-status disabling the way the old two-button
+                    // version needed (disabled states followed the live
+                    // poll, not just `busy` - previously both stayed
+                    // clickable for the ~3s between a fire-and-forget
+                    // action returning and the next poll picking up the
+                    // real status, which was exactly how a user could
+                    // reach Reset while still `Booting` and hit the R1
+                    // race that was paired with fixing). "Stop" while
+                    // Booting/Running (lets an in-progress boot be
+                    // cancelled, same as the old standalone Stop did);
+                    // "Start" otherwise - idle, or retrying after
+                    // Failed/BuildFailed. Disabled only while this
+                    // card's own `busy` action is in flight.
+                    <button
+                        on:click=move |ev| {
+                            if matches!(
+                                card_info.get_untracked().status,
                                 WorkspaceStatus::Booting | WorkspaceStatus::Running { .. }
                             ) {
-                                "Stop"
+                                stop(ev);
                             } else {
-                                "Start"
-                            }}
-                        </button>
-                        {move || if confirming_reset.get() {
-                            view! {
-                                <span class="reset-confirm">
-                                    <span class="reset-confirm-label">"Delete all VM state?"</span>
-                                    <button class="danger" on:click=reset disabled=move || busy.get()>
-                                        {move || if busy.get() { "Resetting…" } else { "Confirm" }}
-                                    </button>
-                                    <button
-                                        on:click=move |_| confirming_reset.set(false)
-                                        disabled=move || busy.get()
-                                    >
-                                        "Cancel"
-                                    </button>
-                                </span>
-                            }.into_any()
+                                open(ev);
+                            }
+                        }
+                        disabled=move || busy.get()
+                    >
+                        {move || if matches!(
+                            card_info.get().status,
+                            WorkspaceStatus::Booting | WorkspaceStatus::Running { .. }
+                        ) {
+                            "Stop"
                         } else {
-                            view! {
-                                <button
-                                    // U3: disabled while `Booting` too - R1
-                                    // makes resetting mid-boot safe/race-
-                                    // free, but it's still a destructive
-                                    // action better reserved for a settled
-                                    // state; Stop (or just waiting) is the
-                                    // better tool for an in-progress boot.
-                                    on:click=move |_| {
-                                        confirming_remove.set(false);
-                                        confirming_reset.set(true);
-                                    }
-                                    disabled=move || {
-                                        busy.get() || matches!(card_info.get().status, WorkspaceStatus::Booting)
-                                    }
-                                >
-                                    "Reset"
-                                </button>
-                            }.into_any()
+                            "Start"
                         }}
-                        {move || if confirming_remove.get() {
-                            view! {
-                                <span class="reset-confirm">
-                                    <span class="reset-confirm-label">"Remove from list?"</span>
-                                    <button class="danger" on:click=remove disabled=move || busy.get()>
-                                        {move || if busy.get() { "Removing…" } else { "Confirm" }}
-                                    </button>
-                                    <button
-                                        on:click=move |_| confirming_remove.set(false)
-                                        disabled=move || busy.get()
-                                    >
-                                        "Cancel"
-                                    </button>
-                                </span>
-                            }.into_any()
-                        } else {
-                            view! {
+                    </button>
+                    {move || if confirming_reset.get() {
+                        view! {
+                            <span class="reset-confirm">
+                                <span class="reset-confirm-label">"Delete all VM state?"</span>
+                                <button class="danger" on:click=reset disabled=move || busy.get()>
+                                    {move || if busy.get() { "Resetting…" } else { "Confirm" }}
+                                </button>
                                 <button
-                                    on:click=move |_| {
-                                        confirming_reset.set(false);
-                                        confirming_remove.set(true);
-                                    }
+                                    on:click=move |_| confirming_reset.set(false)
                                     disabled=move || busy.get()
                                 >
-                                    "Remove"
+                                    "Cancel"
                                 </button>
-                            }.into_any()
+                            </span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <button
+                                // U3: disabled while `Booting` too - R1
+                                // makes resetting mid-boot safe/race-
+                                // free, but it's still a destructive
+                                // action better reserved for a settled
+                                // state; Stop (or just waiting) is the
+                                // better tool for an in-progress boot.
+                                on:click=move |_| {
+                                    confirming_remove.set(false);
+                                    confirming_reset.set(true);
+                                }
+                                disabled=move || {
+                                    busy.get() || matches!(card_info.get().status, WorkspaceStatus::Booting)
+                                }
+                            >
+                                "Reset"
+                            </button>
+                        }.into_any()
+                    }}
+                    {move || if confirming_remove.get() {
+                        view! {
+                            <span class="reset-confirm">
+                                <span class="reset-confirm-label">"Remove from list?"</span>
+                                <button class="danger" on:click=remove disabled=move || busy.get()>
+                                    {move || if busy.get() { "Removing…" } else { "Confirm" }}
+                                </button>
+                                <button
+                                    on:click=move |_| confirming_remove.set(false)
+                                    disabled=move || busy.get()
+                                >
+                                    "Cancel"
+                                </button>
+                            </span>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <button
+                                on:click=move |_| {
+                                    confirming_reset.set(false);
+                                    confirming_remove.set(true);
+                                }
+                                disabled=move || busy.get()
+                            >
+                                "Remove"
+                            </button>
+                        }.into_any()
+                    }}
+                </div>
+                {move || matches!(card_info.get().status, WorkspaceStatus::Booting).then(|| view! {
+                    // U5: a static hint rather than an elapsed-time
+                    // counter - a live timer would need its own
+                    // tick-driven signal here; not worth the added
+                    // complexity for a first pass.
+                    <p class="hint">
+                        "First boot can take a few minutes - longer if "
+                        <code>"gavmo.nix"</code>
+                        " needs to fetch or build new packages."
+                    </p>
+                })}
+                {move || action_error.get().map(|e| view! {
+                    <p class="error">{e}</p>
+                })}
+                {move || build_log_open.get().then(|| view! {
+                    <div class="build-log-panel">
+                        {move || match build_log_content.get() {
+                            None => view! { <p class="empty">"Loading…"</p> }.into_any(),
+                            Some(Ok(text)) => view! { <pre class="build-log">{text}</pre> }.into_any(),
+                            Some(Err(e)) => view! {
+                                <p class="error">"Failed to load build log: " {e}</p>
+                            }.into_any(),
                         }}
                     </div>
-                    {move || matches!(card_info.get().status, WorkspaceStatus::Booting).then(|| view! {
-                        // U5: a static hint rather than an elapsed-time
-                        // counter - a live timer would need its own
-                        // tick-driven signal here; not worth the added
-                        // complexity for a first pass.
-                        <p class="hint">
-                            "First boot can take a few minutes - longer if "
-                            <code>"gavmo.nix"</code>
-                            " needs to fetch or build new packages."
-                        </p>
-                    })}
-                    {move || action_error.get().map(|e| view! {
-                        <p class="error">{e}</p>
-                    })}
-                    {move || build_log_open.get().then(|| view! {
-                        <div class="build-log-panel">
-                            {move || match build_log_content.get() {
-                                None => view! { <p class="empty">"Loading…"</p> }.into_any(),
-                                Some(Ok(text)) => view! { <pre class="build-log">{text}</pre> }.into_any(),
-                                Some(Err(e)) => view! {
-                                    <p class="error">"Failed to load build log: " {e}</p>
-                                }.into_any(),
-                            }}
-                        </div>
-                    })}
-                </div>
-            </Show>
-        </div>
+                })}
+        </Modal>
     }
 }
 

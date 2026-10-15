@@ -25,12 +25,36 @@ vm = { path = "../vm", optional = true }
 # hydrate-only (wasm32 browser build) dependencies.
 console_error_panic_hook = { version = "0.1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+# Used to drive the View Transitions API (card -> modal morph) by calling
+# `document.startViewTransition` dynamically via `js_sys::Reflect` — see
+# `app.rs`'s `start_view_transition`. Dynamic lookup (rather than a typed
+# web-sys binding) avoids needing `--cfg=web_sys_unstable_apis` at all;
+# `leptos_router` itself uses the same trick for its own route transitions.
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+# Used in `app.rs`'s *shared* (both-target) view code for one specific
+# reason: `WorkspaceCard`'s `on:click` handler's event parameter type is
+# `web_sys::MouseEvent` regardless of target (that's just what Leptos's
+# `on:click` always gives you - see `tachys::html::event`'s `EventDescriptor`
+# impl for `click`), so naming it in a function signature compiled for both
+# `ssr`/`hydrate` needs `web-sys` available either way. This is safe: like
+# `wasm-bindgen`/`js-sys`, `web-sys`'s generated bindings are cross-target by
+# design (stub bodies on non-wasm32) - `leptos`'s own `tachys` already pulls
+# it in unconditionally for exactly this reason. The actual DOM calls
+# (`app.rs`'s `click_target`/`set_card_vt_name`) are still `hydrate`-gated
+# internally; nothing here ever runs on the server (there's no click event
+# loop in SSR to begin with).
+web-sys = { version = "0.3", optional = true, features = ["HtmlElement", "CssStyleDeclaration"] }
 
 [features]
 hydrate = [
     "leptos/hydrate",
     "dep:console_error_panic_hook",
     "dep:wasm-bindgen",
+    "dep:js-sys",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
 ]
 ssr = [
     "dep:axum",
@@ -40,6 +64,7 @@ ssr = [
     "dep:dirs",
     "dep:uuid",
     "dep:vm",
+    "dep:web-sys",
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
