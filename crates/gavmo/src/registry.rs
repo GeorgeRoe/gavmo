@@ -6,7 +6,7 @@
 //! mechanism behind the daemon's server functions. See
 //! `crates/gavmo/plan.md` §§6–7.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use vm::{Error as VmError, RunningVm, VmConfig, VmStatus};
 
-use crate::app::{VmStats, WorkspaceInfo, WorkspaceStatus};
+use mcp::{TokenAuthority, ToolDescriptor, ToolExecutor, ToolOutcome, WorkspaceScope};
+use secrets::SecretStore;
+
+use crate::app::{ToolConfig, VmStats, WorkspaceInfo, WorkspaceStatus};
+use crate::integrations::{CandidateTool, ResolvedIntegration, ScopeKind};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -81,6 +85,41 @@ struct Inner {
     gcloud_dir: PathBuf,
     memory_mib: u32,
     vcpus: u32,
+
+    /// Root dir for every workspace's MCP token share (see `mcp_dir_for`) —
+    /// `~/.local/share/gavmo/mcp`, deliberately **outside** any repo (see
+    /// `VmConfig::mcp_dir`'s doc comment for why).
+    mcp_base_dir: PathBuf,
+
+    /// Bearer token -> workspace id, for [`AppState`]'s [`TokenAuthority`]
+    /// impl. A `std::sync::Mutex`, not the `tokio::sync::Mutex` used
+    /// elsewhere in this file: `TokenAuthority::resolve` is a synchronous
+    /// trait method (see `mcp`'s doc comment on why — it's called from
+    /// inside `mcp`'s async `ServerHandler` methods, but as a plain
+    /// in-memory `HashMap` lookup there's never a reason to `.await` while
+    /// holding this lock, so a blocking mutex is both simpler and correct
+    /// here. Minted fresh (and any stale entry for the same workspace
+    /// dropped) on every `open_workspace`; cleared on `stop`/`reset`.
+    mcp_tokens: std::sync::Mutex<HashMap<String, String>>,
+
+    /// Host secret store backing the tool integrations (V1.3 — see
+    /// `crate::integrations`). An `Arc<dyn …>` so the concrete backend
+    /// (keyring today, the encrypted vault later) is swappable without
+    /// touching `AppState`'s callers.
+    secret_store: Arc<dyn SecretStore>,
+
+    /// Workspace id -> the tool integrations resolved for its current boot
+    /// (see `crate::integrations::resolve`). Populated by `open_workspace` once
+    /// a VM boots and read by this struct's [`ToolExecutor`] impl; cleared on
+    /// `stop`/`reset` alongside the MCP token. A `std::sync::Mutex` for the same
+    /// reason as `mcp_tokens`: `ToolExecutor::list_tools` is synchronous and
+    /// this is a plain in-memory lookup.
+    workspace_integrations: std::sync::Mutex<HashMap<String, Vec<ResolvedIntegration>>>,
+
+    /// Shared HTTP client for the tool forwarder (V1.4 — see
+    /// `crate::integrations::forward`). Cloning a `reqwest::Client` shares its
+    /// connection pool, so one instance serves every workspace's tool calls.
+    http_client: reqwest::Client,
 }
 
 /// State of a workspace's VM while a boot is in flight or has settled.
@@ -123,6 +162,10 @@ impl AppState {
     pub fn new(base_image: PathBuf, gcloud_dir: PathBuf) -> io::Result<Self> {
         let registry_path = registry_path()?;
         let registry = load_registry(&registry_path)?;
+        let mcp_base_dir = dirs::data_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
+            .join("gavmo")
+            .join("mcp");
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -133,6 +176,11 @@ impl AppState {
                 gcloud_dir,
                 memory_mib: DEFAULT_MEMORY_MIB,
                 vcpus: DEFAULT_VCPUS,
+                mcp_base_dir,
+                mcp_tokens: std::sync::Mutex::new(HashMap::new()),
+                secret_store: Arc::new(secrets::KeyringStore::new()),
+                workspace_integrations: std::sync::Mutex::new(HashMap::new()),
+                http_client: reqwest::Client::new(),
             }),
         })
     }
@@ -160,13 +208,13 @@ impl AppState {
     /// Registers a new workspace by absolute host path. Idempotent: adding
     /// a path that is already known is a no-op.
     pub async fn add_workspace(&self, path: String) -> io::Result<()> {
-        let canonical = std::fs::canonicalize(&path)?
-            .to_string_lossy()
-            .into_owned();
+        let canonical = std::fs::canonicalize(&path)?.to_string_lossy().into_owned();
 
         let mut registry = self.inner.registry.lock().await;
         if !registry.workspaces.iter().any(|w| w.path == canonical) {
-            registry.workspaces.push(WorkspaceRecord { path: canonical });
+            registry
+                .workspaces
+                .push(WorkspaceRecord { path: canonical });
             save_registry(&self.inner.registry_path, &registry)?;
         }
         Ok(())
@@ -206,7 +254,29 @@ impl AppState {
             Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
         }
 
-        let cfg = match self.vm_config(id) {
+        // Mint a fresh per-boot MCP capability token and publish it into the
+        // read-only share the guest mounts at `/etc/gavmo/mcp` (see
+        // `crates/mcp/plan.md`), *before* building `VmConfig` (which embeds
+        // the same directory as `mcp_dir`). Must only happen on an actual
+        // new boot — not on the early-return "already booting/running"
+        // paths above — since silently rotating a *running* VM's token
+        // would invalidate the one its already-started `gavmo-opencode`
+        // loaded into its environment, breaking an otherwise-healthy VM's
+        // tool calls for no reason.
+        //
+        // This does mean a (cheap, one-shot) file write happens while
+        // holding `running`'s lock, slightly widening the window other
+        // `status`/`list` callers wait behind it — accepted the same way
+        // this function already accepts holding the lock across its other
+        // synchronous setup work.
+        let mcp_dir = self.mcp_dir_for(id);
+        if let Err(e) = self.mint_mcp_token(id, &mcp_dir).await {
+            let reason = format!("failed to write MCP token: {e}");
+            running.insert(id.to_string(), VmSlot::Failed(reason.clone()));
+            return Err(reason);
+        }
+
+        let cfg = match self.vm_config(id, mcp_dir) {
             Ok(cfg) => cfg,
             Err(e) => {
                 let reason = e.to_string();
@@ -219,6 +289,18 @@ impl AppState {
         let task_id = id.to_string();
         let handle = tokio::spawn(async move {
             let result = RunningVm::boot(cfg).await;
+
+            // Resolve this workspace's enabled tool integrations (reads its
+            // `gavmo.yaml`, fetches any referenced team spec) *before* taking
+            // the running lock, so that network fetch can't block `status`/
+            // `list` callers waiting on it. Only meaningful on a successful
+            // boot; a failed boot exposes no tools.
+            let integrations = if result.is_ok() {
+                state.resolve_integrations_for(&task_id).await
+            } else {
+                Vec::new()
+            };
+
             let mut running = state.inner.running.lock().await;
 
             // If the slot is no longer `Booting` (e.g. `stop`/`reset` raced
@@ -239,6 +321,7 @@ impl AppState {
             let still_wanted = matches!(running.get(&task_id), Some(VmSlot::Booting(_)));
             match result {
                 Ok(vm) if still_wanted => {
+                    state.set_integrations(&task_id, integrations);
                     running.insert(task_id, VmSlot::Running(Box::new(vm)));
                 }
                 Ok(vm) => {
@@ -282,6 +365,14 @@ impl AppState {
     /// instantly; accepted, since "stop" blocking until actually stopped is
     /// arguably more correct than the previous fire-and-forget behavior.
     pub async fn stop_workspace(&self, id: &str) -> Result<(), String> {
+        // Invalidate this workspace's MCP capability token up front — a
+        // stopped (or about-to-be-replaced-by-abort) VM should never be
+        // able to authorize gateway calls again, regardless of how the
+        // match below resolves. Idempotent and harmless if there was never
+        // a token (a workspace that was never opened).
+        self.clear_mcp_token(id);
+        self.clear_integrations(id);
+
         let slot = self.inner.running.lock().await.remove(id);
         match slot {
             Some(VmSlot::Running(vm)) => vm.stop().await.map_err(|e| e.to_string()),
@@ -338,6 +429,9 @@ impl AppState {
     /// longer be running — and therefore not still writing to
     /// `.gavmo/vm` — by the time it's deleted below.
     pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
+        self.clear_mcp_token(id);
+        self.clear_integrations(id);
+
         let slot = self.inner.running.lock().await.remove(id);
         match slot {
             Some(VmSlot::Running(vm)) => {
@@ -354,8 +448,11 @@ impl AppState {
     }
 
     /// Builds the per-VM [`VmConfig`] for a workspace path, allocating a
-    /// fresh host port from the OS.
-    fn vm_config(&self, id: &str) -> io::Result<VmConfig> {
+    /// fresh host port from the OS. `mcp_dir` is threaded in rather than
+    /// recomputed here since the caller ([`Self::open_workspace`]) already
+    /// needed it a step earlier, to mint/write that boot's MCP token before
+    /// `VmConfig` existed.
+    fn vm_config(&self, id: &str, mcp_dir: PathBuf) -> io::Result<VmConfig> {
         let repo_dir = PathBuf::from(id);
         let state_dir = Self::state_dir_for(id);
         let workspace_id = repo_dir
@@ -370,6 +467,7 @@ impl AppState {
             state_dir,
             base_image: self.inner.base_image.clone(),
             gcloud_dir: self.inner.gcloud_dir.clone(),
+            mcp_dir,
             memory_mib: self.inner.memory_mib,
             vcpus: self.inner.vcpus,
             host_port,
@@ -383,6 +481,270 @@ impl AppState {
     /// outlive the boot attempt that produced it).
     fn state_dir_for(id: &str) -> PathBuf {
         PathBuf::from(id).join(".gavmo").join("vm")
+    }
+
+    /// This workspace's MCP token share directory — **deliberately outside**
+    /// any repo (unlike `state_dir_for`), under GAVMO's own app-data dir
+    /// (`mcp_base_dir`, set in [`Self::new`]). See `VmConfig::mcp_dir`'s doc
+    /// comment for why the token must not live inside the user's repo.
+    /// `mcp_share_dir_name` turns the workspace's absolute-path identity
+    /// into a stable, filesystem-safe (and repo-independent) directory name.
+    fn mcp_dir_for(&self, id: &str) -> PathBuf {
+        self.inner.mcp_base_dir.join(mcp_share_dir_name(id))
+    }
+
+    /// Mints a fresh MCP capability token for `id`, writes it to that
+    /// workspace's token share as `token.env` (loaded by the guest's
+    /// `gavmo-opencode` service via systemd's `EnvironmentFile` — see
+    /// `nix/base/configuration.nix` — as `GAVMO_MCP_TOKEN`), and records it
+    /// in the in-memory `mcp_tokens` map this struct's [`TokenAuthority`]
+    /// impl resolves against. Drops any token this workspace held from a
+    /// previous boot first: exactly one token is ever valid for a workspace
+    /// at a time.
+    async fn mint_mcp_token(&self, id: &str, dir: &Path) -> io::Result<()> {
+        tokio::fs::create_dir_all(dir).await?;
+        let token = uuid::Uuid::new_v4().to_string();
+        let path = dir.join("token.env");
+        tokio::fs::write(&path, format!("GAVMO_MCP_TOKEN={token}\n")).await?;
+
+        // Best-effort: the share is already read-only in the guest and this
+        // dir isn't inside any repo, but owner-only permissions on the host
+        // copy are cheap insurance against another local user reading it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+
+        let mut tokens = self.inner.mcp_tokens.lock().unwrap();
+        tokens.retain(|_, v| v != id);
+        tokens.insert(token, id.to_string());
+        Ok(())
+    }
+
+    /// Invalidates whatever MCP token `id` currently holds, if any. Called
+    /// whenever a workspace's VM is stopped or reset (see
+    /// [`Self::stop_workspace`]/[`Self::reset_workspace`]) so a no-longer-
+    /// running VM can never successfully call the gateway again, even if its
+    /// `token.env` file is still sitting on disk.
+    fn clear_mcp_token(&self, id: &str) {
+        self.inner.mcp_tokens.lock().unwrap().retain(|_, v| v != id);
+    }
+
+    /// Resolves the *enabled* tool integrations for `id` (the configured subset
+    /// the gateway exposes): enumerates requested tools (reads `gavmo.yaml` +
+    /// fetches any team spec), then keeps only those with a configured secret via
+    /// a batched `spawn_blocking` keyring check. Called from the boot task
+    /// *before* the running lock is taken, so neither the team-spec HTTP fetch nor
+    /// the keyring access blocks other `running`-lock callers.
+    async fn resolve_integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
+        let candidates = self.candidates_for(id).await;
+        let present = self
+            .secrets_present(candidates.iter().map(|c| c.secret_key.clone()).collect())
+            .await;
+        candidates
+            .into_iter()
+            .filter(|candidate| present.contains(&candidate.secret_key))
+            .map(CandidateTool::into_resolved)
+            .collect()
+    }
+
+    /// Records the resolved integrations for a freshly-booted workspace, so
+    /// this struct's [`ToolExecutor`] impl can advertise/dispatch them.
+    fn set_integrations(&self, id: &str, integrations: Vec<ResolvedIntegration>) {
+        self.inner
+            .workspace_integrations
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), integrations);
+    }
+
+    /// Forgets a workspace's integrations. Called on stop/reset alongside
+    /// [`Self::clear_mcp_token`] so a stopped VM exposes no tools (the cleared
+    /// token already makes it unauthorized; this just keeps the map tidy).
+    fn clear_integrations(&self, id: &str) {
+        self.inner.workspace_integrations.lock().unwrap().remove(id);
+    }
+
+    /// The integrations currently resolved for `id` (empty if none/stopped).
+    fn integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
+        self.inner
+            .workspace_integrations
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Resolves *every* tool this workspace's `gavmo.yaml` requests
+    /// (structurally, without touching the secret store), by reading the config
+    /// and fetching any referenced team spec. Unlike the boot-time
+    /// `workspace_integrations` cache (enabled subset, frozen at boot), this is
+    /// computed live — so the control panel reflects config changes immediately.
+    async fn candidates_for(&self, id: &str) -> Vec<CandidateTool> {
+        let config = crate::integrations::read_config(id).await;
+        crate::integrations::resolve_candidates(id, &config).await
+    }
+
+    /// Finds a single requested tool by id (structural; no secret-store access).
+    async fn candidate(&self, id: &str, tool_id: &str) -> Result<CandidateTool, String> {
+        self.candidates_for(id)
+            .await
+            .into_iter()
+            .find(|candidate| candidate.id == tool_id)
+            .ok_or_else(|| format!("unknown tool: {tool_id}"))
+    }
+
+    // --- keyring access helpers (always off the async worker) ---------------
+    //
+    // Every one of these runs the (synchronous, potentially slow — a locked
+    // keyring can prompt) `SecretStore` call on a blocking thread via
+    // `spawn_blocking`, so it can never stall a tokio worker. Combined with the
+    // `async-io` keyring backend (see `crates/secrets/Cargo.toml`), this is what
+    // makes keyring access safe from the daemon's async code.
+
+    /// Fetches one secret value (`None` if absent or on backend error).
+    async fn secret_get(&self, key: String) -> Option<String> {
+        let store = self.inner.secret_store.clone();
+        tokio::task::spawn_blocking(move || store.get(&key).ok().flatten())
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Stores one secret value.
+    async fn secret_set(&self, key: String, value: String) -> Result<(), String> {
+        let store = self.inner.secret_store.clone();
+        tokio::task::spawn_blocking(move || store.set(&key, &value))
+            .await
+            .map_err(|e| format!("secret store task failed: {e}"))?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Deletes one secret value.
+    async fn secret_delete(&self, key: String) -> Result<(), String> {
+        let store = self.inner.secret_store.clone();
+        tokio::task::spawn_blocking(move || store.delete(&key))
+            .await
+            .map_err(|e| format!("secret store task failed: {e}"))?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Checks which of `keys` currently have a stored value, in a single
+    /// blocking batch (one `spawn_blocking` for the whole set rather than one per
+    /// key).
+    async fn secrets_present(&self, keys: Vec<String>) -> HashSet<String> {
+        let store = self.inner.secret_store.clone();
+        tokio::task::spawn_blocking(move || {
+            keys.into_iter()
+                .filter(|key| store.get(key).ok().flatten().is_some())
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The control panel's view of a workspace's requested tools and whether
+    /// each has its credential configured (see [`crate::app::ToolConfig`]).
+    pub async fn list_tool_configs(&self, id: &str) -> Vec<ToolConfig> {
+        let candidates = self.candidates_for(id).await;
+        let present = self
+            .secrets_present(candidates.iter().map(|c| c.secret_key.clone()).collect())
+            .await;
+
+        candidates
+            .into_iter()
+            .map(|tool| ToolConfig {
+                configured: present.contains(&tool.secret_key),
+                id: tool.id,
+                description: tool
+                    .def
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
+                base_url: tool.def.base_url,
+                scope: match tool.scope_kind {
+                    ScopeKind::Team => "team",
+                    ScopeKind::Project => "project",
+                }
+                .to_string(),
+                auth: match tool.def.auth {
+                    teamspec::AuthScheme::Basic => "basic",
+                    teamspec::AuthScheme::Bearer => "bearer",
+                    teamspec::AuthScheme::Header => "header",
+                }
+                .to_string(),
+                secret_name: tool.def.secret,
+                instructions: tool.def.instructions,
+            })
+            .collect()
+    }
+
+    /// Stores (or replaces) a tool's credential in the secret store. For Basic
+    /// auth both `username` and `token` are required; for Bearer/Header only
+    /// `token`. The value is JSON-encoded in the shape the forwarder expects
+    /// (see `crate::integrations`'s credential structs). Takes effect for a VM
+    /// on its next open (a running VM's advertised tools are frozen at boot).
+    pub async fn set_tool_secret(
+        &self,
+        id: &str,
+        tool_id: &str,
+        username: Option<String>,
+        token: String,
+    ) -> Result<(), String> {
+        let tool = self.candidate(id, tool_id).await?;
+
+        let value = match tool.def.auth {
+            teamspec::AuthScheme::Basic => {
+                let username = username
+                    .filter(|u| !u.is_empty())
+                    .ok_or_else(|| "basic auth requires a username/email".to_string())?;
+                serde_json::json!({ "username": username, "password": token })
+            }
+            teamspec::AuthScheme::Bearer | teamspec::AuthScheme::Header => {
+                serde_json::json!({ "token": token })
+            }
+        };
+
+        self.secret_set(tool.secret_key, value.to_string()).await
+    }
+
+    /// Removes a tool's stored credential (disabling it on the next open).
+    pub async fn clear_tool_secret(&self, id: &str, tool_id: &str) -> Result<(), String> {
+        let tool = self.candidate(id, tool_id).await?;
+        self.secret_delete(tool.secret_key).await
+    }
+
+    /// Live connectivity/credential test: forwards a `GET` (to the tool's
+    /// configured `test_path`, or `/` if none) with the stored credential and
+    /// returns the resulting status + body (`Ok` on 2xx, `Err` otherwise) so the
+    /// control panel can show a red/green result. With a `test_path` pointing at
+    /// an auth-reflecting endpoint (e.g. Jira's `rest/api/3/myself`) this is a
+    /// real credential check; without one it's a bare reachability probe.
+    pub async fn test_tool(&self, id: &str, tool_id: &str) -> Result<String, String> {
+        let tool = self.candidate(id, tool_id).await?;
+        let secret_value = self.secret_get(tool.secret_key.clone()).await;
+
+        let test_path = tool
+            .def
+            .test_path
+            .clone()
+            .unwrap_or_else(|| "/".to_string());
+        let mut args = serde_json::Map::new();
+        args.insert("method".to_string(), serde_json::json!("GET"));
+        args.insert("path".to_string(), serde_json::json!(test_path));
+
+        match crate::integrations::forward(
+            &tool.into_resolved(),
+            secret_value,
+            &args,
+            &self.inner.http_client,
+        )
+        .await
+        {
+            ToolOutcome::Success(text) => Ok(text),
+            ToolOutcome::Error(text) => Err(text),
+        }
     }
 
     /// Reads a build-failure log written by the guest's M2 `gavmo-rebuild`
@@ -479,6 +841,113 @@ impl AppState {
             host_port,
         })
     }
+}
+
+/// Lets `crates/mcp`'s gateway resolve a bearer token to a workspace without
+/// that crate depending on `gavmo` at all (see `mcp`'s own doc comment on
+/// [`TokenAuthority`]) — `AppState` just answers from the in-memory
+/// `mcp_tokens` map maintained by [`AppState::mint_mcp_token`]/
+/// [`AppState::clear_mcp_token`].
+impl TokenAuthority for AppState {
+    fn resolve(&self, token: &str) -> Option<WorkspaceScope> {
+        let tokens = self.inner.mcp_tokens.lock().unwrap();
+        let workspace_id = tokens.get(token)?.clone();
+        Some(WorkspaceScope { workspace_id })
+    }
+}
+
+/// The daemon's tool implementation, consumed by the `mcp` gateway (see
+/// [`mcp::ToolExecutor`]). This is the seam where real tools (the generic
+/// host-locked HTTP forwarder, resolving credentials from the secret store)
+/// will land in V1.3+. For now it ports P4.0's connectivity probe `gavmo_ping`
+/// onto the trait so the gateway's behavior is unchanged: an authorized
+/// workspace sees exactly `gavmo_ping`, and calling it echoes back the
+/// workspace id.
+impl ToolExecutor for AppState {
+    fn list_tools(&self, scope: &WorkspaceScope) -> Vec<ToolDescriptor> {
+        // Always expose the connectivity probe, plus one generic forwarder tool
+        // per enabled integration for this workspace.
+        let mut tools = vec![ping_descriptor()];
+        for integration in self.integrations_for(&scope.workspace_id) {
+            tools.push(crate::integrations::integration_tool_descriptor(
+                &integration,
+            ));
+        }
+        tools
+    }
+
+    async fn call_tool(
+        &self,
+        scope: &WorkspaceScope,
+        name: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> ToolOutcome {
+        if name == "gavmo_ping" {
+            return ToolOutcome::Success(format!("pong from workspace {}", scope.workspace_id));
+        }
+
+        // Otherwise it must be one of this workspace's integration tools. The
+        // gateway already rejected names we never advertised, so a miss here is
+        // only possible in a narrow race (tools cleared between list and call);
+        // treat it as a tool-level error.
+        match self
+            .integrations_for(&scope.workspace_id)
+            .into_iter()
+            .find(|integration| integration.id == name)
+        {
+            Some(integration) => {
+                // Fetch the credential value fresh at call time (never cached in
+                // the resolved-integrations map, which holds only the key), via
+                // `spawn_blocking` so the keyring round trip never stalls an async
+                // worker (see `Self::secret_get`).
+                let secret_value = self.secret_get(integration.secret_key.clone()).await;
+                crate::integrations::forward(
+                    &integration,
+                    secret_value,
+                    &arguments,
+                    &self.inner.http_client,
+                )
+                .await
+            }
+            None => ToolOutcome::Error(format!("unknown tool: {name}")),
+        }
+    }
+}
+
+/// The `gavmo_ping` tool descriptor: no arguments, just proves a round trip
+/// (discovery + call + auth) through the whole pipeline. Mirrors the
+/// empty-object input schema the tool previously advertised from `crates/mcp`.
+fn ping_descriptor() -> ToolDescriptor {
+    let mut input_schema = serde_json::Map::new();
+    input_schema.insert(
+        "type".to_string(),
+        serde_json::Value::String("object".into()),
+    );
+    input_schema.insert("properties".to_string(), serde_json::json!({}));
+    input_schema.insert(
+        "additionalProperties".to_string(),
+        serde_json::Value::Bool(false),
+    );
+    ToolDescriptor {
+        name: "gavmo_ping".to_string(),
+        description: "Checks connectivity to the GAVMO host-side tool gateway and reports \
+             which workspace this VM is authorized for. Takes no arguments."
+            .to_string(),
+        input_schema,
+    }
+}
+
+/// Deterministic, filesystem-safe directory name for a workspace's MCP
+/// token share (`AppState::mcp_dir_for`), derived from its absolute-path
+/// identity. Plain hex rather than e.g. base64: trivially correct (no
+/// alphabet/padding edge cases to get right) and the names are internal
+/// plumbing never meant to be read by a human, so hex's verbosity costs
+/// nothing. Deliberately a *different* encoding from
+/// `OPENCODE_WORKSPACE_SESSION_PATH`'s base64url — that one's shape is
+/// dictated by opencode's own route scheme; this one is GAVMO's own
+/// choice and has no reason to match it.
+fn mcp_share_dir_name(id: &str) -> String {
+    id.bytes().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Deletes a directory tree, treating "already gone" as success rather than
@@ -667,7 +1136,8 @@ mod tests {
     /// real terminal.
     #[test]
     fn sanitize_console_strips_systemd_sgr_color_sequences() {
-        let raw = "[\u{1b}[0;32m  OK  \u{1b}[0m] Started \u{1b}[0;1;39mJournal Service\u{1b}[0m.\r\n";
+        let raw =
+            "[\u{1b}[0;32m  OK  \u{1b}[0m] Started \u{1b}[0;1;39mJournal Service\u{1b}[0m.\r\n";
         assert_eq!(
             sanitize_console(raw.as_bytes()),
             "[  OK  ] Started Journal Service.\n"
@@ -734,8 +1204,7 @@ mod tests {
     /// so this test actually catches drift rather than just restating the
     /// constant.
     fn base64_url_nopad(input: &str) -> String {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let bytes = input.as_bytes();
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
@@ -812,9 +1281,7 @@ mod tests {
         assert!(!is_safe_rebuild_log_filename("../../../etc/passwd"));
         assert!(!is_safe_rebuild_log_filename("rebuild-../../secret.log"));
         assert!(!is_safe_rebuild_log_filename("rebuild-foo/../bar.log"));
-        assert!(!is_safe_rebuild_log_filename(
-            "/etc/gavmo/system/flake.nix"
-        ));
+        assert!(!is_safe_rebuild_log_filename("/etc/gavmo/system/flake.nix"));
         assert!(!is_safe_rebuild_log_filename("rebuild-foo\\bar.log"));
 
         // Wrong shape entirely.
@@ -831,10 +1298,7 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "gavmo-test-{tag}-{}-{n}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("gavmo-test-{tag}-{}-{n}", std::process::id()))
     }
 
     /// [`AppState::reset_workspace`]'s core guarantee, exercised directly on
@@ -944,12 +1408,116 @@ mod tests {
             .await
             .insert(id.clone(), never_finishing_boot_slot());
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), state.reset_workspace(&id))
-            .await
-            .expect("reset_workspace should abort the in-flight boot promptly, not wait for it")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.reset_workspace(&id),
+        )
+        .await
+        .expect("reset_workspace should abort the in-flight boot promptly, not wait for it")
+        .unwrap();
 
         assert!(!state_dir.exists());
         assert!(state.inner.running.lock().await.get(&id).is_none());
+    }
+
+    /// Pure, deterministic, and distinct for distinct inputs — the basic
+    /// contract `AppState::mcp_dir_for` relies on to avoid two workspaces
+    /// colliding on the same token-share directory.
+    #[test]
+    fn mcp_share_dir_name_is_deterministic_and_filesystem_safe() {
+        let a = mcp_share_dir_name("/home/user/project-a");
+        let b = mcp_share_dir_name("/home/user/project-b");
+
+        assert_eq!(a, mcp_share_dir_name("/home/user/project-a"));
+        assert_ne!(a, b);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The core round trip [`AppState::mint_mcp_token`] /
+    /// [`TokenAuthority::resolve`] must support: minting a token for a
+    /// workspace writes a guest-loadable `token.env` *and* makes that exact
+    /// token resolve back to the same workspace id.
+    #[tokio::test]
+    async fn mint_mcp_token_writes_env_file_and_resolves_via_token_authority() {
+        let state = test_app_state();
+        let id = "mint-mcp-token-writes-env-file-and-resolves";
+        let dir = unique_temp_dir("mcp-token-mint");
+
+        state.mint_mcp_token(id, &dir).await.unwrap();
+
+        let contents = tokio::fs::read_to_string(dir.join("token.env"))
+            .await
+            .unwrap();
+        let token = contents
+            .trim()
+            .strip_prefix("GAVMO_MCP_TOKEN=")
+            .expect("token.env should contain GAVMO_MCP_TOKEN=<token>")
+            .to_string();
+        assert!(!token.is_empty());
+
+        assert_eq!(
+            TokenAuthority::resolve(&state, &token),
+            Some(WorkspaceScope {
+                workspace_id: id.to_string()
+            })
+        );
+    }
+
+    /// A workspace holds exactly one *currently valid* token at a time:
+    /// re-minting (a fresh `open_workspace` boot) must invalidate whatever
+    /// token a previous boot handed out, not leave both valid.
+    #[tokio::test]
+    async fn minting_a_new_token_invalidates_the_previous_one_for_the_same_workspace() {
+        let state = test_app_state();
+        let id = "minting-a-new-token-invalidates-the-previous-one";
+        let dir = unique_temp_dir("mcp-token-remint");
+
+        state.mint_mcp_token(id, &dir).await.unwrap();
+        let old_token = {
+            let tokens = state.inner.mcp_tokens.lock().unwrap();
+            tokens
+                .iter()
+                .find(|(_, v)| *v == id)
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+
+        state.mint_mcp_token(id, &dir).await.unwrap();
+
+        assert_eq!(TokenAuthority::resolve(&state, &old_token), None);
+    }
+
+    /// [`AppState::clear_mcp_token`] (called from `stop_workspace`/
+    /// `reset_workspace`) must make a workspace's token stop resolving
+    /// immediately — a stopped VM's capability token must not keep working.
+    #[tokio::test]
+    async fn clear_mcp_token_invalidates_resolution() {
+        let state = test_app_state();
+        let id = "clear-mcp-token-invalidates-resolution";
+        let dir = unique_temp_dir("mcp-token-clear");
+
+        state.mint_mcp_token(id, &dir).await.unwrap();
+        let token = {
+            let tokens = state.inner.mcp_tokens.lock().unwrap();
+            tokens
+                .iter()
+                .find(|(_, v)| *v == id)
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+        assert!(TokenAuthority::resolve(&state, &token).is_some());
+
+        state.clear_mcp_token(id);
+
+        assert_eq!(TokenAuthority::resolve(&state, &token), None);
+    }
+
+    /// An unknown token (never minted) must resolve to nothing — the
+    /// baseline "unauthenticated" case every real MCP call that's missing
+    /// or has a garbage bearer token hits.
+    #[test]
+    fn resolve_returns_none_for_an_unknown_token() {
+        let state = test_app_state();
+        assert_eq!(TokenAuthority::resolve(&state, "never-minted"), None);
     }
 }

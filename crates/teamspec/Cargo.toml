@@ -1,0 +1,21 @@
+[package]
+name = "teamspec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# serde_yaml 0.9 is in maintenance-only mode upstream but is still the de-facto
+# YAML<->serde bridge and has no known issues for our simple schema. If it ever
+# needs replacing, `serde_yaml_ng` is a drop-in fork — the swap is confined to
+# this crate's `parse_*` functions.
+serde_yaml = "0.9"
+thiserror = "2"
+# Used only for the host-lock URL math (`lock_url`) — robust, spec-compliant
+# parsing is exactly what makes the "reject any other host" guarantee trustworthy
+# rather than hand-rolled string prefixing an attacker could sidestep.
+url = "2"
+# On-demand HTTPS fetch of a team spec (v1: raw URL, no signature — see
+# gavmo-tools-config-plan.md §13a). rustls (not native-tls) to avoid an OpenSSL
+# build/system dependency, matching the cross-platform, easy-install goal.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

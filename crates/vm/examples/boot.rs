@@ -51,12 +51,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".to_string());
 
+    // The real daemon keeps this *outside* the repo (see
+    // `crates/gavmo/src/registry.rs::mcp_dir_for`) so the MCP capability
+    // token never lands in the user's repo. This throwaway example has no
+    // daemon app-data dir to put it in, so it just reuses `.gavmo` for
+    // simplicity — fine for a manual debug run, not a pattern to copy.
+    let mcp_dir = repo_dir.join(".gavmo").join("mcp");
+    std::fs::create_dir_all(&mcp_dir)?;
+
     let cfg = VmConfig {
         workspace_id,
         repo_dir: repo_dir.clone(),
         state_dir,
         base_image,
         gcloud_dir,
+        mcp_dir,
         memory_mib: 4096,
         vcpus: 4,
         host_port,

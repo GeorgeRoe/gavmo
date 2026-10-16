@@ -33,6 +33,18 @@ pub struct VmConfig {
     /// the guest so `opencode` can authenticate to Vertex AI.
     pub gcloud_dir: PathBuf,
 
+    /// Host path to this workspace's MCP token share — a small daemon-owned
+    /// directory (**not** under `repo_dir`/`state_dir`; see
+    /// `crates/gavmo/src/registry.rs`'s `mcp_dir_for`) containing a
+    /// `token.env` the guest loads as `GAVMO_MCP_TOKEN` (via systemd's
+    /// `EnvironmentFile`, see `nix/base/configuration.nix`). Shared
+    /// read-only into the guest at `/etc/gavmo/mcp`, parallel to
+    /// `gcloud_dir` — see `crates/mcp/plan.md` for the full design (why a
+    /// dedicated share rather than reusing `state_dir`: keeps the
+    /// capability token out of the user's repo, which `state_dir`, being
+    /// under `repo_dir/.gavmo/vm`, is not).
+    pub mcp_dir: PathBuf,
+
     /// Guest memory, in MiB.
     pub memory_mib: u32,
 

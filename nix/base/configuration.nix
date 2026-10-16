@@ -157,6 +157,28 @@ in
     ];
   };
 
+  # Phase 4 / P4.0 (see `crates/mcp/plan.md`): the per-workspace MCP
+  # capability token share. Mirrors the gcloud mount above exactly (same
+  # 9p options, same read-only posture) - the only dynamic per-workspace
+  # value the host needs to get into the guest for the tool gateway is this
+  # one bearer token (see `VmConfig::mcp_dir` in `crates/vm/src/config.rs`
+  # for why it's a dedicated share and not just a file under `/workspace`).
+  # `EnvironmentFile` on `gavmo-opencode` below loads `token.env` from here
+  # directly - no guest-side script needed to turn it into an env var.
+  fileSystems."/etc/gavmo/mcp" = {
+    device = "mcp";
+    fsType = "9p";
+    options = [
+      "trans=virtio"
+      "version=9p2000.L"
+      "cache=none"
+      "msize=1048576"
+      "ro"
+      "nofail"
+      "x-systemd.device-timeout=10s"
+    ];
+  };
+
   # --- M2 hardening: keep Nix's regenerable caches off the persistent disk --
   # Nix runs its fetcher-cache and eval-cache SQLite DBs with `pragma
   # synchronous = off` (durability traded for speed) under `~/.cache/nix` -
@@ -237,6 +259,27 @@ in
       "claude-opus-4-8@default"
       "claude-fable-5@default"
     ];
+
+    # Phase 4 (see `crates/mcp/plan.md`): GAVMO's host-side tool gateway.
+    # `10.0.2.2` is QEMU user-mode networking's address for the host from
+    # inside the guest; `7071` is `mcp::GAVMO_MCP_PORT` - there is no
+    # automatic sharing between that Rust constant and this literal, so a
+    # change to one must be mirrored here by hand. `enabled = true`
+    # unconditionally: the gateway itself decides per-call (via the bearer
+    # token) what tools a workspace is actually authorized to see - an
+    # unauthenticated or tool-less workspace just gets an empty tool list
+    # back, not a connection failure (see `crates/mcp/src/lib.rs`'s
+    # `list_tools`). `GAVMO_MCP_TOKEN` is loaded from the read-only
+    # `/etc/gavmo/mcp/token.env` share above via this service's
+    # `EnvironmentFile` below - baked as a managed config value (not
+    # something a repo's own opencode.json could point elsewhere) so a
+    # repo can't redirect this at a different, attacker-controlled URL.
+    mcp.gavmo-tools = {
+      type = "remote";
+      url = "http://10.0.2.2:7071/mcp";
+      enabled = true;
+      headers.Authorization = "Bearer {env:GAVMO_MCP_TOKEN}";
+    };
 
     # The VM is the security boundary, not opencode's permission system -
     # once `bash` is allow-all, per-category denies (read/external_directory/
@@ -487,6 +530,17 @@ in
     serviceConfig = {
       ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /root/.local/share /root/.config /root/.cache";
       WorkingDirectory = "/workspace";
+      # `GAVMO_MCP_TOKEN` for the managed `mcp.gavmo-tools` config entry
+      # above, loaded straight from the read-only MCP token share - no
+      # script-side parsing needed. Leading `-` makes a missing file
+      # non-fatal (same `nofail`-style posture as the 9p mounts themselves):
+      # if `/etc/gavmo/mcp` hasn't finished mounting by the time this starts
+      # (no explicit unit ordering against it, same as the gcloud share
+      # above), the service still starts with no token, and `Restart =
+      # "always"` below means the next restart picks it up once the mount
+      # has settled - at the cost of the gateway rejecting calls (empty
+      # bearer) until then.
+      EnvironmentFile = "-/etc/gavmo/mcp/token.env";
       Restart = "always";
       RestartSec = "1";
       # Journal only, not console: originally routed to console too (in

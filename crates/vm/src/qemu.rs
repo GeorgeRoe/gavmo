@@ -100,6 +100,7 @@ mod tests {
             state_dir: PathBuf::from("/home/user/project/.gavmo/vm"),
             base_image: PathBuf::from("/var/lib/gavmo/base.qcow2"),
             gcloud_dir: PathBuf::from("/home/user/.config/gcloud"),
+            mcp_dir: PathBuf::from("/var/lib/gavmo/mcp/test-workspace"),
             memory_mib: 4096,
             vcpus: 4,
             host_port: 45123,
@@ -134,6 +135,10 @@ mod tests {
         );
     }
 
+    /// Mirrors the three shares `RunningVm::boot` actually assembles
+    /// (`handle.rs`) — workspace (rw), gcloud (ro), and the MCP token share
+    /// (ro, see `VmConfig::mcp_dir`/`crates/mcp/plan.md`) — even though
+    /// `build_qemu_args` itself is share-count-agnostic.
     #[test]
     fn args_include_each_share() {
         let cfg = test_cfg();
@@ -155,13 +160,26 @@ mod tests {
                     read_only: true,
                 },
             ),
+            (
+                &nine_p,
+                ShareSpec {
+                    host_path: cfg.mcp_dir.clone(),
+                    mount_tag: "mcp",
+                    read_only: true,
+                },
+            ),
         ];
 
         let args = build_qemu_args(&cfg, &shares);
 
         assert!(args.iter().any(|a| a.contains("mount_tag=workspace")));
         assert!(args.iter().any(|a| a.contains("mount_tag=gcloud")));
-        assert!(args.iter().any(|a| a.contains("readonly=on")));
+        assert!(args.iter().any(|a| a.contains("mount_tag=mcp")));
+        assert_eq!(
+            args.iter().filter(|a| a.contains("readonly=on")).count(),
+            2,
+            "gcloud and mcp shares are read-only; workspace is not"
+        );
     }
 
     #[cfg(target_os = "linux")]

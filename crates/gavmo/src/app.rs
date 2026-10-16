@@ -30,13 +30,19 @@ pub struct WorkspaceInfo {
 pub enum WorkspaceStatus {
     Stopped,
     Booting,
-    Running { url: String },
-    Failed { reason: String },
+    Running {
+        url: String,
+    },
+    Failed {
+        reason: String,
+    },
     /// The repo's `gavmo.nix` failed to build (detected within seconds via
     /// the guest's failure marker, not a full boot-health timeout — see
     /// `nix/base/configuration.nix`'s `gavmo-rebuild` service). `log` is the
     /// failed run's log filename, fetchable via [`read_build_log`].
-    BuildFailed { log: String },
+    BuildFailed {
+        log: String,
+    },
 }
 
 /// Host-side resource usage for a `Running` workspace's VM, shown in the
@@ -83,6 +89,31 @@ pub struct DirListing {
 pub struct DirEntry {
     pub name: String,
     pub path: String,
+}
+
+/// A tool a workspace's `gavmo.yaml` requests, for the control panel's Tools
+/// panel (V1.5). `auth`/`scope` are plain strings — not the `ssr`-only
+/// `teamspec` enums — so this type is usable in the wasm/hydrate build too.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolConfig {
+    /// Tool id (also the name the agent calls it by).
+    pub id: String,
+    /// Human-facing description from the spec (or a generated fallback).
+    pub description: String,
+    /// The integration's base URL (shown so the user can verify where their
+    /// credential will be sent).
+    pub base_url: String,
+    /// `"team"` or `"project"`.
+    pub scope: String,
+    /// `"basic"`, `"bearer"`, or `"header"` — drives which secret fields the
+    /// configure form shows.
+    pub auth: String,
+    /// The secret reference name declared in the spec.
+    pub secret_name: String,
+    /// Optional setup help from the spec.
+    pub instructions: Option<String>,
+    /// Whether a credential is currently stored for this tool.
+    pub configured: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,10 +193,7 @@ pub async fn add_workspace(path: String) -> Result<(), ServerFnError> {
 #[server]
 pub async fn open_workspace(id: String) -> Result<(), ServerFnError> {
     let state = app_state()?;
-    state
-        .open_workspace(&id)
-        .await
-        .map_err(ServerFnError::new)
+    state.open_workspace(&id).await.map_err(ServerFnError::new)
 }
 
 #[server]
@@ -213,8 +241,7 @@ pub async fn browse_dir(path: Option<String>) -> Result<DirListing, ServerFnErro
 
     let dir = match path {
         Some(p) => PathBuf::from(p),
-        None => dirs::home_dir()
-            .ok_or_else(|| ServerFnError::new("no home directory"))?,
+        None => dirs::home_dir().ok_or_else(|| ServerFnError::new("no home directory"))?,
     };
     let dir = std::fs::canonicalize(&dir)
         .map_err(|e| ServerFnError::new(format!("{}: {e}", dir.display())))?;
@@ -243,6 +270,55 @@ pub async fn browse_dir(path: Option<String>) -> Result<DirListing, ServerFnErro
         parent: dir.parent().map(|p| p.to_string_lossy().into_owned()),
         entries,
     })
+}
+
+/// Lists the tools a workspace's `gavmo.yaml` requests, with each one's
+/// configured status — for the modal's Tools panel. Computed live (reads the
+/// config, fetches any team spec), so it reflects config/secret changes without
+/// a restart.
+#[server]
+pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, ServerFnError> {
+    let state = app_state()?;
+    Ok(state.list_tool_configs(&id).await)
+}
+
+/// Stores (or replaces) a tool's credential on the host. `username` is only used
+/// for Basic auth; Bearer/Header pass just `token`. The credential never leaves
+/// the host — see `registry::AppState::set_tool_secret`.
+#[server]
+pub async fn set_tool_secret(
+    id: String,
+    tool_id: String,
+    username: Option<String>,
+    token: String,
+) -> Result<(), ServerFnError> {
+    let state = app_state()?;
+    state
+        .set_tool_secret(&id, &tool_id, username, token)
+        .await
+        .map_err(ServerFnError::new)
+}
+
+/// Removes a tool's stored credential (disabling it on the workspace's next open).
+#[server]
+pub async fn clear_tool_secret(id: String, tool_id: String) -> Result<(), ServerFnError> {
+    let state = app_state()?;
+    state
+        .clear_tool_secret(&id, &tool_id)
+        .await
+        .map_err(ServerFnError::new)
+}
+
+/// Live connectivity/credential test for a configured tool: forwards a `GET /`
+/// with the stored credential and returns the status + body. `Err` is returned
+/// for a non-2xx (or transport failure) so the UI can show a red result.
+#[server]
+pub async fn test_tool(id: String, tool_id: String) -> Result<String, ServerFnError> {
+    let state = app_state()?;
+    state
+        .test_tool(&id, &tool_id)
+        .await
+        .map_err(ServerFnError::new)
 }
 
 /// Fetches the injected [`registry::AppState`] from Leptos context. Only
@@ -405,7 +481,7 @@ fn scroll_to_bottom(el: &web_sys::HtmlPreElement) {
 #[cfg(feature = "hydrate")]
 fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOnce() + 'static) {
     use js_sys::Reflect;
-    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
     use wasm_bindgen_futures::{future_to_promise, JsFuture};
 
     let document = document();
@@ -778,11 +854,15 @@ fn WorkspaceCard(
     // than a frame, if at all.
     let card_info = Memo::new(move |_| {
         let current_id = id.get_value();
-        workspaces.get().into_iter().find(|w| w.id == current_id).unwrap_or_else(|| WorkspaceInfo {
-            id: current_id.clone(),
-            path: current_id,
-            status: WorkspaceStatus::Stopped,
-        })
+        workspaces
+            .get()
+            .into_iter()
+            .find(|w| w.id == current_id)
+            .unwrap_or_else(|| WorkspaceInfo {
+                id: current_id.clone(),
+                path: current_id,
+                status: WorkspaceStatus::Stopped,
+            })
     });
 
     view! {
@@ -894,11 +974,15 @@ fn WorkspaceModal(
     // that same change.
     let card_info = Memo::new(move |_| {
         let current_id = id.get_value();
-        workspaces.get().into_iter().find(|w| w.id == current_id).unwrap_or_else(|| WorkspaceInfo {
-            id: current_id.clone(),
-            path: current_id,
-            status: WorkspaceStatus::Stopped,
-        })
+        workspaces
+            .get()
+            .into_iter()
+            .find(|w| w.id == current_id)
+            .unwrap_or_else(|| WorkspaceInfo {
+                id: current_id.clone(),
+                path: current_id,
+                status: WorkspaceStatus::Stopped,
+            })
     });
 
     let busy = RwSignal::new(false);
@@ -1361,7 +1445,206 @@ fn WorkspaceModal(
                         }}
                     </div>
                 })}
+                <WorkspaceTools id=id.get_value() />
         </Modal>
+    }
+}
+
+/// The modal's Tools panel: lists the tools this workspace's `gavmo.yaml`
+/// requests and lets the user configure each one's credential on the host. Loads
+/// live (so it reflects config/secret changes), reloading itself after any
+/// change so the configured/enabled status stays accurate.
+#[component]
+fn WorkspaceTools(id: String) -> impl IntoView {
+    let id = StoredValue::new(id);
+    // `None` = still loading; `Some(vec)` = loaded (possibly empty).
+    let tools = RwSignal::new(None::<Vec<ToolConfig>>);
+    let load_error = RwSignal::new(None::<String>);
+
+    let reload = move || {
+        let id = id.get_value();
+        leptos::task::spawn_local(async move {
+            match list_tool_configs(id).await {
+                Ok(list) => {
+                    load_error.set(None);
+                    tools.set(Some(list));
+                }
+                Err(e) => {
+                    load_error.set(Some(e.to_string()));
+                    tools.set(Some(Vec::new()));
+                }
+            }
+        });
+    };
+
+    // One-shot initial load (the closure reads no reactive state, so the
+    // effect runs exactly once after mount).
+    Effect::new(move |_| reload());
+
+    let on_changed = Callback::new(move |()| reload());
+
+    view! {
+        <div class="tools-panel">
+            <h3 class="tools-title">"Tools"</h3>
+            {move || match tools.get() {
+                None => view! { <p class="empty">"Loading tools…"</p> }.into_any(),
+                Some(list) if list.is_empty() => view! {
+                    <p class="hint">
+                        "This workspace requests no tools. Add a "
+                        <code>"gavmo.yaml"</code>
+                        " to its repo to enable Jira or other integrations."
+                    </p>
+                }.into_any(),
+                Some(list) => view! {
+                    <div class="tool-list">
+                        {list.into_iter()
+                            .map(|tool| view! {
+                                <ToolRow tool=tool workspace_id=id on_changed=on_changed />
+                            })
+                            .collect_view()}
+                    </div>
+                    <p class="hint">
+                        "Credential changes take effect the next time this workspace starts."
+                    </p>
+                }.into_any(),
+            }}
+            {move || load_error.get().map(|e| view! {
+                <p class="error">"Failed to load tools: " {e}</p>
+            })}
+        </div>
+    }
+}
+
+/// One tool's row in the Tools panel: its details, configured/enabled status,
+/// and a form to set (or clear/test) its credential. Holds its own form state;
+/// after a successful change it fires `on_changed` so the parent reloads (which
+/// recreates this row with fresh status).
+#[component]
+fn ToolRow(
+    tool: ToolConfig,
+    workspace_id: StoredValue<String>,
+    on_changed: Callback<()>,
+) -> impl IntoView {
+    let auth = tool.auth.clone();
+    let is_basic = auth == "basic";
+    let configured = tool.configured;
+    let tool = StoredValue::new(tool);
+
+    let username = RwSignal::new(String::new());
+    let token = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    // Result of the last save/clear/test, shown inline (Ok = green, Err = red).
+    let result = RwSignal::new(None::<Result<String, String>>);
+
+    let save = move |_| {
+        let current = tool.get_value();
+        let token_value = token.get_untracked();
+        if token_value.is_empty() {
+            result.set(Some(Err("Enter a token first".to_string())));
+            return;
+        }
+        let username_value = is_basic.then(|| username.get_untracked());
+        let wid = workspace_id.get_value();
+        busy.set(true);
+        result.set(None);
+        leptos::task::spawn_local(async move {
+            let outcome = set_tool_secret(wid, current.id, username_value, token_value).await;
+            busy.set(false);
+            match outcome {
+                Ok(()) => {
+                    token.set(String::new());
+                    result.set(Some(Ok("Saved".to_string())));
+                    on_changed.run(());
+                }
+                Err(e) => result.set(Some(Err(e.to_string()))),
+            }
+        });
+    };
+
+    let clear = move |_| {
+        let current = tool.get_value();
+        let wid = workspace_id.get_value();
+        busy.set(true);
+        result.set(None);
+        leptos::task::spawn_local(async move {
+            let outcome = clear_tool_secret(wid, current.id).await;
+            busy.set(false);
+            match outcome {
+                Ok(()) => {
+                    result.set(Some(Ok("Credential cleared".to_string())));
+                    on_changed.run(());
+                }
+                Err(e) => result.set(Some(Err(e.to_string()))),
+            }
+        });
+    };
+
+    let test = move |_| {
+        let current = tool.get_value();
+        let wid = workspace_id.get_value();
+        busy.set(true);
+        result.set(None);
+        leptos::task::spawn_local(async move {
+            let outcome = test_tool(wid, current.id).await;
+            busy.set(false);
+            result.set(Some(outcome.map_err(|e| e.to_string())));
+        });
+    };
+
+    let header = tool.get_value();
+    view! {
+        <div class="tool-row">
+            <div class="tool-head">
+                <span class="tool-name">{header.id.clone()}</span>
+                <span class="tool-badge">{header.scope.clone()}</span>
+                {if configured {
+                    view! { <span class="tool-status tool-status--ok">"configured"</span> }.into_any()
+                } else {
+                    view! { <span class="tool-status">"not configured"</span> }.into_any()
+                }}
+            </div>
+            <p class="tool-desc">{header.description.clone()}</p>
+            <p class="tool-url">
+                <span class="tool-url-label">"Sends your credential to: "</span>
+                <code>{header.base_url.clone()}</code>
+            </p>
+            {header.instructions.clone().map(|text| view! {
+                <p class="hint">{text}</p>
+            })}
+            <div class="tool-form">
+                {is_basic.then(|| view! {
+                    <input
+                        class="tool-input"
+                        r#type="text"
+                        placeholder="Username / email"
+                        prop:value=move || username.get()
+                        on:input=move |ev| username.set(event_target_value(&ev))
+                        disabled=move || busy.get()
+                    />
+                })}
+                <input
+                    class="tool-input"
+                    r#type="password"
+                    placeholder=move || if configured { "Enter a new token to replace" } else { "Token / API key" }
+                    prop:value=move || token.get()
+                    on:input=move |ev| token.set(event_target_value(&ev))
+                    disabled=move || busy.get()
+                />
+                <div class="tool-actions">
+                    <button on:click=save disabled=move || busy.get()>
+                        {move || if configured { "Update" } else { "Save" }}
+                    </button>
+                    {configured.then(|| view! {
+                        <button on:click=test disabled=move || busy.get()>"Test"</button>
+                        <button class="danger" on:click=clear disabled=move || busy.get()>"Clear"</button>
+                    })}
+                </div>
+            </div>
+            {move || result.get().map(|r| match r {
+                Ok(msg) => view! { <pre class="tool-result tool-result--ok">{msg}</pre> }.into_any(),
+                Err(msg) => view! { <pre class="tool-result tool-result--err">{msg}</pre> }.into_any(),
+            })}
+        </div>
     }
 }
 

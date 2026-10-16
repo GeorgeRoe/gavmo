@@ -37,6 +37,10 @@ const MOUNT_TAG_WORKSPACE: &str = "workspace";
 /// Must match the base NixOS image's fstab.
 const MOUNT_TAG_GCLOUD: &str = "gcloud";
 
+/// The guest-visible mount tag for the read-only MCP token share (see
+/// `VmConfig::mcp_dir`). Must match the base NixOS image's fstab.
+const MOUNT_TAG_MCP: &str = "mcp";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmStatus {
     /// Not running (either never booted, or cleanly stopped).
@@ -86,8 +90,16 @@ impl RunningVm {
             mount_tag: MOUNT_TAG_GCLOUD,
             read_only: true,
         };
-        let shares: Vec<(&dyn ShareBackend, ShareSpec)> =
-            vec![(&nine_p, workspace_share), (&nine_p, gcloud_share)];
+        let mcp_share = ShareSpec {
+            host_path: cfg.mcp_dir.clone(),
+            mount_tag: MOUNT_TAG_MCP,
+            read_only: true,
+        };
+        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
+            (&nine_p, workspace_share),
+            (&nine_p, gcloud_share),
+            (&nine_p, mcp_share),
+        ];
 
         // Clear a stale M2 failure marker from a previous boot attempt
         // before this one starts, so `wait_for_ready` below can't mistake

@@ -487,3 +487,134 @@ button.danger:hover:not(:disabled) {
   height: 100%;
   background: var(--accent);
 }
+
+/* --- Tools panel (V1.5) -------------------------------------------------
+ * Lives at the bottom of the workspace detail modal. Same flat, square,
+ * bordered-box language as `.build-log-panel`/`.stats-panel`; each requested
+ * tool is its own sub-box with an inline credential form. */
+.tools-panel {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.tools-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.tool-row {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.7rem 0.8rem;
+}
+
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.tool-name {
+  font-weight: 600;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
+.tool-badge {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 0.05rem 0.35rem;
+}
+
+.tool-status {
+  margin-left: auto;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.tool-status--ok {
+  color: var(--ok);
+}
+
+.tool-desc {
+  margin: 0.4rem 0 0.2rem;
+  font-size: 0.82rem;
+}
+
+.tool-url {
+  margin: 0.2rem 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.tool-url code {
+  color: var(--text);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+.tool-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.tool-input {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  width: 100%;
+}
+
+.tool-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.tool-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.tool-result {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 10rem;
+  overflow: auto;
+}
+
+.tool-result--ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.tool-result--err {
+  border-color: var(--err);
+  color: var(--err);
+}

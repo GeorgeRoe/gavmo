@@ -695,6 +695,15 @@ startup. - Browser launch. - Versioned image updates and cleanup.
 
 ### Phase 4 --- Jira and secrets vertical slice
 
+**Status: 🔜 in progress.** Being built as de-risked sub-milestones
+(P4.0-P4.4); see `crates/mcp/plan.md` for the as-built design and current
+status. P4.0 (the MCP transport + per-workspace bearer-token auth + a
+throwaway `gavmo_ping` tool, proving the pipeline before any Jira/secrets
+logic) is implemented and sidecar-tested; its real-hardware verification
+gate has not yet been run. The repo-config file name diverged from this
+section's original sketch: `gavmo.toml` (TOML), not `.agent.yaml` (YAML) ---
+chosen to match GAVMO's existing `gavmo.nix` naming convention.
+
 Build one end-to-end capability: - `.agent.yaml` enables Jira and names
 a secret reference. - User configures the secret in the host store for
 that repository. - Daemon exposes a workspace-scoped MCP endpoint. -

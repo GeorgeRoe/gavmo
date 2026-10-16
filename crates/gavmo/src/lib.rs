@@ -9,6 +9,9 @@
 pub mod app;
 
 #[cfg(feature = "ssr")]
+pub mod integrations;
+
+#[cfg(feature = "ssr")]
 pub mod registry;
 
 #[cfg(feature = "hydrate")]
