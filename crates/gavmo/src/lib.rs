@@ -9,6 +9,9 @@
 pub mod app;
 
 #[cfg(feature = "ssr")]
+pub mod auth;
+
+#[cfg(feature = "ssr")]
 pub mod integrations;
 
 #[cfg(feature = "ssr")]

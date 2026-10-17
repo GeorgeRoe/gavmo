@@ -953,6 +953,7 @@ dependencies = [
  "serde_json",
  "teamspec",
  "tokio",
+ "tower",
  "uuid",
  "vm",
  "wasm-bindgen",

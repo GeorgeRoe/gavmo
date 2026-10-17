@@ -58,6 +58,14 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 # - same cross-target-safe, `hydrate`-gated-internally story as above.
 web-sys = { version = "0.3", optional = true, features = ["HtmlElement", "CssStyleDeclaration", "Element"] }
 
+[dev-dependencies]
+# Only exercised by `crates/gavmo/src/auth.rs`'s `require_session`/`login_router`
+# tests, via `tower::ServiceExt::oneshot` against a real (minimal) axum
+# `Router` — already present transitively through `axum` itself (see
+# `Cargo.lock`), so this adds no new crate to the dependency tree, just makes
+# its `util` feature (for `oneshot`) available to tests.
+tower = { version = "0.5", features = ["util"] }
+
 [features]
 hydrate = [
     "leptos/hydrate",

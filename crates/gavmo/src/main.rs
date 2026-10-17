@@ -7,12 +7,14 @@
 #[tokio::main]
 async fn main() {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use axum::body::Body;
     use axum::extract::Request;
     use axum::routing::post;
     use axum::Router;
     use gavmo::app::*;
+    use gavmo::auth;
     use gavmo::registry::AppState;
     use leptos::logging::log;
     use leptos::prelude::*;
@@ -49,6 +51,24 @@ async fn main() {
 
     warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);
 
+    // --- control-panel session auth ------------------------------------------
+    // See `crates/gavmo/src/auth.rs`'s module doc for why this exists: QEMU's
+    // user-mode networking means a workspace's guest VM can reach this
+    // daemon's loopback listener via `10.0.2.2` exactly as easily as the
+    // host's own browser can, so binding to `127.0.0.1` alone is not a
+    // boundary against the guest — every `#[server]` function (host
+    // filesystem browsing, workspace reset/remove, stored-credential
+    // probing, etc.) was reachable from inside any workspace with no auth at
+    // all. `ui_token` is this boundary's secret: host-only, persisted so a
+    // browser's session cookie survives a daemon restart.
+    let ui_token = match auth::load_or_create_token() {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            eprintln!("error: failed to load/create the control-panel session token: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // --- leptos / axum wiring ----------------------------------------------
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
@@ -84,7 +104,17 @@ async fn main() {
             },
         )
         .fallback(leptos_axum::file_and_error_handler(shell))
-        .with_state(leptos_options);
+        .with_state(leptos_options)
+        // `/login` merged in before the auth layer below, same as every
+        // other route — it stays reachable with no cookie purely because
+        // `auth::is_public_path` allowlists it by path, not because of
+        // merge/layer ordering. One source of truth for "what's public"
+        // rather than two (see `auth.rs`'s doc comment on `require_session`).
+        .merge(auth::login_router(ui_token.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            ui_token.clone(),
+            auth::require_session,
+        ));
 
     // --- MCP gateway (brief Phase 4 — see `crates/mcp/plan.md`) -------------
     // A dedicated loopback listener, deliberately separate from the UI's
@@ -107,6 +137,25 @@ async fn main() {
             .await
             .unwrap();
     });
+
+    // --- the login URL: the one thing a user actually needs ------------------
+    // `localhost` (not `127.0.0.1`) deliberately: GAVMO's primary deployment
+    // target is a WSL2 Ubuntu shell (see `crates/gavmo/plan.md`'s auth
+    // section) — `localhost` is what Windows' WSL2 localhost-forwarding
+    // resolves from the host browser's side, and it works identically for a
+    // native Linux desktop too. This URL (not a bare "open your browser"
+    // instruction) is the **primary, reliable** way a user authenticates —
+    // `try_open_browser` below is only a convenience layered on top of it,
+    // never a requirement.
+    let login_url = format!("http://localhost:{}/login?token={}", addr.port(), ui_token);
+    log!(
+        "\n\
+         ==================================================================\n\
+         GAVMO control panel — open this URL in your browser:\n\
+         {login_url}\n\
+         =================================================================="
+    );
+    try_open_browser(&login_url);
 
     log!("GAVMO daemon listening on http://{}", &addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -138,6 +187,33 @@ fn warn_if_missing_from_path(binaries: &[&str]) {
              until qemu is available in this shell (e.g. `nix shell nixpkgs#qemu`)",
             missing.join(", ")
         );
+    }
+}
+
+/// Best-effort: launches the host's default browser at `url`. Tries
+/// `wslview` first — the WSL-specific opener that hands off to the *Windows*
+/// default browser, GAVMO's primary deployment target (see
+/// `crates/gavmo/plan.md`'s auth section) — then falls back to `xdg-open`
+/// for a native Linux desktop.
+///
+/// Failure here is never fatal and never even logged: the URL printed just
+/// above this call is the **reliable, primary** way a user reaches the
+/// control panel (same model as Jupyter's printed token URL) — this is
+/// purely a convenience layered on top of it, so a headless host or a
+/// missing opener binary silently just means the user copies the URL by
+/// hand instead, exactly as if this function didn't exist.
+#[cfg(feature = "ssr")]
+fn try_open_browser(url: &str) {
+    for opener in ["wslview", "xdg-open"] {
+        if std::process::Command::new(opener)
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return;
+        }
     }
 }
 

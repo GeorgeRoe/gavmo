@@ -41,11 +41,12 @@ responsibility split as `vm`'s `VmConfig`/daemon boundary).
 ## 3. Why a dedicated listener, not the existing UI port
 
 The daemon's existing axum/leptos server (`crates/gavmo/src/main.rs`) binds
-`127.0.0.1:3000` for the control-panel UI and its (today, unauthenticated)
-`#[server]` functions. QEMU's user-mode networking means the guest can
-already reach **any** host loopback port via `10.0.2.2` — so the guest can
-already reach `:3000` too. This is a **pre-existing exposure**, not something
-this crate introduces or fixes (see §6).
+`127.0.0.1:3000` for the control-panel UI and its `#[server]` functions.
+QEMU's user-mode networking means the guest can already reach **any** host
+loopback port via `10.0.2.2` — so the guest can already reach `:3000` too.
+This was a **pre-existing exposure** at the time this crate was written, not
+something it introduced — and has since been **closed** by
+`crates/gavmo/src/auth.rs`'s session-cookie gate (see §6 for the resolution).
 
 Putting the MCP gateway on its own port (`7071`) rather than nesting it onto
 the existing router keeps the two concerns separable going forward: the UI
@@ -205,13 +206,18 @@ sidecar, transport/hardware behavior verified for real.
 - **`10.0.2.2` reachability — confirmed working** (§4.1), no longer an open
   risk. (It did surface a *different* real issue — rmcp's `Host`-header
   allowlist — now fixed; see §4.1.)
-- **Pre-existing exposure, not fixed here:** the guest can already reach the
-  daemon's UI port (`:3000`) and its today-unauthenticated `#[server]`
-  functions via the same `10.0.2.2` path. Putting MCP on its own
-  bearer-token-gated port (§3) doesn't worsen this, but doesn't fix it
-  either — a real fix (e.g. authenticating or firewalling the UI port from
-  guest access) is explicitly out of scope for this phase and should be
-  tracked as a separate follow-up.
+- **`:3000` UI-port exposure — ✅ closed.** The guest could reach the
+  daemon's UI port (`:3000`) and its `#[server]` functions via the same
+  `10.0.2.2` path this gateway uses. Putting MCP on its own
+  bearer-token-gated port (§3) never worsened this, but didn't fix it either
+  — the actual fix landed separately, in `crates/gavmo/src/auth.rs`: every
+  route except `/login` and static assets now requires a session cookie
+  matching a host-only secret (`~/.local/share/gavmo/ui_token`, never
+  written anywhere a guest's 9p shares can reach), delivered to the user via
+  a login URL the `gavmo` command prints on startup. Same bearer-token
+  posture as this crate's own gateway, applied to the UI's browser-facing
+  surface via a cookie instead of a header. See `crates/gavmo/plan.md`'s
+  auth section for the full design.
 - **`EnvironmentFile` vs. mount-ordering race:** `gavmo-opencode` has no
   explicit systemd ordering against `etc-gavmo-mcp.mount` completing (same
   pre-existing gap as the `gcloud` share, which `GOOGLE_APPLICATION_CREDENTIALS`

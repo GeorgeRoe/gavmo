@@ -363,3 +363,94 @@ Both reuse the same start/stop-polling-on-status-change shape (a
 different `WorkspaceStatus` variants — confirming the `<Show>`/`StoredValue`
 groundwork from the grid redesign did make this a straightforward addition,
 as predicted.
+
+## 14. Control-panel session auth ✅ done
+
+**The problem.** The daemon binds its control panel + every `#[server]`
+function (`app.rs`) to `127.0.0.1:3000` with no authentication. QEMU's
+user-mode networking means a workspace's own guest VM can reach that
+listener via `10.0.2.2` exactly as easily as the host's browser can (flagged
+as a known, then-unfixed exposure in `crates/mcp/plan.md` §3/§6). Since a
+workspace's agent runs with wide-open root inside its VM by design (the VM
+*is* the trust boundary, not opencode's own permission system — see
+`nix/base/configuration.nix`'s permission comments), a malicious or
+prompt-injected agent in any one workspace could call `browse_dir` (reads
+anywhere on the host filesystem), `reset_workspace`/`remove_workspace`
+(destroys another workspace's VM state), `read_console_log`/`read_build_log`
+(reads host files), or `set_tool_secret`/`test_tool` (exfiltrate/probe
+stored credentials) — on every workspace GAVMO knows about, not just its
+own.
+
+**The constraint that ruled out the easy fixes:** the guest must keep
+internet access (Vertex AI, nix substituters, git) and MCP access, both via
+the same `10.0.2.2` → host-loopback slirp path — so there's no "block the
+guest, keep the internet" QEMU netdev toggle (`restrict=on` kills both), and
+slirp's forwarded connections arrive on the host as plain `127.0.0.1`,
+indistinguishable from the browser by source address alone. The only real
+separator left is a secret the guest can never obtain.
+
+**The fix (`crates/gavmo/src/auth.rs`):** the same bearer-token posture
+`crates/mcp` already uses for its own gateway, adapted to a browser
+consumer via a session cookie:
+
+- A high-entropy token is minted once and persisted host-only at
+  `~/.local/share/gavmo/ui_token` (mode `0600`) — deliberately **outside**
+  every 9p share any VM ever mounts (unlike the MCP token, which the guest
+  *is* meant to read), so no workspace can ever read it. Persisted (not
+  regenerated per boot) so a browser's session cookie survives a daemon
+  restart.
+- An axum middleware (`require_session`, applied as a `.layer(...)` over the
+  whole app router) allowlists only `GET /login` and the static `/pkg/*`
+  bundle (`is_public_path`) — everything else, including every `/api/*`
+  `#[server]`-function call, requires a `gavmo_session` cookie matching that
+  token (constant-time compared). `/api/*` without it gets a bare `401`;
+  page routes get redirected to `/login`.
+- `GET /login?token=...` is the only place the real token is ever compared
+  against user input: a match sets a long-lived (`Max-Age` ~1 year)
+  `HttpOnly; SameSite=Strict` cookie and redirects to `/`; anything else
+  shows a static fallback page (never echoing the real token).
+
+**Delivery — "completely automatic" without any manual token-copying.**
+GAVMO's primary deployment target is a non-technical user running `gavmo` in
+a WSL2 Ubuntu shell (Windows + WSL2 Ubuntu is assumed to be
+DI-team-approved and simple enough to install). The daemon prints the full
+login URL — `http://localhost:3000/login?token=<token>` — to its own
+stdout at startup: the exact same terminal the user is already watching
+after typing `gavmo`, no separate step to remember. `localhost` (not
+`127.0.0.1`) is deliberate: it's what Windows' WSL2 localhost-forwarding
+resolves from the host browser's side, and works identically for a native
+Linux desktop too. `main.rs` additionally makes a best-effort attempt to
+open that URL automatically (`wslview`, falling back to `xdg-open`) — purely
+a convenience layered on top of the printed URL, never a requirement; if it
+silently fails (headless host, missing opener), the printed URL is still
+there. This was chosen over two alternatives considered and rejected:
+- *Relying solely on auto-opening a browser with no printed fallback* — too
+  fragile for a non-technical audience if the default-browser launch fails
+  silently or targets an unexpected browser profile.
+- *Binding the UI to a guest-unroutable loopback address (e.g.
+  `127.0.0.2`)* — would need zero auth at all, but depends on
+  libslirp-version-specific behavior for whether a guest can still reach an
+  arbitrary host loopback address directly (not just via the `10.0.2.2`
+  gateway alias), which wasn't verified and would need a companion firewall
+  rule to be trustworthy anyway — no simpler than the token approach in the
+  end, and less clearly robust against a root-capable in-guest adversary.
+
+**Scope:** daemon-only change. No VM image rebuild — the guest-facing MCP
+gateway (`127.0.0.1:7071`, its own bearer-token gate) is untouched.
+
+**Testing:** `crates/gavmo/src/auth.rs`'s `#[cfg(test)]` module, run via
+`cargo test -p gavmo --features ssr --no-default-features` — pure unit
+tests for cookie parsing, constant-time comparison, and the public-path
+allowlist, plus `tower::ServiceExt::oneshot` integration-style tests against
+a real (minimal) axum `Router` covering: `/api/*` 401s with no/wrong cookie
+and passes with the right one, page routes redirect to `/login`, `/login`
+itself stays reachable with no cookie, and a correct/incorrect token at
+`/login` does/doesn't set the cookie. `tower` was already present
+transitively via `axum` (see `Cargo.lock`), so this added it only as a
+dev-dependency, not a new crate to the dependency tree.
+
+Not yet verified on real WSL2/NixOS hardware — the next hardware gate
+should confirm `localhost:3000` is actually reachable from the Windows
+browser via WSL2's localhost-forwarding, and that a fresh guest VM's
+`#[server]`-function requests to `10.0.2.2:3000` now get a `401` rather than
+succeeding.
