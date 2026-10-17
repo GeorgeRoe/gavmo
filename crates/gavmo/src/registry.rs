@@ -68,6 +68,22 @@ pub struct Registry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceRecord {
     pub path: String,
+
+    /// The host port this workspace was last booted on, if any.
+    /// `#[serde(default)]` so existing `workspaces.json` files written
+    /// before this field existed still deserialize (as `None`).
+    ///
+    /// Persisted (rather than re-allocated fresh every boot) so that
+    /// `opencode web`'s URL — and therefore the browser's *origin* — stays
+    /// the same across a Stop/Start cycle. opencode's web UI keeps which
+    /// project/session to reopen in **per-origin** `localStorage`
+    /// (`lastProject`/`lastProjectSession`); a new random port every boot
+    /// looks like a brand-new origin with no history, even though the
+    /// session data itself is safely sitting in the VM's own SQLite DB the
+    /// whole time. See [`AppState::resolve_host_port`] for how this is
+    /// kept up to date (reused when free, reallocated+persisted when not).
+    #[serde(default)]
+    pub host_port: Option<u16>,
 }
 
 /// Shared, cloneable application state, injected into every server function
@@ -212,9 +228,10 @@ impl AppState {
 
         let mut registry = self.inner.registry.lock().await;
         if !registry.workspaces.iter().any(|w| w.path == canonical) {
-            registry
-                .workspaces
-                .push(WorkspaceRecord { path: canonical });
+            registry.workspaces.push(WorkspaceRecord {
+                path: canonical,
+                host_port: None,
+            });
             save_registry(&self.inner.registry_path, &registry)?;
         }
         Ok(())
@@ -235,14 +252,47 @@ impl AppState {
     /// callers should poll `status`/`list` to observe the transition from
     /// `Booting` to `Running`/`Failed`.
     pub async fn open_workspace(&self, id: &str) -> Result<(), String> {
-        // The whole check -> build-config -> spawn -> insert sequence runs
-        // under one continuously-held lock (no `.await` in between: the
+        // Phase 1: a quick, registry-free peek. If this workspace is
+        // already booting/running, bail out now without ever calling
+        // `resolve_host_port` — doing that unconditionally would be wrong
+        // here: this workspace's own live VM is almost certainly bound to
+        // its persisted port *right now*, which would make
+        // `resolve_host_port`'s free-check see that port as "taken" and
+        // needlessly reallocate + overwrite the persisted value for what
+        // should have been a no-op call.
+        if matches!(
+            self.inner.running.lock().await.get(id),
+            Some(VmSlot::Booting(_) | VmSlot::Running(_))
+        ) {
+            return Ok(());
+        }
+
+        // Phase 2: resolve (and persist) this boot's host port. Takes only
+        // the `registry` lock, deliberately *not* nested under `running`
+        // (which was already released above) — `Self::list` elsewhere in
+        // this file takes `registry` then `running`, so taking the two in
+        // the opposite order anywhere would be a lock-ordering deadlock
+        // risk the moment both run concurrently. See
+        // [`Self::resolve_host_port`]'s doc comment for why this matters
+        // (keeping `opencode web`'s URL/origin stable across restarts).
+        let host_port = self
+            .resolve_host_port(id)
+            .await
+            .map_err(|e| format!("failed to resolve a host port: {e}"))?;
+
+        // Phase 3: the original atomic check -> mint token -> build config
+        // -> spawn -> insert, under one continuously-held lock (no
+        // `.await` between the check and `running.insert` below: the
         // status check and `vm_config` are both synchronous, and
         // `tokio::spawn` itself doesn't await the spawned future's body —
         // it just queues it and returns the handle). This preserves the
         // same TOCTOU-free guarantee the old "check-then-insert-a-bare-
         // marker" version had: two concurrent `open_workspace` calls for
-        // the same `id` can never both decide to boot.
+        // the same `id` can never both decide to boot. It's *this* check —
+        // not phase 1's — that's load-bearing for that guarantee; phase 1
+        // is purely an optimization to skip phase 2's registry write on
+        // the common already-running no-op path. A racer that slipped past
+        // phase 1 while we were in phase 2 is caught here.
         let mut running = self.inner.running.lock().await;
         match running.get(id) {
             // Already booting or running: nothing to do.
@@ -276,14 +326,7 @@ impl AppState {
             return Err(reason);
         }
 
-        let cfg = match self.vm_config(id, mcp_dir) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                let reason = e.to_string();
-                running.insert(id.to_string(), VmSlot::Failed(reason.clone()));
-                return Err(reason);
-            }
-        };
+        let cfg = self.vm_config(id, mcp_dir, host_port);
 
         let state = self.clone();
         let task_id = id.to_string();
@@ -447,21 +490,24 @@ impl AppState {
         remove_dir_all_idempotent(&Self::state_dir_for(id)).await
     }
 
-    /// Builds the per-VM [`VmConfig`] for a workspace path, allocating a
-    /// fresh host port from the OS. `mcp_dir` is threaded in rather than
-    /// recomputed here since the caller ([`Self::open_workspace`]) already
-    /// needed it a step earlier, to mint/write that boot's MCP token before
-    /// `VmConfig` existed.
-    fn vm_config(&self, id: &str, mcp_dir: PathBuf) -> io::Result<VmConfig> {
+    /// Builds the per-VM [`VmConfig`] for a workspace path. `mcp_dir` and
+    /// `host_port` are threaded in rather than resolved here: `mcp_dir`
+    /// because the caller ([`Self::open_workspace`]) already needed it a
+    /// step earlier, to mint/write that boot's MCP token before `VmConfig`
+    /// existed; `host_port` because resolving it
+    /// ([`Self::resolve_host_port`]) needs the `registry` lock, which must
+    /// never be taken nested under the `running` lock this call happens
+    /// inside of (see that method's doc comment for why) — so the caller
+    /// resolves it beforehand, in its own lock phase.
+    fn vm_config(&self, id: &str, mcp_dir: PathBuf, host_port: u16) -> VmConfig {
         let repo_dir = PathBuf::from(id);
         let state_dir = Self::state_dir_for(id);
         let workspace_id = repo_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "workspace".to_string());
-        let host_port = alloc_port()?;
 
-        Ok(VmConfig {
+        VmConfig {
             workspace_id,
             repo_dir,
             state_dir,
@@ -471,7 +517,45 @@ impl AppState {
             memory_mib: self.inner.memory_mib,
             vcpus: self.inner.vcpus,
             host_port,
-        })
+        }
+    }
+
+    /// Resolves the host port this boot of workspace `id` should forward
+    /// to, persisting it to the registry so the *next* boot reuses the same
+    /// one. Reuses the workspace's previously-persisted port
+    /// ([`WorkspaceRecord::host_port`]) if it's still free to bind to;
+    /// otherwise allocates a fresh one via [`alloc_port`] and persists that
+    /// instead.
+    ///
+    /// Keeping the port stable across restarts is the whole fix for
+    /// "sessions don't survive a VM restart": `opencode web`'s session data
+    /// is always safely persisted in the VM's own SQLite DB regardless of
+    /// this, but its *web UI* keeps which project/session to reopen in
+    /// **per-origin** browser `localStorage` (`lastProject`,
+    /// `lastProjectSession`). Since the origin includes the port, a fresh
+    /// random port every boot ([`alloc_port`] previously being called
+    /// unconditionally) looked to the browser like a brand-new origin with
+    /// no history every single time, even though nothing was actually
+    /// lost server-side.
+    ///
+    /// Takes only the `registry` lock — deliberately **never** called while
+    /// the `running` lock is held (see [`Self::open_workspace`]'s phase
+    /// comments): [`Self::list`] elsewhere in this file takes `registry`
+    /// then `running`, so taking the two in the opposite order here would
+    /// be a lock-ordering deadlock risk the moment both run concurrently.
+    ///
+    /// Also must only be called once the caller has confirmed (under the
+    /// `running` lock) that this workspace isn't currently booting/running:
+    /// if it were, that live VM is almost certainly bound to its persisted
+    /// port right now, which would make the free-check below see it as
+    /// "taken" and needlessly reallocate + overwrite the persisted value.
+    async fn resolve_host_port(&self, id: &str) -> io::Result<u16> {
+        let mut registry = self.inner.registry.lock().await;
+        let (port, changed) = resolve_host_port_in(&mut registry, id)?;
+        if changed {
+            save_registry(&self.inner.registry_path, &registry)?;
+        }
+        Ok(port)
     }
 
     /// The conventional per-workspace state dir (`<repo>/.gavmo/vm` — see
@@ -1102,6 +1186,65 @@ fn alloc_port() -> io::Result<u16> {
     Ok(port)
 }
 
+/// Picks the host port for a boot: reuses `existing` (a workspace's
+/// previously-persisted port) if it's currently free to bind to, otherwise
+/// falls back to a fresh one via [`alloc_port`]. Pure and synchronous —
+/// deliberately independent of [`AppState`]/the registry so it's directly
+/// unit-testable with real sockets (see the tests below) without needing a
+/// real registry file.
+///
+/// Same accepted small race as `alloc_port` itself: there's a gap between
+/// this function's bind-to-check-then-drop and qemu's own later bind of the
+/// same port, during which something else could in principle grab it.
+fn choose_host_port(existing: Option<u16>) -> io::Result<u16> {
+    let reusable = existing.filter(|&port| TcpListener::bind(("127.0.0.1", port)).is_ok());
+    match reusable {
+        Some(port) => Ok(port),
+        None => alloc_port(),
+    }
+}
+
+/// Resolves the host port workspace `id` should use for this boot against
+/// `registry`'s current state, mutating the matching [`WorkspaceRecord`] in
+/// place if (and only if) a different port needed to be chosen. Returns the
+/// chosen port plus whether `registry` was actually changed, so the caller
+/// ([`AppState::resolve_host_port`]) knows whether a `save_registry` is
+/// needed at all.
+///
+/// Pure/sync and operates on a plain `&mut Registry` — no locking, no I/O
+/// beyond [`choose_host_port`]'s port-freeness check — so it's directly
+/// unit-testable (see the tests below) without standing up an `AppState` or
+/// touching any real registry file.
+///
+/// A no-op (returns the freshly-allocated port, `changed = false`,
+/// `registry` untouched) if `id` has no matching record at all — this
+/// shouldn't happen via the normal `add_workspace` -> `open_workspace` UI
+/// flow, but degrades gracefully rather than panicking if it ever does.
+fn resolve_host_port_in(registry: &mut Registry, id: &str) -> io::Result<(u16, bool)> {
+    let existing = registry
+        .workspaces
+        .iter()
+        .find(|w| w.path == id)
+        .and_then(|w| w.host_port);
+
+    let port = choose_host_port(existing)?;
+
+    // `changed` tracks whether `registry` was actually mutated (not merely
+    // whether `port` differs from `existing`) — the two diverge exactly
+    // when `id` has no matching record to write into, and the caller
+    // ([`AppState::resolve_host_port`]) uses this to decide whether a
+    // `save_registry` disk write is warranted at all.
+    let mut changed = false;
+    if existing != Some(port) {
+        if let Some(record) = registry.workspaces.iter_mut().find(|w| w.path == id) {
+            record.host_port = Some(port);
+            changed = true;
+        }
+    }
+
+    Ok((port, changed))
+}
+
 /// `~/.local/share/gavmo/workspaces.json` (or platform equivalent).
 fn registry_path() -> io::Result<PathBuf> {
     let dir = dirs::data_dir()
@@ -1288,6 +1431,166 @@ mod tests {
         assert!(!is_safe_rebuild_log_filename("not-a-rebuild-log.txt"));
         assert!(!is_safe_rebuild_log_filename("rebuild-no-extension"));
         assert!(!is_safe_rebuild_log_filename(""));
+    }
+
+    /// The whole fix for "sessions don't survive a VM restart": when a
+    /// workspace has no persisted port yet (first-ever boot), a fresh one
+    /// is allocated — proven here only by it being a validly-bound-able
+    /// port, since `alloc_port`'s choice is inherently non-deterministic.
+    #[test]
+    fn choose_host_port_allocates_fresh_when_none_persisted() {
+        let port = choose_host_port(None).expect("allocation should succeed");
+        assert!(port > 0);
+    }
+
+    /// The core reuse behavior: a previously-persisted port that's
+    /// currently free must be reused as-is, not swapped for a new one —
+    /// this is what keeps `opencode web`'s URL/origin (and therefore its
+    /// browser `localStorage`) stable across a Stop/Start cycle.
+    #[test]
+    fn choose_host_port_reuses_a_free_persisted_port() {
+        // Reserve a real, currently-unused port up front (then release it)
+        // so this test doesn't hardcode a port number that might collide
+        // with something else on the test machine.
+        let persisted = alloc_port().unwrap();
+
+        assert_eq!(choose_host_port(Some(persisted)).unwrap(), persisted);
+    }
+
+    /// The fallback behavior: if the persisted port is actually occupied
+    /// (e.g. grabbed by something else since the last boot), fall back to a
+    /// fresh allocation rather than erroring or colliding - self-healing,
+    /// at the cost of one boot's worth of origin stability.
+    #[test]
+    fn choose_host_port_falls_back_when_persisted_port_is_taken() {
+        // Hold a real listener open on a port to simulate it being
+        // occupied by something else.
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+
+        let chosen = choose_host_port(Some(occupied_port)).expect("should fall back, not error");
+
+        assert_ne!(
+            chosen, occupied_port,
+            "must not choose a port that's actually in use"
+        );
+        drop(occupied);
+    }
+
+    /// [`resolve_host_port_in`]'s persistence contract, end to end against a
+    /// plain in-memory [`Registry`] (no `AppState`, no real registry file —
+    /// see `test_app_state`'s doc comment for why those are avoided in unit
+    /// tests): a workspace with no persisted port yet gets one allocated
+    /// *and written into its record*, and the call reports `changed = true`
+    /// so the caller knows to persist it.
+    #[test]
+    fn resolve_host_port_in_persists_a_fresh_port_for_a_new_workspace() {
+        let mut registry = Registry {
+            workspaces: vec![WorkspaceRecord {
+                path: "/workspace/one".to_string(),
+                host_port: None,
+            }],
+        };
+
+        let (port, changed) = resolve_host_port_in(&mut registry, "/workspace/one").unwrap();
+
+        assert!(changed, "a newly-chosen port must be reported as a change");
+        assert_eq!(
+            registry.workspaces[0].host_port,
+            Some(port),
+            "the chosen port must be written back into the matching record"
+        );
+    }
+
+    /// The steady-state, no-op case: a workspace whose persisted port is
+    /// still free must come back unchanged (`changed = false`) — this is
+    /// what lets [`AppState::resolve_host_port`] skip a `save_registry`
+    /// disk write on every single boot of an already-known workspace.
+    #[test]
+    fn resolve_host_port_in_is_a_noop_when_the_persisted_port_is_still_free() {
+        let persisted = alloc_port().unwrap();
+        let mut registry = Registry {
+            workspaces: vec![WorkspaceRecord {
+                path: "/workspace/two".to_string(),
+                host_port: Some(persisted),
+            }],
+        };
+
+        let (port, changed) = resolve_host_port_in(&mut registry, "/workspace/two").unwrap();
+
+        assert_eq!(port, persisted);
+        assert!(
+            !changed,
+            "reusing the same port must not be reported as a change"
+        );
+        assert_eq!(registry.workspaces[0].host_port, Some(persisted));
+    }
+
+    /// The self-healing case: if the persisted port is occupied, a fresh
+    /// one is chosen *and overwrites* the stale value in the record, so the
+    /// next boot reuses the new one instead of repeating the same failed
+    /// reuse attempt forever.
+    #[test]
+    fn resolve_host_port_in_overwrites_a_persisted_port_that_is_now_taken() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let mut registry = Registry {
+            workspaces: vec![WorkspaceRecord {
+                path: "/workspace/three".to_string(),
+                host_port: Some(occupied_port),
+            }],
+        };
+
+        let (port, changed) = resolve_host_port_in(&mut registry, "/workspace/three").unwrap();
+
+        assert_ne!(port, occupied_port);
+        assert!(changed);
+        assert_eq!(registry.workspaces[0].host_port, Some(port));
+        drop(occupied);
+    }
+
+    /// Workspaces are looked up by `path`, not position: resolving one
+    /// workspace's port must never touch a different workspace's record,
+    /// even when both are present in the registry.
+    #[test]
+    fn resolve_host_port_in_only_touches_the_matching_workspace() {
+        let mut registry = Registry {
+            workspaces: vec![
+                WorkspaceRecord {
+                    path: "/workspace/a".to_string(),
+                    host_port: Some(4096),
+                },
+                WorkspaceRecord {
+                    path: "/workspace/b".to_string(),
+                    host_port: None,
+                },
+            ],
+        };
+
+        resolve_host_port_in(&mut registry, "/workspace/b").unwrap();
+
+        assert_eq!(
+            registry.workspaces[0].host_port,
+            Some(4096),
+            "the untouched workspace's persisted port must be left alone"
+        );
+        assert!(registry.workspaces[1].host_port.is_some());
+    }
+
+    /// Degenerate but shouldn't-panic case: resolving a port for an `id`
+    /// with no matching `WorkspaceRecord` at all still returns a usable
+    /// port (so a boot can proceed), it just has nothing to persist it
+    /// into — correctly reported as `changed = false` since nothing in the
+    /// registry actually changed.
+    #[test]
+    fn resolve_host_port_in_degrades_gracefully_for_an_unknown_workspace() {
+        let mut registry = Registry { workspaces: vec![] };
+
+        let (port, changed) = resolve_host_port_in(&mut registry, "/not/registered").unwrap();
+
+        assert!(port > 0);
+        assert!(!changed);
+        assert!(registry.workspaces.is_empty());
     }
 
     /// A unique scratch dir under the OS temp dir, named with the test's own

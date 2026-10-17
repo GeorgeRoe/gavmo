@@ -30,56 +30,150 @@ let
   # the default. We force that function to always resolve "on" for an
   # uninitialized profile; its `if (initialized === true) return` guard is
   # untouched, so a user's later manual toggle still sticks permanently.
-  opencodeWeb = pkgs.opencode.overrideAttrs (old: {
-    nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.perl ];
-
-    postPatch = (old.postPatch or "") + ''
-      settings=$(find . -type f -path '*/packages/app/src/context/settings.tsx')
-      settingsCount=$(printf '%s\n' "$settings" | grep -c .)
-      if [ "$settingsCount" != "1" ]; then
-        echo "gavmo: expected exactly one" \
-             "packages/app/src/context/settings.tsx in the opencode source," \
-             "found $settingsCount: [$settings] - opencode's web UI source" \
-             "layout has changed; update the opencodeWeb override in" \
-             "nix/base/configuration.nix" >&2
-        exit 1
-      fi
-
-      # Applies one exact textual substitution inside $settings. Refuses to
-      # proceed unless $from occurs in the file EXACTLY once.
-      patchOnce() {
-        FROM="$1" TO="$2" FILE="$settings" perl -0777 -i -pe '
-          my $from = $ENV{FROM};
-          my $to   = $ENV{TO};
-          my $count = () = /\Q$from\E/g;
-          if ($count != 1) {
-            die "gavmo: expected exactly one occurrence of \"$from\" in " .
-                "$ENV{FILE}, found $count instead - opencode'"'"'s web UI " .
-                "source has likely changed upstream; update the " .
-                "opencodeWeb override in nix/base/configuration.nix\n";
-          }
-          s/\Q$from\E/$to/;
-        ' "$settings"
-      }
-
-      # File tree / Command palette / Server status: plain default-value
-      # flips (false -> true) in `defaultSettings.general`.
-      patchOnce 'showFileTree: false,' 'showFileTree: true,'
-      patchOnce 'showSearch: false,' 'showSearch: true,'
-      patchOnce 'showStatus: false,' 'showStatus: true,'
-
-      # Show agent: default-value flip, plus forcing the first-run
-      # auto-init branch (see comment above) to always resolve on.
-      patchOnce 'showCustomAgents: false,' 'showCustomAgents: true,'
-      patchOnce 'return existing || previousVersion !== undefined' 'return true'
-
-      # Timeline display prefs: pure default-value flips, no auto-init
-      # override to worry about (plain `withFallback` accessors).
-      patchOnce 'showReasoningSummaries: false,' 'showReasoningSummaries: true,'
-      patchOnce 'shellToolPartsExpanded: false,' 'shellToolPartsExpanded: true,'
-      patchOnce 'editToolPartsExpanded: false,' 'editToolPartsExpanded: true,'
+  #
+  # --- Auto-register the workspace as an opencode project -----------------
+  # opencode scopes every session under a *project*, which it normally
+  # auto-derives from a git repo at the working directory. `/workspace`
+  # often isn't a git repo (it's just whatever the user's project happens to
+  # be), so opencode falls back to its global/"no project" bucket on every
+  # boot - the user's prior sessions are still sitting in its SQLite DB (see
+  # the "sessions don't survive a restart" investigation in
+  # `gavmo-mvp-plan.md`), but the home page never resurfaces them because
+  # opencode's *client* - not the server - decides what to show there: the
+  # project list and "last project" live in the browser's `localStorage`
+  # (persisted key `server.v3`, written by `createServerProjects` in
+  # `packages/app/src/context/server.tsx`), and nothing auto-registers the
+  # instance's own worktree into that store.
+  #
+  # Fix: patch `packages/app/src/pages/directory-layout.tsx`'s
+  # `DirectoryDataProvider` - the component gavmo's "Open UI" deep-link
+  # (`OPENCODE_WORKSPACE_SESSION_PATH` in `crates/gavmo/src/registry.rs`)
+  # lands on every boot - so that viewing a *local* (non-draft, non-remote)
+  # directory calls `server.projects.open(directory)` (adds it to the home
+  # list, a no-op if already present - the same call "New project" makes)
+  # and `server.projects.touch(directory)` (marks it last-opened, so a bare
+  # `/` visit auto-opens it too). Works for non-git directories exactly as
+  # well as git ones - `open`/`touch` just store the worktree path as a
+  # string - and writes nothing into the user's project folder. Combined
+  # with `crates/gavmo/src/registry.rs` persisting a stable host port across
+  # restarts (so the browser keeps the same origin, and therefore this same
+  # `localStorage`), this is what makes a session survive a VM Stop/Start.
+  #
+  # Verified against `anomalyco/opencode` tag `v1.18.35` (the exact version
+  # `nixpkgs` at this flake's pinned revision builds - see `flake.lock`).
+  # The `assert` below fails the build loudly (not a silent regression) if a
+  # future `nixpkgs` update bumps opencode: re-verify the three substitution
+  # anchors below against the new version's source before updating the
+  # pinned string.
+  opencodeWeb =
+    assert lib.assertMsg (pkgs.opencode.version == "1.18.35") ''
+      gavmo: opencode changed from 1.18.35, the version the web-UI source
+      patches below (directory-layout.tsx project auto-registration,
+      settings.tsx default flips) were verified against. Re-check both
+      files' anchors at https://github.com/anomalyco/opencode for the new
+      version, update the patches if they moved, then bump the version
+      string in this assert (nix/base/configuration.nix).
     '';
-  });
+    pkgs.opencode.overrideAttrs (old: {
+      nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.perl ];
+
+      postPatch = (old.postPatch or "") + ''
+        settings=$(find . -type f -path '*/packages/app/src/context/settings.tsx')
+        settingsCount=$(printf '%s\n' "$settings" | grep -c .)
+        if [ "$settingsCount" != "1" ]; then
+          echo "gavmo: expected exactly one" \
+               "packages/app/src/context/settings.tsx in the opencode source," \
+               "found $settingsCount: [$settings] - opencode's web UI source" \
+               "layout has changed; update the opencodeWeb override in" \
+               "nix/base/configuration.nix" >&2
+          exit 1
+        fi
+
+        dirLayout=$(find . -type f -path '*/packages/app/src/pages/directory-layout.tsx')
+        dirLayoutCount=$(printf '%s\n' "$dirLayout" | grep -c .)
+        if [ "$dirLayoutCount" != "1" ]; then
+          echo "gavmo: expected exactly one" \
+               "packages/app/src/pages/directory-layout.tsx in the opencode" \
+               "source, found $dirLayoutCount: [$dirLayout] - opencode's web" \
+               "UI source layout has changed; update the opencodeWeb" \
+               "override in nix/base/configuration.nix" >&2
+          exit 1
+        fi
+
+        # Applies one exact textual substitution inside $3 (a target file -
+        # $settings or $dirLayout below). Refuses to proceed unless $from
+        # occurs in that file EXACTLY once.
+        patchOnce() {
+          FROM="$1" TO="$2" FILE="$3" perl -0777 -i -pe '
+            my $from = $ENV{FROM};
+            my $to   = $ENV{TO};
+            my $count = () = /\Q$from\E/g;
+            if ($count != 1) {
+              die "gavmo: expected exactly one occurrence of \"$from\" in " .
+                  "$ENV{FILE}, found $count instead - opencode'"'"'s web UI " .
+                  "source has likely changed upstream; update the " .
+                  "opencodeWeb override in nix/base/configuration.nix\n";
+            }
+            s/\Q$from\E/$to/;
+          ' "$3"
+        }
+
+        # File tree / Command palette / Server status: plain default-value
+        # flips (false -> true) in `defaultSettings.general`.
+        patchOnce 'showFileTree: false,' 'showFileTree: true,' "$settings"
+        patchOnce 'showSearch: false,' 'showSearch: true,' "$settings"
+        patchOnce 'showStatus: false,' 'showStatus: true,' "$settings"
+
+        # Show agent: default-value flip, plus forcing the first-run
+        # auto-init branch (see comment above) to always resolve on.
+        patchOnce 'showCustomAgents: false,' 'showCustomAgents: true,' "$settings"
+        patchOnce 'return existing || previousVersion !== undefined' 'return true' "$settings"
+
+        # Timeline display prefs: pure default-value flips, no auto-init
+        # override to worry about (plain `withFallback` accessors).
+        patchOnce 'showReasoningSummaries: false,' 'showReasoningSummaries: true,' "$settings"
+        patchOnce 'shellToolPartsExpanded: false,' 'shellToolPartsExpanded: true,' "$settings"
+        patchOnce 'editToolPartsExpanded: false,' 'editToolPartsExpanded: true,' "$settings"
+
+        # Auto-register the workspace as an opencode project (see the
+        # doc comment above `opencodeWeb`): three substitutions against
+        # `DirectoryDataProvider` in $dirLayout.
+        #
+        # 1. Import the `projects` store's hook alongside the existing
+        #    (type-only) `ServerConnection` import.
+        patchOnce \
+          'import type { ServerConnection } from "@/context/server"' \
+          'import type { ServerConnection } from "@/context/server"
+import { useServer } from "@/context/server"' \
+          "$dirLayout"
+
+        # 2. Grab the store, right next to the sibling `serverSync` hook
+        #    this component already calls.
+        patchOnce \
+          'const serverSync = useServerSync()' \
+          'const serverSync = useServerSync()
+  const server = useServer()' \
+          "$dirLayout"
+
+        # 3. Register (and mark last-opened) the current directory for a
+        #    *local* instance - mirrors the existing draft/remote guard on
+        #    the sibling effect just above this anchor - inserted right
+        #    before the component's only other effect-ish call
+        #    (`createResource`), so it runs once `directory()` is known.
+        patchOnce \
+          '  createResource(' \
+          '  createEffect(() => {
+    if (props.draftID || props.server?.()) return
+    const d = directory()
+    if (!d) return
+    server.projects.open(d)
+    server.projects.touch(d)
+  })
+
+  createResource(' \
+          "$dirLayout"
+      '';
+    });
 
   # `opencode web` attempts to open a browser on startup; without this, a
   # headless VM has no `xdg-open` and the resulting ENOENT can crash the
