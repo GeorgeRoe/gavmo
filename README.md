@@ -74,11 +74,16 @@ A few things worth knowing:
 See `nix/spike-m2.md` for the full design and the hardware-validated results
 behind this mechanism.
 
-See `examples/playwright/` for a worked `gavmo.nix` + `opencode.json` that
-install the Playwright MCP server and a Nix-provided Chromium, so the agent
-can drive a real browser - one action at a time, nothing written to the repo
-- to validate its own work (e.g. hitting a Nuxt dev server) instead of just
-reading source.
+See `examples/` for worked `gavmo.nix` recipes:
+
+- `examples/docker/` - enables the Docker daemon and adds the agent to its
+  group, so it can `docker build`/`docker run` with no `sudo`, plus a sample
+  project CLI (`jq`). The worked version of "Granting the agent more" below.
+- `examples/playwright/` - a `gavmo.nix` + `opencode.json` that install the
+  Playwright MCP server and a Nix-provided Chromium, so the agent can drive a
+  real browser - one action at a time, nothing written to the repo - to
+  validate its own work (e.g. hitting a Nuxt dev server) instead of just
+  reading source.
 
 ## Granting the agent more
 
