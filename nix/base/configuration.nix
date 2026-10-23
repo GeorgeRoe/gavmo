@@ -469,7 +469,7 @@ in
   # --- M2: per-repo environment via gavmo.nix --------------------------------
   # Bakes this entire flake directory (flake.nix, flake.lock, configuration.nix,
   # disk.nix) into the image at a fixed path, so the in-guest rebuild below has
-  # something to target without needing the 9p-shared /workspace to contain
+  # something to target without needing the virtiofs-shared /workspace to contain
   # GAVMO's own source. `./.` is this file's own directory (nix/base) - a plain
   # path literal, so this is a point-in-time filesystem copy taken at image
   # *build* time, not a live/recursive reference; see `nix/spike-m2.md` for the

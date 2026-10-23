@@ -35,7 +35,7 @@ responsibility split as `vm`'s `VmConfig`/daemon boundary).
 | MCP server implementation | `rmcp` (official Rust SDK), pinned exactly (`=3.5.1`) — its HTTP-transport internals are young and have shifted across releases; an unpinned bump risks silently changing the `ServerHandler`/`StreamableHttpService` shapes this crate relies on |
 | Transport | Streamable HTTP, **stateless** (`legacy_session_mode(false)`) — every call is independently authorized by its own bearer token, so there's no conversation-scoped session state worth keeping |
 | Auth | Per-call bearer token (`Authorization: Bearer <token>`), resolved via [`TokenAuthority`] — **not** axum middleware; `rmcp`'s `StreamableHttpService` already injects `http::request::Parts` into every `RequestContext`'s extensions, so the token is read directly inside `list_tools`/`call_tool` |
-| Token delivery to the guest | A dedicated read-only 9p share (`mcp_dir`, mount tag `mcp`) parallel to the existing `gcloud` share — **not** a file under `/workspace` (would land the capability token inside the user's, gitignored-but-still-present, repo dir) |
+| Token delivery to the guest | A dedicated read-only virtiofs share (`mcp_dir`, mount tag `mcp`) parallel to the existing `gcloud` share — **not** a file under `/workspace` (would land the capability token inside the user's, gitignored-but-still-present, repo dir) |
 | Listener | A **dedicated** host port (`GAVMO_MCP_PORT = 7071`), separate from the UI's `:3000` — see §3 |
 | "Enabled" posture | Always-on, empty-by-default: the managed `mcp.gavmo-tools` config entry and the token share exist for *every* workspace; an unauthenticated or tool-less workspace just sees an empty tool list, not a connection failure |
 | P4.0 scope | Exactly one tool, `gavmo_ping` — proves the whole pipeline (guest reachability, auth, OpenCode wiring) before any Jira/secrets logic is written |
@@ -70,7 +70,7 @@ the design before any Jira/secrets logic exists:
   same case (per `rmcp`'s own error-handling convention: `Err(McpError)` is
   for "can't route this at all", not "you're not authorized" — see its
   README).
-- `crates/vm`: a third read-only 9p share (`VmConfig::mcp_dir`, mount tag
+- `crates/vm`: a third read-only virtiofs share (`VmConfig::mcp_dir`, mount tag
   `mcp`) alongside `repo_dir`/`gcloud_dir`.
 - `crates/gavmo`:
   - `AppState` implements `mcp::TokenAuthority` against an in-memory
@@ -93,7 +93,7 @@ the design before any Jira/secrets logic exists:
   - `gavmo-opencode`'s `serviceConfig.EnvironmentFile =
     "-/etc/gavmo/mcp/token.env"` — loads `GAVMO_MCP_TOKEN` straight from the
     share, no guest-side parsing script needed. Leading `-` makes a missing
-    file non-fatal (mirrors the `nofail` posture of the 9p mounts
+    file non-fatal (mirrors the `nofail` posture of the virtiofs mounts
     themselves); `Restart = "always"` (pre-existing) means a lost
     mount-vs-service-start race self-heals on the next restart.
   - The managed `opencode.json` gets a new `mcp.gavmo-tools` entry: `type =
@@ -111,7 +111,7 @@ the design before any Jira/secrets logic exists:
 This milestone is **not done** until, on real NixOS/KVM hardware:
 
 1. A booted workspace's OpenCode discovers `gavmo_ping` (confirms the whole
-   chain: 9p mount → `EnvironmentFile` → `{env:...}` substitution → remote
+   chain: virtiofs mount → `EnvironmentFile` → `{env:...}` substitution → remote
    MCP handshake against `10.0.2.2:7071`).
 2. Calling `gavmo_ping` from inside that session returns the pong with the
    correct workspace id.
@@ -234,7 +234,7 @@ sidecar, transport/hardware behavior verified for real.
   — the actual fix landed separately, in `crates/gavmo/src/auth.rs`: every
   route except `/login` and static assets now requires a session cookie
   matching a host-only secret (`~/.local/share/gavmo/ui_token`, never
-  written anywhere a guest's 9p shares can reach), delivered to the user via
+  written anywhere a guest's virtiofs shares can reach), delivered to the user via
   a login URL the `gavmo` command prints on startup. Same bearer-token
   posture as this crate's own gateway, applied to the UI's browser-facing
   surface via a cookie instead of a header. See `crates/gavmo/plan.md`'s

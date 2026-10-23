@@ -395,7 +395,7 @@ consumer via a session cookie:
 
 - A high-entropy token is minted once and persisted host-only at
   `~/.local/share/gavmo/ui_token` (mode `0600`) — deliberately **outside**
-  every 9p share any VM ever mounts (unlike the MCP token, which the guest
+  every virtiofs share any VM ever mounts (unlike the MCP token, which the guest
   *is* meant to read), so no workspace can ever read it. Persisted (not
   regenerated per boot) so a browser's session cookie survives a daemon
   restart.

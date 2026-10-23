@@ -9,9 +9,9 @@
 
 | Milestone | What it proves | Status |
 |---|---|---|
-| **M0** — plumbing proof | QEMU/KVM + 9p shares + port-forward + health-check + QMP stop, all working end to end on real NixOS hardware | ✅ Done |
+| **M0** — plumbing proof | QEMU/KVM + host-dir shares (9p at M0, now virtiofs) + port-forward + health-check + QMP stop, all working end to end on real NixOS hardware | ✅ Done |
 | **M1** — real OpenCode + Vertex | Real `opencode web` in the VM, authenticated to Vertex, editing live host files both directions | ✅ Done |
-| **M1.5** — permission/git polish | Frictionless agent (no prompts), git works over 9p | ✅ Done |
+| **M1.5** — permission/git polish | Frictionless agent (no prompts), git works over the host-dir share | ✅ Done |
 | **M1.6** — opencode-web UI defaults | Patches opencode's own source at image-build time so useful web-UI panels (file tree, command palette, etc.) are on by default | ✅ Done |
 | **M3** — daemon + Leptos control panel | Turns the proven `vm` crate into an actual usable app | ✅ Done — see `crates/gavmo/plan.md` |
 | **M2** — `gavmo.nix` rebuild-on-open | Per-repo NixOS config applied via `nixos-rebuild switch` at boot | ✅ Done — see §4 |
@@ -35,7 +35,7 @@ A **Linux-only, solo proof-of-concept** that proves one loop end-to-end:
 - Rust daemon (single binary) + Leptos control-panel UI (full hydration).
 - QEMU/KVM VM per workspace (system-installed QEMU).
 - NixOS base image, built manually via `nix build ./nix/base`.
-- 9p `/workspace` (live host repo dir, read-write) and `/etc/gavmo/gcloud` (read-only ADC).
+- virtiofs `/workspace` (live host repo dir, read-write) and `/etc/gavmo/gcloud` (read-only ADC). (9p at M0; switched to virtiofs at M3 — see §2.)
 - Vertex AI via mounted ADC credentials.
 - `opencode web` port-forwarded to the host.
 - Lifecycle: Open / Stop / Status / Reset / Remove (with live status polling in the UI).
@@ -68,10 +68,10 @@ A **Linux-only, solo proof-of-concept** that proves one loop end-to-end:
 | Guest OS | NixOS |
 | Base image source | Pre-built `qcow2` via `nixos-generators` (manual `nix build`), daemon points at it |
 | QEMU | System-installed `qemu-system-x86_64` + KVM |
-| Dir sharing | **9p** (`virtio-9p-pci`), not virtiofs — see rationale below |
-| Model auth | Vertex AI via mounted ADC file (read-only 9p), like DAFNAI |
+| Dir sharing | **virtiofs** (`virtiofsd` + `vhost-user-fs-pci`), switched from 9p at M3 — see rationale below |
+| Model auth | Vertex AI via mounted ADC file (read-only virtiofs share), like DAFNAI |
 | Agent UI | OpenCode's own `opencode web` (confirmed to exist and work) |
-| OpenCode state | VM's own overlay disk (`HOME=/root`), **not** the 9p share — SQLite needs it |
+| OpenCode state | VM's own overlay disk (`HOME=/home/agent`), **not** the host-dir share — SQLite needs it |
 | OpenCode permissions | Baked `"*": "allow"` — the VM is the real trust boundary, not per-tool prompts |
 | GAVMO UI | Leptos, **full hydration** (not SSR-only) |
 | UI delivery | Localhost web app (axum + Leptos), not Tauri |
@@ -82,25 +82,40 @@ A **Linux-only, solo proof-of-concept** that proves one loop end-to-end:
 | Workspace identity | Absolute host path of the repo |
 | OpenCode password | None — forwarded port is bound to `127.0.0.1` only, local-only is sufficient |
 
-### Why 9p, not virtiofs (changed from the original plan)
+### Why virtiofs, not 9p (switched at M3 — supersedes the original 9p decision)
 
-The original plan assumed virtiofs. Researched directly: `virtiofsd` is a FUSE-based
-daemon that only runs on a **Linux host** (FUSE doesn't exist on Windows), so virtiofs
-can never be the one cross-platform mechanism GAVMO wants. `virtio-9p` is built directly
-into QEMU and works identically on Windows and Linux hosts with zero extra processes.
-9p is the portable default; virtiofs would only ever be a Linux-only optimization added
-later behind the same `ShareBackend` trait in the `vm` crate — not needed yet.
+The MVP originally shipped **9p**, chosen specifically to be the one share transport
+that could also work on a **Windows host** (`virtio-9p-pci` is built into QEMU with no
+extra processes; `virtiofsd` is a Linux-only FUSE daemon). That cross-platform
+requirement was later dropped — GAVMO is Linux-host-only — which reopened the choice,
+and a second, independent requirement made **virtiofs** the clear winner: running the
+guest agent as an **unprivileged** user (not root) needs file ownership *inside* the
+guest to be correct and predictable.
 
-### Why OpenCode state lives on the overlay disk, not the 9p share
+9p's `security_model=mapped-xattr` stores guest-visible ownership in host xattrs,
+decoupled from real host uids — invisible to a root agent (root bypasses DAC) but
+load-bearing for a non-root one, which can't touch a file whose mapped ownership
+doesn't resolve to its uid. `virtiofsd`'s internal UID/GID translation
+(`--translate-uid`/`--translate-gid`, see `vm::share::build_virtiofsd_args`) maps each
+share's real host owner to the guest's `agent` uid/gid at the transport level, so
+ownership "just works" — which is what makes the unprivileged guest agent practical.
+virtiofs also has stronger POSIX/locking semantics than 9p. The full as-built rationale
+(including the `--sandbox none` / `--inode-file-handles=never` details validated on real
+hardware) lives in `crates/vm/plan.md` §1.
+
+### Why OpenCode state lives on the overlay disk, not the host-dir share
 
 Tried first: OpenCode's XDG dirs pointed at `/workspace/.gavmo/local` (host-visible,
 survives a VM reset, matching DAFNAI's layout). It failed hard: OpenCode's SQLite
-session database threw `disk I/O error` (`SQLITE_IOERR`) on every startup — 9p's
-locking/IO semantics don't satisfy SQLite, even with `cache=none`. Switching
-`HOME=/root` (native ext4 on the overlay disk) fixed it immediately. Tradeoff: session
-history persists across VM stop/restart (the overlay persists) but is wiped on a full
-VM reset, and isn't visible from the host. The project files in `/workspace` are
-unaffected — only OpenCode's internal DB moved.
+session database threw `disk I/O error` (`SQLITE_IOERR`) on every startup — the share's
+locking/IO semantics didn't satisfy SQLite (this was under the then-current 9p
+transport, even with `cache=none`). Pointing `HOME` at native ext4 on the overlay disk
+fixed it immediately. This decision predates (and wasn't revisited by) the M3 switch to
+virtiofs, whose stronger POSIX/locking semantics may eventually make moving the DB back
+onto `/workspace` viable — not pursued yet. Tradeoff: session history persists across VM
+stop/restart (the overlay persists) but is wiped on a full VM reset, and isn't visible
+from the host. The project files in `/workspace` are unaffected — only OpenCode's
+internal DB moved.
 
 ### Why OpenCode permissions are wide open
 
@@ -124,7 +139,7 @@ Browser (localhost)
                                      ┌───────────────────────┐
                                      │ GAVMO daemon (Rust)   │  axum + Leptos (ssr+hydrate), one binary
                                      │  workspace registry   │  JSON file, global app dir
-                                     │  VM manager (`vm` crate) │ spawns qemu, 9p shares
+                                     │  VM manager (`vm` crate) │ spawns qemu + virtiofsd shares
                                      │  port allocator       │  bind :0, take what the OS gives
                                      │  health poller        │
                                      └──────────┬────────────┘
@@ -133,9 +148,10 @@ Browser (localhost)
                                      ┌───────────────────────┐
                                      │ NixOS VM              │
                                      │  base image (ro) +    │  qcow2 overlay in .gavmo/vm/ (persists /nix, OpenCode state)
-                                     │  opencode web :7080   │  bound to guest 0.0.0.0, HOME=/root
-                                     │  /workspace (9p, rw)  │  <- host repo dir, live, cache=none
-                                     │  /etc/gavmo/gcloud (9p, ro) │ <- ~/.config/gcloud, read-only
+                                     │  opencode web :7080   │  bound to guest 0.0.0.0, HOME=/home/agent
+                                     │  /workspace (virtiofs, rw) │ <- host repo dir, live, cache=auto
+                                     │  /etc/gavmo/gcloud (virtiofs, ro) │ <- ~/.config/gcloud, read-only
+                                     │  /etc/gavmo/mcp (virtiofs, ro) │ <- per-workspace MCP token, read-only
                                      └───────────────────────┘
 ```
 
@@ -149,9 +165,13 @@ Browser (localhost)
   nix substituters, git) with zero host setup; `hostfwd` maps a unique host port →
   the guest's fixed `opencode web` port (`7080`, `GUEST_OPENCODE_PORT` in
   `crates/vm/src/config.rs`).
-- **`/workspace` and gcloud creds.** Both 9p (`virtio-9p-pci`), `cache=none`,
-  `security_model=mapped-xattr`. Workspace is read-write; gcloud is read-only.
-- **Vertex auth.** `GOOGLE_APPLICATION_CREDENTIALS` points at the 9p-mounted ADC file;
+- **`/workspace` and gcloud creds.** Both virtiofs — one `virtiofsd` helper per share
+  exposed via `vhost-user-fs-pci`, `--cache=auto`, with `--translate-uid`/
+  `--translate-gid` mapping the real host owner to the guest's unprivileged `agent`
+  uid/gid (see §2 for why this replaced 9p's `security_model=mapped-xattr`). Workspace
+  is read-write; gcloud is read-only. (A third read-only virtiofs share, `/etc/gavmo/mcp`,
+  carries the per-workspace MCP token — see `crates/mcp/plan.md`.)
+- **Vertex auth.** `GOOGLE_APPLICATION_CREDENTIALS` points at the virtiofs-mounted ADC file;
   `GOOGLE_CLOUD_PROJECT` + `VERTEX_LOCATION=global` set on the `gavmo-opencode`
   systemd service. Managed `/etc/opencode/opencode.json` (non-overridable by any repo)
   pins the provider to `google-vertex-anthropic` and whitelists 4 Claude models —
@@ -160,7 +180,7 @@ Browser (localhost)
   overlay** on the read-only base image, stored in `.gavmo/vm/`. Because it persists,
   `/nix` and OpenCode's own state survive restarts → cache reuse "for free" with
   nothing committed to the repo.
-- **Guest control.** A systemd service (`gavmo-opencode`) mounts the 9p shares (via
+- **Guest control.** A systemd service (`gavmo-opencode`) mounts the virtiofs shares (via
   NixOS `fileSystems`), then runs `opencode web --hostname 0.0.0.0 --port 7080`. No
   SSH, no custom guest agent. Logs route to `journal+console` so the serial console
   (`crates/vm`'s `console.log`) shows real startup errors — essential for debugging
@@ -209,18 +229,21 @@ Vertex env vars. Hit and fixed two real issues along the way (both now documente
 `nix/base/configuration.nix`'s comments):
 - `network-online.target` could stall the service; reverted to `network.target`.
 - `opencode web`'s browser-auto-open needed a no-op `xdg-open` shim.
-- OpenCode's SQLite session DB doesn't work over 9p (`disk I/O error`) — state moved to
-  the VM's native overlay disk (`HOME=/root`).
+- OpenCode's SQLite session DB doesn't work over 9p (`disk I/O error`, the then-current
+  transport) — state moved to the VM's native overlay disk (via `HOME`, now
+  `/home/agent`).
 
 Confirmed end to end: real model responses via Vertex, and bidirectional file sync
-(host↔guest, both directions) over 9p.
+(host↔guest, both directions) over the host-dir share (9p then, virtiofs now).
 
 ### M1.5 — permission/git polish ✅
 
 Baked a top-level `"*": "allow"` OpenCode permission policy (removes all prompts; see
 §2 for why per-category denies don't add real protection once `bash` is open), plus
 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` env vars forcing
-`safe.directory=*` so git doesn't choke on 9p ownership.
+`safe.directory=*` so git doesn't choke on share-reported ownership (this was motivated
+by 9p's `mapped-xattr` ownership; virtiofs's uid-mapping now largely resolves it, and
+the env vars remain as a harmless belt-and-braces).
 
 ### M1.6 — opencode-web UI defaults ✅
 
@@ -509,12 +532,14 @@ gavmo/                        # repo root
 
 ## 6. Open risks to watch
 
-- **9p performance** on large/busy trees (`node_modules`, big `.git`) — not yet stress-
-  tested; `cache=none` favors correctness over speed. Revisit if it proves too slow.
-- **File watching** (`inotify`) over 9p is unreliable — dev servers/watchers inside the
-  VM may need polling mode. Not yet hit, not yet tested.
-- **Vertex ADC is readable by the agent.** With permissions wide open and the agent
-  running as root, it *can* `cat` the mounted ADC token. Accepted risk for the MVP
+- **virtiofs performance** on large/busy trees (`node_modules`, big `.git`) — not yet
+  stress-tested; virtiofs (`--cache=auto`) is generally expected to outperform the old
+  9p transport, but this hasn't been freshly benchmarked. Revisit if it proves too slow.
+- **File watching** (`inotify`) over virtiofs — virtiofs has better semantics here than
+  9p did, but in-guest dev servers/watchers may still need polling mode. Not yet tested.
+- **Vertex ADC is readable by the agent.** With permissions wide open, the agent *can*
+  `cat` the mounted ADC token (the share is read-only, but readable). Accepted risk for
+  the MVP
   (short-lived ~24h credentials, solo use); the brief's deferred host-side token-proxy
   would eventually remove this.
 - **KVM availability** confirmed working on the real NixOS host (`vmx` present,
