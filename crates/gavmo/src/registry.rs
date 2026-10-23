@@ -118,10 +118,11 @@ struct Inner {
     /// dropped) on every `open_workspace`; cleared on `stop`/`reset`.
     mcp_tokens: std::sync::Mutex<HashMap<String, String>>,
 
-    /// Host secret store backing the tool integrations (V1.3 — see
-    /// `crate::integrations`). An `Arc<dyn …>` so the concrete backend
-    /// (keyring today, the encrypted vault later) is swappable without
-    /// touching `AppState`'s callers.
+    /// Host secret store backing the tool integrations (see
+    /// `crate::integrations`). An `Arc<dyn …>` so the concrete backend is
+    /// swappable without touching `AppState`'s callers; today it's the encrypted
+    /// `secrets::LazyVaultStore` (one AEAD file, data-key in the OS keystore —
+    /// see the `secrets` crate docs), opened lazily on first access.
     secret_store: Arc<dyn SecretStore>,
 
     /// Workspace id -> the tool integrations resolved for its current boot
@@ -178,10 +179,19 @@ impl AppState {
     pub fn new(base_image: PathBuf, gcloud_dir: PathBuf) -> io::Result<Self> {
         let registry_path = registry_path()?;
         let registry = load_registry(&registry_path)?;
-        let mcp_base_dir = dirs::data_dir()
+        let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
-            .join("gavmo")
-            .join("mcp");
+            .join("gavmo");
+        let mcp_base_dir = gavmo_data_dir.join("mcp");
+        // The encrypted secrets vault (Option B — see `secrets` crate docs).
+        // Opened *lazily* on first secret access, not here: a host with a
+        // broken/absent OS keystore must still be able to start the daemon (and
+        // manage VMs) — only tool-secret operations should fail on it, and then
+        // fail closed. The data-key lives solely in the OS keystore; there is no
+        // plaintext fallback.
+        let secret_store: Arc<dyn SecretStore> = Arc::new(secrets::LazyVaultStore::keyring_backed(
+            gavmo_data_dir.join("secrets.vault"),
+        ));
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -194,7 +204,7 @@ impl AppState {
                 vcpus: DEFAULT_VCPUS,
                 mcp_base_dir,
                 mcp_tokens: std::sync::Mutex::new(HashMap::new()),
-                secret_store: Arc::new(secrets::KeyringStore::new()),
+                secret_store,
                 workspace_integrations: std::sync::Mutex::new(HashMap::new()),
                 http_client: reqwest::Client::new(),
             }),

@@ -59,17 +59,36 @@ Four options were considered for host-side at-rest storage of tokens:
 - **D — Layered: OS-native first, automatic vault fallback.** Best-available
   everywhere, most code, two paths to test.
 
-**Target: Option B** (encrypted vault keyed by a single keystore entry).
-**As built today: Option A** — the `keyring` crate, one entry per secret (see
-§9a). The encrypted Option-B vault lands later as **another `SecretStore` impl
-behind the same trait** — callers won't change.
+**Built: Option B** (encrypted vault keyed by a single keystore entry) —
+`secrets::VaultStore` (+ the lazily-opened `secrets::LazyVaultStore` the daemon
+actually wires up). The original Option A (`secrets::KeyringStore`, one entry per
+secret) remains in the crate as a valid `SecretStore` impl but is no longer the
+daemon's backend. Both sit behind the same `SecretStore` trait, so no caller
+changed when the backend was swapped.
 
-Implementation notes:
-- `keyring` crate for the keystore entry (Windows Credential Manager / Linux
-  Secret Service); **pin exact versions + confirm per-platform feature flags**
-  (this repo pins deps deliberately — see `crates/mcp/plan.md` §2).
-- A vetted AEAD for the eventual vault file (e.g. an `age`-style construction or
-  XChaCha20-Poly1305). No home-grown crypto. Exact crate TBD.
+Implementation notes (as built):
+- **One AEAD-encrypted file** (`~/.local/share/gavmo/secrets.vault`,
+  `0600` on Unix) holds the whole secret map; it's rewritten wholesale
+  (atomic temp-file + rename) on each `set`/`delete`. The map is tiny (a few
+  integrations per workspace), so whole-file re-encrypt beats incremental
+  crypto on simplicity.
+- **Data-key in the keystore.** A single `keyring` entry (`service=gavmo`,
+  name=`vault-data-key`, base64 value) holds the 32-byte AEAD key, minted on
+  first run. That's the *only* keyring entry GAVMO keeps now (vs. Option A's
+  N). `keyring` is pinned + feature-flagged as before (see `crates/secrets/
+  Cargo.toml`).
+- **AEAD: XChaCha20-Poly1305** (`chacha20poly1305` crate, pinned exactly
+  `=0.11.0`). Pure-Rust (no OpenSSL), 24-byte random nonce generated per
+  write — no counter/reuse bookkeeping. No home-grown crypto.
+- **Fail-closed, lazy.** The data-key lives *only* in the keystore; an
+  unreachable keystore (no/locked Secret Service, no D-Bus session bus — the
+  common stock-WSL case) makes every vault op return a backend error rather
+  than degrading to plaintext. The vault is opened *lazily* (first secret
+  access, not daemon startup) via `LazyVaultStore`, so such a host can still
+  start the daemon and manage VMs — only tool-secret operations fail on it.
+- **No migration** from Option A's per-secret entries: `keyring` has no list
+  API, so enumerating prior entries isn't possible; a user re-enters each
+  secret once via the Tools panel.
 
 ## 4. One tier — project-scoped tools
 
@@ -187,17 +206,23 @@ preserved. This is tool correctness, not optional hardening — it is always on.
 **Project `gavmo.yaml`** — see §5 (requests/pointers only, untrusted).
 
 **Local host state:**
-- *Secrets* — today one keyring entry per secret, keyed
+- *Secrets* — the Option-B encrypted vault file
+  (`~/.local/share/gavmo/secrets.vault`), an XChaCha20-Poly1305 map keyed by
   `secret_key(workspace_id, name)` = `"{workspace_id}\x1f{name}"` (the `\x1f`
-  Unit Separator can't appear in a path or name, so the two can't collide).
-- *Vault (deferred)* — the Option-B encrypted file, tokens keyed by
-  `hash(workspace, canonical_url, secret_name)` (URL-binding).
+  Unit Separator can't appear in a path or name, so the two can't collide). The
+  vault's 32-byte data-key is the single `vault-data-key` keyring entry.
+- *URL-binding (still deferred)* — keying each secret by
+  `hash(workspace, canonical_url, secret_name)` instead, so a changed URL fails
+  closed. The vault's self-owned on-disk format makes this a localized
+  follow-up; see §11.
 
 ## 9a. Crate layout
 
 - **`crates/secrets`** (ssr-only, mechanism): `SecretStore` trait (`get`/`set`/
-  `delete` by key) + `keyring` backend + in-memory backend for tests + the
-  `secret_key(workspace_id, name)` composer. No knowledge of Jira/workspaces.
+  `delete` by key) + the encrypted `VaultStore`/`LazyVaultStore` backend (AEAD
+  file + `KeyProvider`-sourced data-key) + the legacy `KeyringStore` +
+  in-memory backend for tests + the `secret_key(workspace_id, name)` composer.
+  No knowledge of Jira/workspaces.
 - **`crates/toolspec`** (pure): the `gavmo.yaml` YAML schema (`GavmoConfig` /
   `ToolDef` / `ToolKind` / `AuthScheme`), parse/validate, and the host-lock
   `lock_url`. Bytes-in, no I/O. *(Renamed from `teamspec` — it no longer models
@@ -207,13 +232,20 @@ preserved. This is tool correctness, not optional hardening — it is always on.
   `WorkspaceScope` carries the workspace id and the executor looks integrations
   up by it.
 - **`crates/gavmo`** (extend, ssr-only): owns policy — resolves identity, reads
-  `gavmo.yaml`, implements `ToolExecutor` (keyring lookup → host-locked HTTPS
+  `gavmo.yaml`, implements `ToolExecutor` (vault lookup → host-locked HTTPS
   call → size-capped result), plus the control-panel UI (Leptos `#[server]` fns +
-  the Tools panel in `app.rs`).
+  the Tools panel in `app.rs`). All `SecretStore` calls run on `spawn_blocking`
+  threads (the vault does file I/O + an occasional keystore unlock).
 
 ## 10. What's built
 
-- **`crates/secrets`** — keyring + in-memory backends, `secret_key` composer.
+- **`crates/secrets`** — the encrypted Option-B vault (`VaultStore`: one
+  XChaCha20-Poly1305 file, data-key held as the single `vault-data-key` keyring
+  entry; `LazyVaultStore` for deferred, fail-closed open) + the legacy
+  `KeyringStore` + in-memory backends, all behind the `SecretStore` trait, plus
+  the `secret_key` composer. Vault AEAD/round-trip/tamper/wrong-key/fail-closed/
+  `0600`-perms paths unit-tested via an in-memory `KeyProvider` (no live keystore
+  needed).
 - **`crates/toolspec`** — `gavmo.yaml` schema + parse/validate + host-lock
   `lock_url`, exhaustively unit-tested.
 - **`ToolExecutor` seam in `crates/mcp`** — transport-neutral
@@ -237,9 +269,15 @@ preserved. This is tool correctness, not optional hardening — it is always on.
 The built path omits these; their insertion points are preserved so they drop in
 without a rewrite:
 
-- **Encrypted Option-B vault** (§3) — another `SecretStore` impl behind the trait.
+- ~~**Encrypted Option-B vault** (§3)~~ — **built** (`secrets::VaultStore`); see
+  §3/§10.
 - **URL-binding of credentials** (§5) — fails a changed URL closed, re-prompts
-  visibly.
+  visibly. Still deferred; the vault's self-owned on-disk format makes the key
+  shape a localized change.
+- **Legible keystore-unavailable UX** — a broken/absent OS keystore (stock WSL)
+  currently surfaces as the raw backend error from a fail-closed vault op, not a
+  friendly "your keychain isn't set up" banner. Deliberately unshipped; the
+  fail-closed behavior itself is correct, only its presentation is terse.
 
 (The team tier — remote team-spec fetch, signing/minisign, TOFU key-pinning — is
 **not** deferred; it was removed from scope. See the status note at the top.)
@@ -265,7 +303,10 @@ without a rewrite:
    **Resolved — won't do.** The absolute host path stays the permanent identity;
    a moved/re-cloned repo losing its secrets is accepted as the user's problem
    (see §6 for the rationale).
-2. **AEAD crate** for the eventual vault: pick + pin a vetted construction.
+2. ~~**AEAD crate** for the eventual vault: pick + pin a vetted construction.~~
+   **Resolved — done.** XChaCha20-Poly1305 via `chacha20poly1305`, pinned
+   exactly (`=0.11.0`); pure-Rust, random 24-byte nonce per write. The vault is
+   built (§3/§10).
 3. ~~**Rename `crates/teamspec`** now that it no longer models a team spec.~~
    **Resolved — done.** Renamed to `crates/toolspec` (it only models the
    per-repo tool-request schema + host-lock, not a "team" spec).
