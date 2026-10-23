@@ -21,7 +21,7 @@ use mcp::{TokenAuthority, ToolDescriptor, ToolExecutor, ToolOutcome, WorkspaceSc
 use secrets::SecretStore;
 
 use crate::app::{ToolConfig, VmStats, WorkspaceInfo, WorkspaceStatus};
-use crate::integrations::{CandidateTool, ResolvedIntegration, ScopeKind};
+use crate::integrations::{CandidateTool, ResolvedIntegration};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -334,10 +334,9 @@ impl AppState {
             let result = RunningVm::boot(cfg).await;
 
             // Resolve this workspace's enabled tool integrations (reads its
-            // `gavmo.yaml`, fetches any referenced team spec) *before* taking
-            // the running lock, so that network fetch can't block `status`/
-            // `list` callers waiting on it. Only meaningful on a successful
-            // boot; a failed boot exposes no tools.
+            // `gavmo.yaml`) *before* taking the running lock, so the keyring
+            // check can't block `status`/`list` callers waiting on it. Only
+            // meaningful on a successful boot; a failed boot exposes no tools.
             let integrations = if result.is_ok() {
                 state.resolve_integrations_for(&task_id).await
             } else {
@@ -616,11 +615,11 @@ impl AppState {
     }
 
     /// Resolves the *enabled* tool integrations for `id` (the configured subset
-    /// the gateway exposes): enumerates requested tools (reads `gavmo.yaml` +
-    /// fetches any team spec), then keeps only those with a configured secret via
-    /// a batched `spawn_blocking` keyring check. Called from the boot task
-    /// *before* the running lock is taken, so neither the team-spec HTTP fetch nor
-    /// the keyring access blocks other `running`-lock callers.
+    /// the gateway exposes): enumerates requested tools (reads `gavmo.yaml`),
+    /// then keeps only those with a configured secret via a batched
+    /// `spawn_blocking` keyring check. Called from the boot task *before* the
+    /// running lock is taken, so the keyring access doesn't block other
+    /// `running`-lock callers.
     async fn resolve_integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
         let candidates = self.candidates_for(id).await;
         let present = self
@@ -662,13 +661,13 @@ impl AppState {
     }
 
     /// Resolves *every* tool this workspace's `gavmo.yaml` requests
-    /// (structurally, without touching the secret store), by reading the config
-    /// and fetching any referenced team spec. Unlike the boot-time
-    /// `workspace_integrations` cache (enabled subset, frozen at boot), this is
-    /// computed live — so the control panel reflects config changes immediately.
+    /// (structurally, without touching the secret store), by reading the config.
+    /// Unlike the boot-time `workspace_integrations` cache (enabled subset,
+    /// frozen at boot), this is computed live — so the control panel reflects
+    /// config changes immediately.
     async fn candidates_for(&self, id: &str) -> Vec<CandidateTool> {
         let config = crate::integrations::read_config(id).await;
-        crate::integrations::resolve_candidates(id, &config).await
+        crate::integrations::resolve_candidates(id, &config)
     }
 
     /// Finds a single requested tool by id (structural; no secret-store access).
@@ -747,11 +746,6 @@ impl AppState {
                     .clone()
                     .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
                 base_url: tool.def.base_url,
-                scope: match tool.scope_kind {
-                    ScopeKind::Team => "team",
-                    ScopeKind::Project => "project",
-                }
-                .to_string(),
                 auth: match tool.def.auth {
                     teamspec::AuthScheme::Basic => "basic",
                     teamspec::AuthScheme::Bearer => "bearer",

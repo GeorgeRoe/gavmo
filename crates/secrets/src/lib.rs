@@ -1,5 +1,5 @@
-//! Host-side secret storage for GAVMO's tool gateway (v1 — see
-//! `gavmo-tools-config-plan.md` §13a).
+//! Host-side secret storage for GAVMO's tool gateway (see
+//! `gavmo-tools-config-plan.md`).
 //!
 //! Pure mechanism, same spirit as `vm`/`mcp`: it knows how to put and fetch a
 //! secret string under a key, but has no idea what a "workspace", an
@@ -67,20 +67,19 @@ pub trait SecretStore: Send + Sync {
 /// other apps' credentials in e.g. Windows Credential Manager.
 pub const KEYRING_SERVICE: &str = "gavmo";
 
-/// Composes a storage key from a scope and a secret name.
+/// Composes a storage key from a workspace identity and a secret name.
 ///
 /// This is the one shared opinion the daemon and the store agree on, lifted
-/// here so both sides format keys identically. `scope` is something like
-/// `"team:<team-spec-id>"` or `"project:<workspace-id>"`; `name` is the
-/// secret reference from the config (e.g. `"jira-cred"`). The exact scope
-/// strings are the daemon's business — this only guarantees a stable,
-/// collision-resistant join.
+/// here so both sides format keys identically. `workspace_id` is the workspace's
+/// identity (its absolute host path); `name` is the secret reference from the
+/// config (e.g. `"jira-cred"`). Keying by workspace binds a secret to the one
+/// repo that requested it.
 ///
 /// The separator is `\u{1f}` (ASCII Unit Separator): it can't appear in a
-/// human-typed scope or secret name, so `scope`/`name` can never be confused
+/// human-typed workspace path or secret name, so the two can never be confused
 /// for one another the way a `:` or `/` join could be ambiguous.
-pub fn secret_key(scope: &str, name: &str) -> String {
-    format!("{scope}\u{1f}{name}")
+pub fn secret_key(workspace_id: &str, name: &str) -> String {
+    format!("{workspace_id}\u{1f}{name}")
 }
 
 /// The real backend: one entry per secret in the OS credential store.
@@ -169,13 +168,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_key_joins_scope_and_name_with_a_non_typeable_separator() {
-        let key = secret_key("team:dafni", "jira-cred");
-        assert_eq!(key, "team:dafni\u{1f}jira-cred");
+    fn secret_key_joins_workspace_and_name_with_a_non_typeable_separator() {
+        let key = secret_key("/home/me/repo", "jira-cred");
+        assert_eq!(key, "/home/me/repo\u{1f}jira-cred");
     }
 
     #[test]
-    fn secret_key_cannot_collide_across_a_scope_name_boundary() {
+    fn secret_key_cannot_collide_across_a_workspace_name_boundary() {
         // Without the Unit Separator these could both be "a" + "bc" vs "ab" + "c".
         assert_ne!(secret_key("a", "bc"), secret_key("ab", "c"));
     }

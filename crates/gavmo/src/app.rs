@@ -115,25 +115,23 @@ pub struct DirEntry {
 }
 
 /// A tool a workspace's `gavmo.yaml` requests, for the control panel's Tools
-/// panel (V1.5). `auth`/`scope` are plain strings — not the `ssr`-only
-/// `teamspec` enums — so this type is usable in the wasm/hydrate build too.
+/// panel. `auth` is a plain string — not the `ssr`-only `teamspec` enum — so
+/// this type is usable in the wasm/hydrate build too.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolConfig {
     /// Tool id (also the name the agent calls it by).
     pub id: String,
-    /// Human-facing description from the spec (or a generated fallback).
+    /// Human-facing description from the config (or a generated fallback).
     pub description: String,
     /// The integration's base URL (shown so the user can verify where their
     /// credential will be sent).
     pub base_url: String,
-    /// `"team"` or `"project"`.
-    pub scope: String,
     /// `"basic"`, `"bearer"`, or `"header"` — drives which secret fields the
     /// configure form shows.
     pub auth: String,
-    /// The secret reference name declared in the spec.
+    /// The secret reference name declared in the config.
     pub secret_name: String,
-    /// Optional setup help from the spec.
+    /// Optional setup help from the config.
     pub instructions: Option<String>,
     /// Whether a credential is currently stored for this tool.
     pub configured: bool,
@@ -297,8 +295,7 @@ pub async fn browse_dir(path: Option<String>) -> Result<DirListing, ServerFnErro
 
 /// Lists the tools a workspace's `gavmo.yaml` requests, with each one's
 /// configured status — for the modal's Tools panel. Computed live (reads the
-/// config, fetches any team spec), so it reflects config/secret changes without
-/// a restart.
+/// config), so it reflects config/secret changes without a restart.
 #[server]
 pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, ServerFnError> {
     let state = app_state()?;
@@ -1632,7 +1629,6 @@ fn ToolRow(
         <div class="tool-row">
             <div class="tool-head">
                 <span class="tool-name">{header.id.clone()}</span>
-                <span class="tool-badge">{header.scope.clone()}</span>
                 {if configured {
                     view! { <span class="tool-status tool-status--ok">"configured"</span> }.into_any()
                 } else {

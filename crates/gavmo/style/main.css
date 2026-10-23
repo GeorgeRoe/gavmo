@@ -530,15 +530,6 @@ button.danger:hover:not(:disabled) {
   font-size: 0.85rem;
 }
 
-.tool-badge {
-  font-size: 0.65rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  border: 1px solid var(--border);
-  padding: 0.05rem 0.35rem;
-}
-
 .tool-status {
   margin-left: auto;
   font-size: 0.7rem;

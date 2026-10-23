@@ -1,37 +1,27 @@
-//! Resolving a workspace's enabled tool integrations from its `gavmo.yaml`
-//! (plus any referenced team spec) and the host secret store (V1.3 — see
-//! `gavmo-tools-config-plan.md` §13a).
+//! Resolving a workspace's enabled tool integrations from its `gavmo.yaml` and
+//! the host secret store (see `gavmo-tools-config-plan.md`).
 //!
 //! This module is the daemon's *policy* layer between the untrusted repo config
-//! (`teamspec::GavmoConfig`), the team manifest (`teamspec::TeamSpec`), the
-//! secret store (`secrets::SecretStore`), and the transport-neutral tool
-//! interface the gateway consumes (`mcp::ToolDescriptor` / `mcp::ToolOutcome`).
+//! (`teamspec::GavmoConfig`), the secret store (`secrets::SecretStore`), and the
+//! transport-neutral tool interface the gateway consumes (`mcp::ToolDescriptor`
+//! / `mcp::ToolOutcome`).
 //!
 //! ## What "enabled" means
 //!
 //! A tool is advertised to the agent only when **both** the repo requests it
-//! **and** the user has configured its secret on the host:
-//!
-//! - *Team tools*: opted into by `gavmo.yaml`'s `team.tools`, present in the
-//!   fetched [`teamspec::TeamSpec`], and with a secret stored under the
-//!   `team:<spec-url>` scope.
-//! - *Project tools*: declared inline under `gavmo.yaml`'s `tools:` map, with a
-//!   secret stored under the `project:<workspace-id>` scope.
+//! (declared inline under `gavmo.yaml`'s `tools:` map) **and** the user has
+//! configured its secret on the host (stored under the workspace's secret key).
 //!
 //! Advertising only configured tools means the agent never sees a tool it can't
 //! actually use for lack of credentials.
 //!
-//! ## v1 posture (security deferred)
-//!
-//! [`forward`] performs the real HTTP call (V1.4): it host-locks the URL (via
-//! [`teamspec::lock_url`] — the one guardrail kept in v1), injects the
-//! configured credential, forwards any method, and returns a size-capped
-//! response. The deferred hardening (signed specs, encrypted vault, URL-binding)
-//! layers on later without changing this path.
+//! [`forward`] performs the real HTTP call: it host-locks the URL (via
+//! [`teamspec::lock_url`]), injects the configured credential, forwards any
+//! method, and returns a size-capped response.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use teamspec::{AuthScheme, GavmoConfig, TeamSpec, ToolDef};
+use teamspec::{AuthScheme, GavmoConfig, ToolDef};
 
 /// Hard cap on how much of a tool response is returned to the agent. A read-only
 /// API can still return large payloads (big JQL result sets, long issue
@@ -68,15 +58,6 @@ pub struct ResolvedIntegration {
     pub secret_key: String,
 }
 
-/// Whether a requested tool comes from the team spec or an inline project entry
-/// — surfaced in the control panel so the user can see which scope a credential
-/// is bound to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScopeKind {
-    Team,
-    Project,
-}
-
 /// A tool a repo *requests*, paired with its resolved secret-store key, but
 /// **without** consulting the secret store — purely structural. Whether its
 /// credential is actually configured is a separate, store-touching question the
@@ -87,14 +68,12 @@ pub enum ScopeKind {
 pub struct CandidateTool {
     pub id: String,
     pub def: ToolDef,
-    pub scope_kind: ScopeKind,
     /// The composed [`secrets::secret_key`] for this tool's credential.
     pub secret_key: String,
 }
 
 impl CandidateTool {
-    /// Narrows to the gateway-facing [`ResolvedIntegration`] (dropping the
-    /// control-panel-only `scope_kind`).
+    /// Narrows to the gateway-facing [`ResolvedIntegration`].
     pub fn into_resolved(self) -> ResolvedIntegration {
         ResolvedIntegration {
             id: self.id,
@@ -112,7 +91,6 @@ impl CandidateTool {
 pub struct RequestedTool {
     pub id: String,
     pub def: ToolDef,
-    pub scope_kind: ScopeKind,
     /// The composed secret-store key for this tool's credential.
     pub secret_key: String,
     /// Whether a credential is currently stored under `secret_key`.
@@ -121,7 +99,7 @@ pub struct RequestedTool {
 
 impl RequestedTool {
     /// Narrows to the gateway-facing [`ResolvedIntegration`] (dropping the
-    /// control-panel-only `scope_kind`/`configured` fields).
+    /// control-panel-only `configured` field).
     pub fn into_resolved(self) -> ResolvedIntegration {
         ResolvedIntegration {
             id: self.id,
@@ -131,77 +109,37 @@ impl RequestedTool {
     }
 }
 
-/// Secret-store scope string for a team tool, namespaced by the team spec's URL
-/// so the same secret name under two different team specs can't collide.
-pub fn team_scope(spec_url: &str) -> String {
-    format!("team:{spec_url}")
-}
-
-/// Secret-store scope string for an inline project tool, namespaced by the
-/// workspace identity so project secrets stay bound to their one repo.
-pub fn project_scope(workspace_id: &str) -> String {
-    format!("project:{workspace_id}")
-}
-
-/// Pure, **store-free** enumeration of every tool a repo requests (team opt-ins
-/// present in the spec + inline project tools), each with its resolved secret
-/// key. The single source of truth for the structure of a workspace's tools;
-/// configured-or-not is decided separately by the caller so no keyring access
-/// happens here.
-pub fn candidate_tools(
-    workspace_id: &str,
-    config: &GavmoConfig,
-    team_spec: Option<&TeamSpec>,
-) -> Vec<CandidateTool> {
-    let mut out = Vec::new();
-
-    // Team tools: those this repo opted into that the spec actually declares.
-    if let (Some(team), Some(spec)) = (&config.team, team_spec) {
-        let scope = team_scope(&team.spec);
-        for id in &team.tools {
-            if let Some(tool) = spec.tool(id) {
-                out.push(CandidateTool {
-                    id: id.clone(),
-                    def: tool.def.clone(),
-                    scope_kind: ScopeKind::Team,
-                    secret_key: secrets::secret_key(&scope, &tool.def.secret),
-                });
-            }
-        }
-    }
-
-    // Inline project tools.
-    let scope = project_scope(workspace_id);
-    for (id, def) in &config.tools {
-        out.push(CandidateTool {
+/// Pure, **store-free** enumeration of every tool a repo requests (the inline
+/// `tools:` map), each with its resolved secret key. The single source of truth
+/// for the structure of a workspace's tools; configured-or-not is decided
+/// separately by the caller so no keyring access happens here.
+pub fn candidate_tools(workspace_id: &str, config: &GavmoConfig) -> Vec<CandidateTool> {
+    config
+        .tools
+        .iter()
+        .map(|(id, def)| CandidateTool {
             id: id.clone(),
             def: def.clone(),
-            scope_kind: ScopeKind::Project,
-            secret_key: secrets::secret_key(&scope, &def.secret),
-        });
-    }
-
-    out
+            secret_key: secrets::secret_key(workspace_id, &def.secret),
+        })
+        .collect()
 }
 
 /// Pure enumeration of requested tools, each tagged with whether its secret is
-/// configured per the `has_secret` predicate. Unit-testable without a network
-/// fetch or live keystore; the daemon's real resolution path uses
-/// [`candidate_tools`] + a batched async presence check instead (see
-/// [`crate::registry::AppState`]).
+/// configured per the `has_secret` predicate. Unit-testable without a live
+/// keystore; the daemon's real resolution path uses [`candidate_tools`] + a
+/// batched async presence check instead (see [`crate::registry::AppState`]).
 pub fn requested_tools(
     workspace_id: &str,
     config: &GavmoConfig,
-    team_spec: Option<&TeamSpec>,
     has_secret: impl Fn(&str) -> bool,
 ) -> Vec<RequestedTool> {
-    candidate_tools(workspace_id, config, team_spec)
+    candidate_tools(workspace_id, config)
         .into_iter()
         .map(|c| RequestedTool {
             configured: has_secret(&c.secret_key),
             id: c.id,
             def: c.def,
-            scope_kind: c.scope_kind,
             secret_key: c.secret_key,
         })
         .collect()
@@ -213,10 +151,9 @@ pub fn requested_tools(
 pub fn select_integrations(
     workspace_id: &str,
     config: &GavmoConfig,
-    team_spec: Option<&TeamSpec>,
     has_secret: impl Fn(&str) -> bool,
 ) -> Vec<ResolvedIntegration> {
-    requested_tools(workspace_id, config, team_spec, has_secret)
+    requested_tools(workspace_id, config, has_secret)
         .into_iter()
         .filter(|tool| tool.configured)
         .map(RequestedTool::into_resolved)
@@ -242,30 +179,13 @@ pub async fn read_config(workspace_path: &str) -> GavmoConfig {
     }
 }
 
-/// Fetches a config's referenced team spec (if any). A fetch failure is logged
-/// and degrades gracefully to `None` ("no team tools") rather than erroring.
-async fn fetch_team_spec(config: &GavmoConfig) -> Option<TeamSpec> {
-    match &config.team {
-        Some(team) => match teamspec::fetch_spec(&team.spec).await {
-            Ok(spec) => Some(spec),
-            Err(e) => {
-                eprintln!("gavmo: failed to fetch team spec {}: {e}", team.spec);
-                None
-            }
-        },
-        None => None,
-    }
-}
-
-/// Resolves a workspace's requested tools structurally: fetches the referenced
-/// team spec (if any), then enumerates [`candidate_tools`]. **Touches no secret
-/// store** — the caller decides which candidates are configured via a batched,
-/// `spawn_blocking` presence check (see [`crate::registry::AppState`]). Keeping
-/// the keyring out of this async fn is what prevents a blocking D-Bus call from
-/// landing on a tokio worker thread.
-pub async fn resolve_candidates(workspace_id: &str, config: &GavmoConfig) -> Vec<CandidateTool> {
-    let team_spec = fetch_team_spec(config).await;
-    candidate_tools(workspace_id, config, team_spec.as_ref())
+/// Resolves a workspace's requested tools structurally by enumerating
+/// [`candidate_tools`]. **Touches no secret store** — the caller decides which
+/// candidates are configured via a batched, `spawn_blocking` presence check (see
+/// [`crate::registry::AppState`]). Keeping the keyring out of this async fn is
+/// what prevents a blocking D-Bus call from landing on a tokio worker thread.
+pub fn resolve_candidates(workspace_id: &str, config: &GavmoConfig) -> Vec<CandidateTool> {
+    candidate_tools(workspace_id, config)
 }
 
 /// Builds the gateway tool descriptor for an integration: one generic
@@ -457,28 +377,23 @@ mod tests {
     use super::*;
     use secrets::{MemoryStore, SecretStore};
 
-    const TEAM_SPEC: &str = r#"
-version: 1
-team: DAFNI
+    const JIRA_CONFIG: &str = r#"
 tools:
-  - id: dafni-jira
+  dafni-jira:
     type: http
     base_url: https://dafni.atlassian.net
     auth: basic
     secret: jira-cred
 "#;
 
-    const SPEC_URL: &str = "https://example.com/team-tools.yaml";
-
-    fn team_config() -> GavmoConfig {
-        let yaml = format!("team:\n  spec: {SPEC_URL}\n  tools:\n    - dafni-jira\n");
-        teamspec::parse_config(&yaml).unwrap()
+    fn jira_config() -> GavmoConfig {
+        teamspec::parse_config(JIRA_CONFIG).unwrap()
     }
 
-    /// Helper: a MemoryStore with a team secret already configured.
-    fn store_with_team_secret() -> MemoryStore {
+    /// Helper: a MemoryStore with the jira secret already configured for `/ws`.
+    fn store_with_secret(workspace_id: &str) -> MemoryStore {
         let store = MemoryStore::new();
-        let key = secrets::secret_key(&team_scope(SPEC_URL), "jira-cred");
+        let key = secrets::secret_key(workspace_id, "jira-cred");
         store
             .set(&key, r#"{"username":"a@b.c","password":"tok"}"#)
             .unwrap();
@@ -488,85 +403,59 @@ tools:
     fn select_with_store(
         workspace_id: &str,
         config: &GavmoConfig,
-        spec: Option<&TeamSpec>,
         store: &MemoryStore,
     ) -> Vec<ResolvedIntegration> {
-        select_integrations(workspace_id, config, spec, |k| {
-            store.get(k).unwrap().is_some()
-        })
+        select_integrations(workspace_id, config, |k| store.get(k).unwrap().is_some())
     }
 
     #[test]
-    fn team_tool_enabled_when_opted_in_present_in_spec_and_secret_configured() {
-        let spec = teamspec::parse_team_spec(TEAM_SPEC).unwrap();
-        let config = team_config();
-        let store = store_with_team_secret();
+    fn tool_enabled_when_requested_and_secret_configured() {
+        let config = jira_config();
+        let store = store_with_secret("/ws");
 
-        let resolved = select_with_store("/ws", &config, Some(&spec), &store);
+        let resolved = select_with_store("/ws", &config, &store);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "dafni-jira");
         assert_eq!(resolved[0].def.base_url, "https://dafni.atlassian.net");
     }
 
     #[test]
-    fn team_tool_disabled_when_secret_missing() {
-        let spec = teamspec::parse_team_spec(TEAM_SPEC).unwrap();
-        let config = team_config();
+    fn tool_disabled_when_secret_missing() {
+        let config = jira_config();
         let store = MemoryStore::new(); // no secret configured
 
-        let resolved = select_with_store("/ws", &config, Some(&spec), &store);
+        let resolved = select_with_store("/ws", &config, &store);
         assert!(resolved.is_empty());
     }
 
     #[test]
-    fn team_tool_disabled_when_not_declared_in_spec() {
-        // Opted into "dafni-jira" but the spec declares nothing.
-        let empty_spec = teamspec::parse_team_spec("version: 1\nteam: X\ntools: []\n").unwrap();
-        let config = team_config();
-        let store = store_with_team_secret();
-
-        let resolved = select_with_store("/ws", &config, Some(&empty_spec), &store);
-        assert!(resolved.is_empty());
-    }
-
-    #[test]
-    fn team_tool_disabled_when_spec_unavailable() {
-        let config = team_config();
-        let store = store_with_team_secret();
-
-        // No spec fetched (e.g. fetch failed) -> no team tools, even with secret.
-        let resolved = select_with_store("/ws", &config, None, &store);
-        assert!(resolved.is_empty());
-    }
-
-    #[test]
-    fn inline_project_tool_enabled_when_secret_configured() {
+    fn inline_tool_enabled_when_secret_configured() {
         let config = teamspec::parse_config(
             "tools:\n  pdocs:\n    type: http\n    base_url: https://p.example.com\n    auth: bearer\n    secret: pdocs-token\n",
         )
         .unwrap();
         let store = MemoryStore::new();
-        let key = secrets::secret_key(&project_scope("/ws"), "pdocs-token");
+        let key = secrets::secret_key("/ws", "pdocs-token");
         store.set(&key, "tok").unwrap();
 
-        let resolved = select_with_store("/ws", &config, None, &store);
+        let resolved = select_with_store("/ws", &config, &store);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "pdocs");
         assert_eq!(resolved[0].secret_key, key);
     }
 
     #[test]
-    fn project_secret_is_scoped_to_its_workspace() {
+    fn secret_is_scoped_to_its_workspace() {
         let config = teamspec::parse_config(
             "tools:\n  pdocs:\n    type: http\n    base_url: https://p.example.com\n    auth: bearer\n    secret: pdocs-token\n",
         )
         .unwrap();
         let store = MemoryStore::new();
         // Secret configured for a *different* workspace id.
-        let other = secrets::secret_key(&project_scope("/other"), "pdocs-token");
+        let other = secrets::secret_key("/other", "pdocs-token");
         store.set(&other, "tok").unwrap();
 
-        let resolved = select_with_store("/ws", &config, None, &store);
+        let resolved = select_with_store("/ws", &config, &store);
         assert!(
             resolved.is_empty(),
             "a secret bound to /other must not enable /ws"
@@ -577,22 +466,12 @@ tools:
     fn empty_config_yields_no_integrations() {
         let config = GavmoConfig::default();
         let store = MemoryStore::new();
-        assert!(select_with_store("/ws", &config, None, &store).is_empty());
+        assert!(select_with_store("/ws", &config, &store).is_empty());
     }
 
     #[test]
     fn descriptor_is_named_after_the_integration_id_and_requires_method_and_path() {
-        let integration = ResolvedIntegration {
-            id: "dafni-jira".to_string(),
-            def: teamspec::parse_team_spec(TEAM_SPEC)
-                .unwrap()
-                .tool("dafni-jira")
-                .unwrap()
-                .def
-                .clone(),
-            secret_key: "k".to_string(),
-        };
-        let descriptor = integration_tool_descriptor(&integration);
+        let descriptor = integration_tool_descriptor(&jira_integration());
         assert_eq!(descriptor.name, "dafni-jira");
         assert_eq!(
             descriptor.input_schema.get("required"),
@@ -601,14 +480,10 @@ tools:
     }
 
     fn jira_integration() -> ResolvedIntegration {
+        let mut config = jira_config();
         ResolvedIntegration {
             id: "dafni-jira".to_string(),
-            def: teamspec::parse_team_spec(TEAM_SPEC)
-                .unwrap()
-                .tool("dafni-jira")
-                .unwrap()
-                .def
-                .clone(),
+            def: config.tools.remove("dafni-jira").unwrap(),
             secret_key: "k".to_string(),
         }
     }

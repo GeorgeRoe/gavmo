@@ -1,43 +1,31 @@
-//! GAVMO's tool-configuration schema + the host-lock URL math (v1 — see
-//! `gavmo-tools-config-plan.md` §13a).
+//! GAVMO's tool-configuration schema + the host-lock URL math (see
+//! `gavmo-tools-config-plan.md`).
 //!
 //! This crate is the shared, mostly-pure vocabulary for *what tools a workspace
 //! wants*:
 //!
-//! - [`TeamSpec`] — the team-wide manifest (fetched from a URL) declaring tools
-//!   the whole team can use (e.g. "DAFNI Jira lives here; supply a secret named
-//!   `jira-cred`"). Holds **references and instructions, never secrets**.
-//! - [`GavmoConfig`] — the per-repo `gavmo.yaml`: an **untrusted** pointer at a
-//!   team spec + an opt-in list, plus any inline project-only tool requests.
-//! - [`lock_url`] — the single security-relevant primitive kept even in v1: it
-//!   resolves an agent-supplied path against an integration's `base_url` and
-//!   **refuses to produce a URL on any other host/scheme/port**, so the host can
-//!   never be tricked into forwarding a credential to `evil.com`.
+//! - [`GavmoConfig`] — the per-repo `gavmo.yaml`: an **untrusted** list of
+//!   inline tool requests. A repo can only *request* a tool and name a secret
+//!   reference; it can never supply the credential itself.
+//! - [`lock_url`] — the single security-relevant primitive: it resolves an
+//!   agent-supplied path against an integration's `base_url` and **refuses to
+//!   produce a URL on any other host/scheme/port**, so the host can never be
+//!   tricked into forwarding a credential to `evil.com`.
 //!
-//! ## v1 posture (security deferred)
-//!
-//! Signature verification of a fetched spec is **not** implemented — [`verify`]
-//! is a documented no-op seam so the call site exists now and the real
-//! minisign/Ed25519 check (plan §5) drops in later without reshaping callers.
-//! Both files are YAML; GAVMO uses no TOML.
+//! `gavmo.yaml` is YAML (`serde_yaml`); GAVMO uses no TOML.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 use url::Url;
 
-/// The only `TeamSpec::version` this build understands. Bumped when the schema
-/// changes incompatibly; [`parse_team_spec`] rejects anything else up front so a
-/// newer manifest fails loudly instead of being half-parsed.
-pub const SUPPORTED_SPEC_VERSION: u32 = 1;
-
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
 
-/// The kind of tool an integration exposes. v1 ships exactly one: a generic,
+/// The kind of tool an integration exposes. Exactly one: a generic,
 /// host-locked HTTP forwarder (`type: http`) — one type covers Jira, Supabase,
-/// etc. with zero per-service code (plan §13a). `deny_unknown`-free on purpose:
+/// etc. with zero per-service code. `deny_unknown`-free on purpose:
 /// an unknown `type` is caught by this enum's own deserialization error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,9 +52,8 @@ pub enum AuthScheme {
 }
 
 /// A single integration definition: everything the host needs to forward a
-/// request *except* the secret value. Shared by [`TeamSpec`] tools (which carry
-/// an `id` alongside — see [`TeamTool`]) and [`GavmoConfig`] inline tools (where
-/// the map key is the id).
+/// request *except* the secret value. Used by [`GavmoConfig`] inline tools,
+/// where the map key is the id.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolDef {
     #[serde(rename = "type")]
@@ -117,51 +104,13 @@ impl ToolDef {
     }
 }
 
-/// A [`ToolDef`] plus its `id`, as it appears in a [`TeamSpec`]'s `tools` list.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TeamTool {
-    pub id: String,
-    #[serde(flatten)]
-    pub def: ToolDef,
-}
-
-/// The team-wide manifest fetched from a URL.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TeamSpec {
-    pub version: u32,
-    /// Human-readable team label (e.g. "DAFNI"); display-only.
-    pub team: String,
-    #[serde(default)]
-    pub tools: Vec<TeamTool>,
-}
-
-impl TeamSpec {
-    /// Looks up a declared tool by id.
-    pub fn tool(&self, id: &str) -> Option<&TeamTool> {
-        self.tools.iter().find(|t| t.id == id)
-    }
-}
-
 /// The per-repo `gavmo.yaml`. **Untrusted** (repo-controlled): it may only
-/// *request* and *point*, never supply a credential.
+/// *request* a tool and name a secret reference, never supply a credential.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct GavmoConfig {
-    /// Optional reference to a team spec + which of its tools this repo opts into.
-    pub team: Option<TeamRef>,
-    /// Optional inline project-scoped tool requests, keyed by id.
+    /// Inline tool requests, keyed by id.
     pub tools: HashMap<String, ToolDef>,
-}
-
-/// A repo's reference to a team spec: where to fetch it, and which of its tools
-/// this repo wants enabled.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TeamRef {
-    /// Raw HTTPS URL of the team-spec YAML (v1: no signature — plan §13a).
-    pub spec: String,
-    /// Ids of team tools this repo opts into.
-    #[serde(default)]
-    pub tools: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,14 +120,10 @@ pub struct TeamRef {
 /// Schema-level problems found after a YAML document parses structurally.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
-    #[error("unsupported team spec version {found} (this build supports {SUPPORTED_SPEC_VERSION})")]
-    UnsupportedVersion { found: u32 },
     #[error("tool {id:?} has an invalid base_url: {reason}")]
     BadBaseUrl { id: String, reason: String },
     #[error("tool {id:?} uses auth: header but has no header_name")]
     MissingHeaderName { id: String },
-    #[error("duplicate tool id {id:?} in team spec")]
-    DuplicateToolId { id: String },
 }
 
 /// Anything that can go wrong turning YAML text into a validated schema value.
@@ -188,15 +133,6 @@ pub enum ParseError {
     Yaml(#[from] serde_yaml::Error),
     #[error(transparent)]
     Validation(#[from] ValidationError),
-}
-
-/// Anything that can go wrong fetching + parsing a team spec from a URL.
-#[derive(Debug, thiserror::Error)]
-pub enum FetchError {
-    #[error("fetching team spec failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error(transparent)]
-    Parse(#[from] ParseError),
 }
 
 /// Why a request couldn't be host-locked to an integration's `base_url`. Every
@@ -220,28 +156,6 @@ pub enum HostLockError {
 // Parsing
 // ---------------------------------------------------------------------------
 
-/// Parses and validates a team-spec YAML document.
-pub fn parse_team_spec(yaml: &str) -> Result<TeamSpec, ParseError> {
-    let spec: TeamSpec = serde_yaml::from_str(yaml)?;
-    if spec.version != SUPPORTED_SPEC_VERSION {
-        return Err(ValidationError::UnsupportedVersion {
-            found: spec.version,
-        }
-        .into());
-    }
-    let mut seen = std::collections::HashSet::new();
-    for tool in &spec.tools {
-        if !seen.insert(tool.id.as_str()) {
-            return Err(ValidationError::DuplicateToolId {
-                id: tool.id.clone(),
-            }
-            .into());
-        }
-        tool.def.validate(&tool.id)?;
-    }
-    Ok(spec)
-}
-
 /// Parses and validates a `gavmo.yaml` document.
 pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
     let config: GavmoConfig = serde_yaml::from_str(yaml)?;
@@ -249,31 +163,6 @@ pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
         def.validate(id)?;
     }
     Ok(config)
-}
-
-/// Fetches a team spec over HTTPS and parses it.
-///
-/// **v1 (security deferred):** the response is trusted after a plain
-/// `error_for_status` — there is no signature check. [`verify`] marks where that
-/// check will go.
-pub async fn fetch_spec(url: &str) -> Result<TeamSpec, FetchError> {
-    let body = reqwest::get(url).await?.error_for_status()?.text().await?;
-    Ok(parse_team_spec(&body)?)
-}
-
-/// Signature-verification seam. **No-op in v1** (always `Ok`) — placeholder for
-/// the minisign/Ed25519 check described in `gavmo-tools-config-plan.md` §5. Kept
-/// as real API so the import path can call it today and only its body changes
-/// later.
-#[derive(Debug, thiserror::Error)]
-pub enum VerifyError {
-    #[error("signature verification failed")]
-    Invalid,
-}
-
-/// See [`VerifyError`]. Returns `Ok(())` unconditionally in v1.
-pub fn verify(_spec_bytes: &[u8], _signature: &[u8], _public_key: &str) -> Result<(), VerifyError> {
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -362,78 +251,44 @@ fn origin_string(u: &Url) -> String {
 mod tests {
     use super::*;
 
-    const TEAM_SPEC: &str = r#"
-version: 1
-team: DAFNI
+    #[test]
+    fn parses_gavmo_config_with_inline_tools() {
+        let yaml = r#"
 tools:
-  - id: dafni-jira
+  dafni-jira:
     type: http
     base_url: https://dafni.atlassian.net
     auth: basic
     secret: jira-cred
     description: "DAFNI Jira (read via your PAT)"
     instructions: "Create an API token at id.atlassian.net; provide your email + token."
-"#;
-
-    #[test]
-    fn parses_a_valid_team_spec() {
-        let spec = parse_team_spec(TEAM_SPEC).unwrap();
-        assert_eq!(spec.version, 1);
-        assert_eq!(spec.team, "DAFNI");
-        let tool = spec.tool("dafni-jira").expect("tool present");
-        assert_eq!(tool.def.kind, ToolKind::Http);
-        assert_eq!(tool.def.auth, AuthScheme::Basic);
-        assert_eq!(tool.def.base_url, "https://dafni.atlassian.net");
-        assert_eq!(tool.def.secret, "jira-cred");
-    }
-
-    #[test]
-    fn rejects_unsupported_version() {
-        let yaml = "version: 2\nteam: X\ntools: []\n";
-        let err = parse_team_spec(yaml).unwrap_err();
-        assert!(matches!(
-            err,
-            ParseError::Validation(ValidationError::UnsupportedVersion { found: 2 })
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_tool_ids() {
-        let yaml = r#"
-version: 1
-team: X
-tools:
-  - id: dup
+  project-docs:
     type: http
-    base_url: https://a.example.com
+    base_url: https://project.example.com
     auth: bearer
-    secret: s
-  - id: dup
-    type: http
-    base_url: https://b.example.com
-    auth: bearer
-    secret: s
+    secret: project-docs-token
 "#;
-        let err = parse_team_spec(yaml).unwrap_err();
-        assert!(matches!(
-            err,
-            ParseError::Validation(ValidationError::DuplicateToolId { .. })
-        ));
+        let config = parse_config(yaml).unwrap();
+        let jira = config.tools.get("dafni-jira").expect("jira tool");
+        assert_eq!(jira.kind, ToolKind::Http);
+        assert_eq!(jira.auth, AuthScheme::Basic);
+        assert_eq!(jira.base_url, "https://dafni.atlassian.net");
+        assert_eq!(jira.secret, "jira-cred");
+        let proj = config.tools.get("project-docs").expect("inline tool");
+        assert_eq!(proj.auth, AuthScheme::Bearer);
     }
 
     #[test]
     fn rejects_header_auth_without_header_name() {
         let yaml = r#"
-version: 1
-team: X
 tools:
-  - id: t
+  t:
     type: http
     base_url: https://a.example.com
     auth: header
     secret: s
 "#;
-        let err = parse_team_spec(yaml).unwrap_err();
+        let err = parse_config(yaml).unwrap_err();
         assert!(matches!(
             err,
             ParseError::Validation(ValidationError::MissingHeaderName { .. })
@@ -443,16 +298,14 @@ tools:
     #[test]
     fn rejects_non_http_base_url() {
         let yaml = r#"
-version: 1
-team: X
 tools:
-  - id: t
+  t:
     type: http
     base_url: "ftp://a.example.com"
     auth: bearer
     secret: s
 "#;
-        let err = parse_team_spec(yaml).unwrap_err();
+        let err = parse_config(yaml).unwrap_err();
         assert!(matches!(
             err,
             ParseError::Validation(ValidationError::BadBaseUrl { .. })
@@ -462,46 +315,21 @@ tools:
     #[test]
     fn rejects_unknown_tool_type() {
         let yaml = r#"
-version: 1
-team: X
 tools:
-  - id: t
+  t:
     type: smtp
     base_url: https://a.example.com
     auth: bearer
     secret: s
 "#;
         // Unknown enum variant -> structural YAML/serde error.
-        assert!(matches!(parse_team_spec(yaml), Err(ParseError::Yaml(_))));
-    }
-
-    #[test]
-    fn parses_gavmo_config_with_team_ref_and_inline_tool() {
-        let yaml = r#"
-team:
-  spec: https://gitlab.com/dafni/gavmo-tools/-/raw/main/team-tools.yaml
-  tools:
-    - dafni-jira
-tools:
-  project-docs:
-    type: http
-    base_url: https://project.example.com
-    auth: bearer
-    secret: project-docs-token
-"#;
-        let config = parse_config(yaml).unwrap();
-        let team = config.team.expect("team ref present");
-        assert_eq!(team.tools, vec!["dafni-jira".to_string()]);
-        assert!(team.spec.ends_with("team-tools.yaml"));
-        let proj = config.tools.get("project-docs").expect("inline tool");
-        assert_eq!(proj.auth, AuthScheme::Bearer);
+        assert!(matches!(parse_config(yaml), Err(ParseError::Yaml(_))));
     }
 
     #[test]
     fn empty_gavmo_config_is_valid_and_default() {
         // A repo with an empty gavmo.yaml requests nothing.
         let config = parse_config("{}\n").unwrap();
-        assert!(config.team.is_none());
         assert!(config.tools.is_empty());
     }
 
@@ -617,10 +445,5 @@ tools:
         // https://h:443 is the same origin as https://h.
         let u = lock_url("https://h.example.com", "https://h.example.com:443/x").unwrap();
         assert_eq!(u.host_str(), Some("h.example.com"));
-    }
-
-    #[test]
-    fn verify_is_a_noop_in_v1() {
-        assert!(verify(b"spec", b"sig", "pubkey").is_ok());
     }
 }

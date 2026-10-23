@@ -3120,7 +3120,6 @@ dependencies = [
 name = "teamspec"
 version = "0.1.0"
 dependencies = [
- "reqwest",
  "serde",
  "serde_yaml",
  "thiserror 2.0.21",

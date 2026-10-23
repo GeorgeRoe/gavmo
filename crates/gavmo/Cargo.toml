@@ -24,9 +24,8 @@ vm = { path = "../vm", optional = true }
 mcp = { path = "../mcp", optional = true }
 secrets = { path = "../secrets", optional = true }
 teamspec = { path = "../teamspec", optional = true }
-# The host-side HTTP forwarder (V1.4). rustls (not native-tls) to avoid an
-# OpenSSL build/system dependency, matching teamspec's fetch client and the
-# cross-platform, easy-install goal.
+# The host-side HTTP forwarder. rustls (not native-tls) to avoid an OpenSSL
+# build/system dependency, matching the cross-platform, easy-install goal.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 # hydrate-only (wasm32 browser build) dependencies.

@@ -15,7 +15,3 @@ thiserror = "2"
 # parsing is exactly what makes the "reject any other host" guarantee trustworthy
 # rather than hand-rolled string prefixing an attacker could sidestep.
 url = "2"
-# On-demand HTTPS fetch of a team spec (v1: raw URL, no signature — see
-# gavmo-tools-config-plan.md §13a). rustls (not native-tls) to avoid an OpenSSL
-# build/system dependency, matching the cross-platform, easy-install goal.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
