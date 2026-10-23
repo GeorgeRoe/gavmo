@@ -79,7 +79,7 @@ A **Linux-only, solo proof-of-concept** that proves one loop end-to-end:
 | Concurrency | Multiple concurrent VMs |
 | Lifecycle buttons | Open, Stop, Status (status auto-polls live) |
 | State location | VM overlay disk under the repo's `.gavmo/vm/` (gitignored) |
-| Workspace identity | Absolute host path of the repo |
+| Workspace identity | Absolute host path of the repo (permanent — a git-remote-derived identity was considered and declined; moving/re-cloning a repo is accepted as the user's responsibility. See `gavmo-tools-config-plan.md` §6) |
 | OpenCode password | None — forwarded port is bound to `127.0.0.1` only, local-only is sufficient |
 
 ### Why virtiofs, not 9p (switched at M3 — supersedes the original 9p decision)

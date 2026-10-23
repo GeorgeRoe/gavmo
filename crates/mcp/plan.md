@@ -309,5 +309,7 @@ outbound request and reaches **no** VM-visible surface.
 
 - **Deferred hardening** (see `gavmo-tools-config-plan.md` §11): encrypted
   Option-B vault behind the `SecretStore` trait; URL-binding of credentials.
-- **Open tidy-ups** (ibid. §13): git-remote-else-path workspace identity; rename
-  `crates/teamspec` (no longer a "team" spec); pick + pin an AEAD crate.
+- **Open tidy-ups** (ibid. §13): rename `crates/teamspec` (no longer a "team"
+  spec); pick + pin an AEAD crate. (Git-remote-else-path workspace identity was
+  considered and **declined** — the absolute host path stays the permanent
+  identity; see `gavmo-tools-config-plan.md` §6.)

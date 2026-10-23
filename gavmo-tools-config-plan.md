@@ -142,16 +142,25 @@ live test, not eliminated.
 
 ## 6. Workspace identity (for keying secrets)
 
-Secrets are keyed by `(workspace identity, secret name)`. Today identity = the
+Secrets are keyed by `(workspace identity, secret name)`. Identity = the
 absolute host path (`gavmo-mvp-plan.md:82`, `WorkspaceRecord.path`), composed
 with the secret name via `secrets::secret_key`. The brief warns against
-path-keying (`gavmo-chatgpt-plan.md:509`); options for later:
+path-keying (`gavmo-chatgpt-plan.md:509`); the options considered were:
 
-1. Keep absolute path (simplest; aliases on reclone / path reuse — current).
+1. **Keep absolute path (chosen — permanent).** Simplest; aliases on reclone /
+   path reuse.
 2. Normalized git remote URL (survives reclone; edge cases: no remote, multiple
-   remotes, forks).
-3. **Git remote if present, else fall back to path, and always show the resolved
-   identity to the user before they save a token.** — recommended future state.
+   remotes, forks). — **rejected.**
+3. Git remote if present, else fall back to path, and always show the resolved
+   identity to the user before they save a token. — **rejected.**
+
+**Decision: keep the absolute host path as the workspace identity (option 1),
+permanently.** The git-remote-derived options (2/3) were considered and
+declined: a repo moving/re-cloning to a different path losing its stored
+secrets is accepted as the user's responsibility, which doesn't justify the
+URL-normalization (`git@host:` vs `https://host/` forms, trailing `.git`,
+multi-remote selection) plus one-time secret-migration/re-prompt complexity the
+derivation would add.
 
 ## 7. Tool types
 
@@ -252,7 +261,10 @@ without a rewrite:
 
 ## 13. Open questions
 
-1. **Workspace identity:** move from absolute path to git-remote-else-path (§6)?
+1. ~~**Workspace identity:** move from absolute path to git-remote-else-path (§6)?~~
+   **Resolved — won't do.** The absolute host path stays the permanent identity;
+   a moved/re-cloned repo losing its secrets is accepted as the user's problem
+   (see §6 for the rationale).
 2. **AEAD crate** for the eventual vault: pick + pin a vetted construction.
 3. **Rename `crates/teamspec`** now that it no longer models a team spec.
 
@@ -262,5 +274,5 @@ without a rewrite:
   sketch. This document refines that "What's next" section.
 - `gavmo-chatgpt-plan.md` §11 (Jira wiring), §13 (security principles), §15
   (phase plan) — the originating brief.
-- `gavmo-mvp-plan.md` — workspace identity = absolute host path (to be revisited
-  per §6).
+- `gavmo-mvp-plan.md` — workspace identity = absolute host path (permanent; the
+  git-remote alternative was considered and declined — see §6).
