@@ -53,3 +53,27 @@ A few things worth knowing:
 See `nix/spike-m2.md` for the full design and the hardware-validated results
 behind this mechanism.
 
+## Long-running shell commands
+
+opencode's shell tool kills any command that runs longer than a configured
+timeout (the upstream default is 2 minutes). The base image raises that
+default to **5 minutes**, since installs/builds/test suites on a real
+project routinely exceed 2 — a killed command surfaces in the agent's own
+output as a `<shell_metadata>` "terminated command after exceeding timeout"
+note, easy to mistake for the command having silently hung rather than
+having been stopped.
+
+If a specific repo's workflow still needs longer (a slow test suite, a big
+build), raise it further via that repo's own `gavmo.nix`:
+
+```nix
+{ ... }:
+{
+  environment.sessionVariables.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS = "1200000"; # 20 min
+}
+```
+
+Or, for a one-off long command, just ask the agent to run it with a larger
+timeout — the shell tool takes a `timeout` (in milliseconds) per call, with
+no upper limit, so this needs no `gavmo.nix` change at all.
+

@@ -576,6 +576,30 @@ in
   # stop/restart (the overlay persists) but is wiped on a full VM reset,
   # and isn't visible from the host. Your actual project files in
   # /workspace are unaffected - only OpenCode's internal DB moved.
+  #
+  # opencode's shell tool kills any command that runs longer than this many
+  # milliseconds (upstream default: 2 minutes - see
+  # `packages/opencode/src/tool/shell.ts`'s `defaultTimeoutMs` and
+  # `runtime-flags.ts`'s `bashDefaultTimeoutMs`, confirmed against the
+  # `opencode` v1.18.35 source pinned above). 2 minutes is too low for a dev
+  # VM where installs/builds/test suites routinely run longer - confirmed in
+  # practice: an `npm run test` run was killed mid-suite, surfaced as a
+  # `<shell_metadata>` "terminated command after exceeding timeout" note in
+  # the agent's own tool output, easy to mistake for the command having
+  # silently hung. 5 minutes is a more realistic default for ordinary dev
+  # work while still catching a truly stuck command reasonably fast.
+  #
+  # Set via `sessionVariables` (merged into `gavmo-opencode`'s `environment`
+  # below) rather than that service's managed `environment` block, and with
+  # `lib.mkDefault`, specifically so a repo's own `gavmo.nix` can override it
+  # with its own `environment.sessionVariables.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`
+  # (see the README) - unlike the managed block's GOOGLE_*/GIT_*/HOME vars,
+  # there's no reason this one shouldn't be repo-adjustable. A single long
+  # command can also always request its own larger timeout directly (the
+  # shell tool's `timeout` parameter), with no config needed.
+  environment.sessionVariables.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS =
+    lib.mkDefault "300000";
+
   systemd.services.gavmo-opencode = {
     description = "GAVMO milestone-1 opencode web server";
     # Only `network.target` (not `network-online.target`): opencode doesn't
