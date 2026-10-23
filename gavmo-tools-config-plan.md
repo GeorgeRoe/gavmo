@@ -1,6 +1,7 @@
 # GAVMO tool configuration & secrets — design notes
 
-> **Status: ✅ built (project-scoped slice), with security hardening deferred.**
+> **Status: ✅ built (project-scoped slice), including the encrypted vault and
+> credential URL-binding hardening.**
 > This captures how GAVMO lets the agent reach context beyond the repo (Jira, a
 > project-specific platform, etc.) *safely and easily* for **non-technical users
 > on their own Windows/Linux desktops**. It extends the Phase 4 vertical slice in
@@ -15,8 +16,10 @@
 > configs rarely change. What remains is the **single, project-scoped** model
 > below: tools are declared inline in a repo's `gavmo.yaml`, credentials live
 > host-side keyed by workspace, and the host-locked HTTP forwarder does the work.
-> The deferred *hardening* seams (encrypted vault, URL-binding) still apply and
-> are noted where relevant.
+> The *hardening* seams once listed here as deferred — the encrypted vault and
+> credential URL-binding — are now both built (see §3, §5, §10); the only
+> remaining deferred item is a friendlier "your OS keychain isn't set up" UX
+> (§11).
 
 ## 1. The problem
 
@@ -42,7 +45,7 @@ stop a repo from redirecting a user's token to an attacker.
   in the project repo — including its `gavmo.yaml` — must be treated as
   potentially attacker-controlled.
 
-## 3. Secret storage — decision: Option B (vault deferred; keyring in use today)
+## 3. Secret storage — decision: Option B (encrypted vault, built)
 
 Four options were considered for host-side at-rest storage of tokens:
 
@@ -149,11 +152,16 @@ changing a `base_url`. Mitigations:
 - **Shown destination + live test call (built).** The control panel shows the
   exact URL a credential will be sent to, and a "Test" button makes a live call,
   so a changed destination is visible before the user commits a token.
-- **URL-binding of credentials (deferred hardening).** Key each secret by
-  `hash(workspace, canonical_url, secret_name)` so a token is only releasable to
-  the exact URL it was stored against. A changed URL then fails closed and
-  re-prompts the user *seeing the new URL*. Complements the above with zero key
-  management; not yet implemented.
+- **URL-binding of credentials (built).** A stored credential records the
+  canonical `base_url` it was approved for, so it is only ever released to that
+  exact destination. A repo changing `base_url` afterward (or a value with no
+  binding) fails **closed** at release time and the control panel shows a
+  "destination changed from X to Y — re-confirm" warning, so the user re-approves
+  *seeing the new URL*. See §8a for the mechanism. (Implemented by **storing the
+  canonical URL alongside the credential inside the encrypted vault value**, not
+  by hashing it into the key as this section originally sketched — now that GAVMO
+  owns the vault format, store-alongside is simpler *and* lets the UI show the old
+  URL, which a one-way hash couldn't.)
 
 The irreducible residue is **first-use social engineering** ("paste your prod-DB
 token for `evil.com`") at initial setup — mitigated by the shown destination +
@@ -201,6 +209,37 @@ confusion trick — is rejected, so the host never forwards the credential
 off-origin. A `base_url` path prefix (e.g. an Atlassian gateway base) is
 preserved. This is tool correctness, not optional hardening — it is always on.
 
+## 8a. URL-binding (built)
+
+Host-lock stops a request mid-flight from leaving the integration's current
+origin, but it can't tell that the *current* origin isn't the one the user
+approved — a repo that silently changes `base_url` from `trusted` to `evil`
+would pass host-lock (the request does stay on `evil`). URL-binding closes that:
+
+- **Canonical form.** `toolspec::canonical_base_url(base_url)` produces a stable
+  destination string — scheme + host + effective port + normalized path prefix —
+  reusing the *same* normalization as `lock_url`, so binding and host-locking can
+  never disagree on "same destination". It captures only what determines *where*
+  a credential goes (not `auth`/`header_name`/`description`, which would cause
+  pointless re-prompts), and binds the **path prefix** too, so a same-host tenant
+  swap (`/ex/jira/GOOD` → `/ex/jira/EVIL`) is caught, not just a host change.
+- **Stored alongside the credential.** `set_tool_secret` wraps the credential in
+  a `{ bound_url, credential }` envelope (`crate::integrations::wrap_stored_secret`)
+  inside the encrypted vault value; saving a credential *is* the user approving
+  the destination the control panel just showed them.
+- **Enforced at release (the hard boundary).** `integrations::forward` — the one
+  path both `call_tool` and the "Test" button go through — calls `check_binding`
+  before attaching the credential: it canonicalizes the tool's *current*
+  `base_url` and refuses (fail-closed, tool-level error naming both URLs) on a
+  mismatch, on an unbound/legacy value, or if the current `base_url` can't be
+  canonicalized. This holds regardless of what any running VM was told at boot.
+- **Reflected in resolution + UI.** `classify_binding` gives a tri-state
+  (`NotConfigured` / `Configured` / `DestinationChanged`). Boot-time resolution
+  advertises only `Configured` tools (so a tampered tool isn't even offered —
+  defense-in-depth above the release check); the control panel shows a
+  "destination changed from X to Y — re-enter to confirm" warning for
+  `DestinationChanged`, with Save re-binding to the new URL.
+
 ## 9. Data shapes & local state
 
 **Project `gavmo.yaml`** — see §5 (requests/pointers only, untrusted).
@@ -210,11 +249,9 @@ preserved. This is tool correctness, not optional hardening — it is always on.
   (`~/.local/share/gavmo/secrets.vault`), an XChaCha20-Poly1305 map keyed by
   `secret_key(workspace_id, name)` = `"{workspace_id}\x1f{name}"` (the `\x1f`
   Unit Separator can't appear in a path or name, so the two can't collide). The
-  vault's 32-byte data-key is the single `vault-data-key` keyring entry.
-- *URL-binding (still deferred)* — keying each secret by
-  `hash(workspace, canonical_url, secret_name)` instead, so a changed URL fails
-  closed. The vault's self-owned on-disk format makes this a localized
-  follow-up; see §11.
+  vault's 32-byte data-key is the single `vault-data-key` keyring entry. Each
+  value is a `{ bound_url, credential }` envelope (URL-binding — see §8a), so the
+  destination a credential was approved for travels *with* it.
 
 ## 9a. Crate layout
 
@@ -224,8 +261,9 @@ preserved. This is tool correctness, not optional hardening — it is always on.
   in-memory backend for tests + the `secret_key(workspace_id, name)` composer.
   No knowledge of Jira/workspaces.
 - **`crates/toolspec`** (pure): the `gavmo.yaml` YAML schema (`GavmoConfig` /
-  `ToolDef` / `ToolKind` / `AuthScheme`), parse/validate, and the host-lock
-  `lock_url`. Bytes-in, no I/O. *(Renamed from `teamspec` — it no longer models
+  `ToolDef` / `ToolKind` / `AuthScheme`), parse/validate, the host-lock
+  `lock_url`, and the URL-binding `canonical_base_url` (same normalization as
+  `lock_url`). Bytes-in, no I/O. *(Renamed from `teamspec` — it no longer models
   a "team" spec, only the per-repo tool-request schema.)*
 - **`crates/mcp`** (extend): the daemon-implemented `ToolExecutor` trait
   (`list_tools`/`call_tool`) so `reqwest` + credentials never enter this crate;
@@ -247,33 +285,39 @@ preserved. This is tool correctness, not optional hardening — it is always on.
   `0600`-perms paths unit-tested via an in-memory `KeyProvider` (no live keystore
   needed).
 - **`crates/toolspec`** — `gavmo.yaml` schema + parse/validate + host-lock
-  `lock_url`, exhaustively unit-tested.
+  `lock_url` + URL-binding `canonical_base_url`, exhaustively unit-tested.
 - **`ToolExecutor` seam in `crates/mcp`** — transport-neutral
   `ToolDescriptor`/`ToolOutcome`; `gavmo_ping` ported onto it.
 - **`crate::integrations`** — resolution (`gavmo.yaml` → candidate tools →
-  enabled subset via a batched keyring presence check), keyring +
-  `workspace_integrations` wired into `AppState`, resolved on boot / cleared on
-  stop+reset.
+  enabled subset via a batched secret fetch + `classify_binding`, so only tools
+  whose credential is present *and* bound to the current `base_url` are enabled),
+  wired into `AppState`, resolved on boot / cleared on stop+reset.
+- **URL-binding** (§8a) — `canonical_base_url` + the `{bound_url, credential}`
+  vault envelope (`wrap_stored_secret`/`parse_stored_secret`), `check_binding`
+  enforced at release in `forward`, and the `classify_binding` tri-state driving
+  both boot-time resolution and the UI. Unit-tested (canonical equivalence/
+  distinctness, envelope round-trip, `forward` reject-on-mismatch/unbound,
+  tri-state classification).
 - **`integrations::forward`** — real `reqwest` call: host-lock → method →
-  credential injection (Basic / Bearer / custom header) → size-capped response;
-  shared `http_client`; secret fetched at call time.
+  **URL-binding check** → credential injection (Basic / Bearer / custom header) →
+  size-capped response; shared `http_client`; secret fetched at call time.
 - **Control-panel UI** — a Tools panel in the workspace modal
   (`WorkspaceTools`/`ToolRow` in `app.rs`) listing each requested tool with its
-  destination URL and configured status; per-tool configure form (Basic shows
-  username+token, Bearer/Header show token), plus **Save / Update / Test /
-  Clear**. Backed by `list_tool_configs` / `set_tool_secret` / `clear_tool_secret`
-  / `test_tool`.
+  destination URL and a tri-state status (configured / not configured /
+  **destination changed**, the last with a "was X, now Y — re-enter to confirm"
+  warning); per-tool configure form (Basic shows username+token, Bearer/Header
+  show token), plus **Save / Update / Test / Clear**. Backed by
+  `list_tool_configs` / `set_tool_secret` / `clear_tool_secret` / `test_tool`.
 
 ## 11. Deferred hardening (seams preserved)
 
-The built path omits these; their insertion points are preserved so they drop in
-without a rewrite:
+Most of the originally-deferred hardening is now built; what's left:
 
 - ~~**Encrypted Option-B vault** (§3)~~ — **built** (`secrets::VaultStore`); see
   §3/§10.
-- **URL-binding of credentials** (§5) — fails a changed URL closed, re-prompts
-  visibly. Still deferred; the vault's self-owned on-disk format makes the key
-  shape a localized change.
+- ~~**URL-binding of credentials** (§5)~~ — **built** (§8a): a credential is
+  released only to the exact destination it was approved for; a changed `base_url`
+  fails closed and the UI re-prompts visibly.
 - **Legible keystore-unavailable UX** — a broken/absent OS keystore (stock WSL)
   currently surfaces as the raw backend error from a fail-closed vault op, not a
   friendly "your keychain isn't set up" banner. Deliberately unshipped; the
@@ -287,7 +331,10 @@ without a rewrite:
 - A malicious project repo can only *request*; it can never supply or select a
   real credential.
 - A tampered `base_url` can't send the token anywhere but that URL mid-request
-  (host-lock), and the destination is shown + testable before a token is saved.
+  (host-lock), the destination is shown + testable before a token is saved, and
+  (URL-binding, §8a) an already-saved credential is *only* released to the exact
+  destination it was approved for — a later `base_url` change fails closed and
+  re-prompts rather than silently redirecting the token.
 - Secrets are bound to one workspace; a secret stored for `/other` can't enable a
   different repo.
 - **Residual, accepted:** first-use social engineering (persuading a user to
@@ -310,6 +357,12 @@ without a rewrite:
 3. ~~**Rename `crates/teamspec`** now that it no longer models a team spec.~~
    **Resolved — done.** Renamed to `crates/toolspec` (it only models the
    per-repo tool-request schema + host-lock, not a "team" spec).
+4. ~~**URL-binding** of credentials (§5): bind a stored credential to the URL it
+   was approved for.~~ **Resolved — built** (§8a). Deviated from the originally
+   sketched `hash(workspace, canonical_url, name)` key: the canonical URL is
+   stored *alongside* the credential in the vault envelope instead, which (now
+   that GAVMO owns the vault format) is simpler and lets the UI show the old URL
+   on a mismatch — impossible with a one-way hash.
 
 ## 14. Relationship to existing docs
 

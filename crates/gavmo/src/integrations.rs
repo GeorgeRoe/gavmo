@@ -19,7 +19,7 @@
 //! [`toolspec::lock_url`]), injects the configured credential, forwards any
 //! method, and returns a size-capped response.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use toolspec::{AuthScheme, GavmoConfig, ToolDef};
 
@@ -43,6 +43,98 @@ struct BasicCredential {
 #[derive(Debug, Deserialize)]
 struct TokenCredential {
     token: String,
+}
+
+/// The envelope actually written to the secret store: the credential plus the
+/// **canonical `base_url` it was approved for** (URL-binding — see
+/// `gavmo-tools-config-plan.md` §5). Binding the destination *into the stored
+/// value* means a credential is only ever released to the exact URL the user saw
+/// and approved; a repo quietly changing `base_url` afterward fails closed.
+///
+/// `credential` holds the raw inner JSON (`{"username","password"}` or
+/// `{"token"}`) as a string, so the existing [`BasicCredential`]/[`TokenCredential`]
+/// parsing is unchanged once the envelope is peeled off.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredSecret {
+    /// The canonical base_url (see [`toolspec::canonical_base_url`]) this
+    /// credential was approved for.
+    bound_url: String,
+    /// The inner credential JSON, exactly as the forwarder's credential structs
+    /// expect it.
+    credential: String,
+}
+
+/// Result of peeling the stored envelope: the credential JSON plus the URL it was
+/// bound to (`None` for a legacy/plain value with no envelope).
+pub struct ParsedSecret {
+    /// The canonical URL the credential was approved for, or `None` if the stored
+    /// value predates URL-binding (a bare credential with no envelope).
+    pub bound_url: Option<String>,
+    /// The inner credential JSON to hand to [`apply_auth`].
+    pub credential: String,
+}
+
+/// Wraps a credential JSON with the canonical URL it's approved for, producing
+/// the string actually stored in the vault. Saving a secret *is* the user's
+/// approval of `canonical_url` (the control panel shows the destination first).
+pub fn wrap_stored_secret(canonical_url: &str, credential_json: &str) -> String {
+    // Infallible shape (two strings) — `to_string` can't realistically fail, but
+    // fall back to the bare credential rather than panicking if it somehow does.
+    serde_json::to_string(&StoredSecret {
+        bound_url: canonical_url.to_string(),
+        credential: credential_json.to_string(),
+    })
+    .unwrap_or_else(|_| credential_json.to_string())
+}
+
+/// Peels the stored envelope. A value written by [`wrap_stored_secret`] yields
+/// its `bound_url` + inner credential; any *other* shape (a bare credential from
+/// before URL-binding, or hand-written store contents) is treated as **unbound**
+/// — `bound_url: None` — so the release-time check forces a re-approval rather
+/// than trusting an unbound value.
+pub fn parse_stored_secret(raw: &str) -> ParsedSecret {
+    match serde_json::from_str::<StoredSecret>(raw) {
+        Ok(env) => ParsedSecret {
+            bound_url: Some(env.bound_url),
+            credential: env.credential,
+        },
+        Err(_) => ParsedSecret {
+            bound_url: None,
+            credential: raw.to_string(),
+        },
+    }
+}
+
+/// A tool's credential state, as the control panel and boot-time resolution both
+/// see it. The URL-binding tri-state (see `gavmo-tools-config-plan.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingState {
+    /// No credential stored — the user hasn't configured this tool.
+    NotConfigured,
+    /// A credential is stored and bound to the tool's *current* `base_url`.
+    Configured,
+    /// A credential is stored but bound to a *different* destination than the
+    /// tool now declares (the repo changed `base_url`, or the value predates
+    /// URL-binding). Carries the URL it *was* approved for so the UI can show
+    /// "was X, now Y"; `None` means an unbound/legacy value.
+    DestinationChanged { bound_url: Option<String> },
+}
+
+/// Classifies a tool's binding state from its *current* `base_url` and the raw
+/// stored secret value (`None` if nothing is stored). Pure — the single source of
+/// truth shared by boot-time resolution (which enables only `Configured` tools)
+/// and the control-panel listing (which surfaces `DestinationChanged`).
+pub fn classify_binding(current_base_url: &str, stored_value: Option<&str>) -> BindingState {
+    let Some(raw) = stored_value else {
+        return BindingState::NotConfigured;
+    };
+    let parsed = parse_stored_secret(raw);
+    match check_binding(current_base_url, parsed.bound_url.as_deref()) {
+        Ok(()) => BindingState::Configured,
+        Err(_) => BindingState::DestinationChanged {
+            bound_url: parsed.bound_url,
+        },
+    }
 }
 
 /// A tool the daemon has decided to expose for a workspace: its id, the full
@@ -250,11 +342,13 @@ pub fn integration_tool_descriptor(integration: &ResolvedIntegration) -> mcp::To
 ///
 /// Order of checks is deliberate — the cheap, local rejections happen before any
 /// network I/O: argument validation, **host-lock** (the credential never leaves
-/// the integration's own origin), method parsing, and credential presence. Only
-/// then is the request built and sent via the shared `client`. The response is
-/// returned with its status line and a size-capped body; a non-2xx status comes
-/// back as a tool-level error (the agent still sees the body) so a failed read
-/// is visibly distinct from a successful one.
+/// the integration's own origin), method parsing, credential presence, and
+/// **URL-binding** (the credential is only released to the exact destination it
+/// was approved for — see [`check_binding`]). Only then is the request built and
+/// sent via the shared `client`. The response is returned with its status line
+/// and a size-capped body; a non-2xx status comes back as a tool-level error (the
+/// agent still sees the body) so a failed read is visibly distinct from a
+/// successful one.
 pub async fn forward(
     integration: &ResolvedIntegration,
     secret_value: Option<String>,
@@ -285,12 +379,22 @@ pub async fn forward(
         ));
     };
 
+    // URL-binding: release the credential only to the destination it was approved
+    // for. This is the hard security boundary — the UI's warning is just UX; a
+    // repo that changed `base_url` after a credential was saved (or a value with
+    // no binding at all) fails closed *here*, regardless of what any VM was told
+    // at boot.
+    let parsed = parse_stored_secret(&secret_value);
+    if let Err(message) = check_binding(&integration.def.base_url, parsed.bound_url.as_deref()) {
+        return mcp::ToolOutcome::Error(message);
+    }
+
     let request = client.request(method, url);
     let request = match apply_auth(
         request,
         integration.def.auth,
         integration.def.header_name.as_deref(),
-        &secret_value,
+        &parsed.credential,
     ) {
         Ok(request) => request,
         Err(e) => return mcp::ToolOutcome::Error(e),
@@ -315,6 +419,35 @@ pub async fn forward(
         mcp::ToolOutcome::Success(payload)
     } else {
         mcp::ToolOutcome::Error(payload)
+    }
+}
+
+/// Checks that a stored credential's bound URL still matches the integration's
+/// *current* `base_url` (URL-binding enforcement). `Ok(())` to release; `Err` with
+/// an agent-visible message to refuse.
+///
+/// Fails closed on three cases: an unbound value (`bound_url == None` — a legacy
+/// credential from before URL-binding, or a tampered store entry), a current
+/// `base_url` that no longer canonicalizes (shouldn't happen for a validated
+/// config, but refuse rather than guess), and a genuine mismatch (the repo
+/// changed where the token would go). The message names both the approved and the
+/// current destination so the agent — and, surfaced via the UI, the user —
+/// can see exactly what changed.
+pub fn check_binding(current_base_url: &str, bound_url: Option<&str>) -> Result<(), String> {
+    let current = toolspec::canonical_base_url(current_base_url).map_err(|e| {
+        format!("integration base_url could not be canonicalized for binding check: {e}")
+    })?;
+    match bound_url {
+        Some(bound) if bound == current => Ok(()),
+        Some(bound) => Err(format!(
+            "credential was approved for {bound} but this tool now points at {current}; \
+             re-confirm it in the GAVMO control panel"
+        )),
+        None => Err(
+            "credential is not bound to a destination (saved before URL-binding, or the stored \
+             value is malformed); re-save it in the GAVMO control panel to confirm its destination"
+                .to_string(),
+        ),
     }
 }
 
@@ -549,6 +682,134 @@ tools:
             mcp::ToolOutcome::Error(text) => assert!(text.contains("no credential"), "{text}"),
             other => panic!("expected error, got {other:?}"),
         }
+    }
+
+    // --- URL-binding --------------------------------------------------------
+
+    /// A properly-bound Basic credential for the jira integration's own base_url.
+    fn bound_jira_secret() -> String {
+        let url = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
+        wrap_stored_secret(&url, r#"{"username":"a@b.c","password":"t"}"#)
+    }
+
+    #[test]
+    fn stored_secret_envelope_round_trips() {
+        let wrapped = wrap_stored_secret("https://h.example.com/", r#"{"token":"abc"}"#);
+        let parsed = parse_stored_secret(&wrapped);
+        assert_eq!(parsed.bound_url.as_deref(), Some("https://h.example.com/"));
+        assert_eq!(parsed.credential, r#"{"token":"abc"}"#);
+    }
+
+    #[test]
+    fn parse_stored_secret_treats_a_bare_credential_as_unbound() {
+        // A legacy value (pre-URL-binding) has no envelope -> unbound.
+        let parsed = parse_stored_secret(r#"{"username":"a","password":"b"}"#);
+        assert!(parsed.bound_url.is_none());
+        assert_eq!(parsed.credential, r#"{"username":"a","password":"b"}"#);
+    }
+
+    #[test]
+    fn check_binding_accepts_a_matching_destination() {
+        let bound = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
+        assert!(check_binding("https://dafni.atlassian.net", Some(&bound)).is_ok());
+        // Cosmetic differences (trailing slash) must still match.
+        assert!(check_binding("https://dafni.atlassian.net/", Some(&bound)).is_ok());
+    }
+
+    #[test]
+    fn check_binding_rejects_a_changed_destination() {
+        let bound = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
+        let err = check_binding("https://evil.com", Some(&bound)).unwrap_err();
+        assert!(err.contains("evil.com"), "{err}");
+        assert!(err.contains("re-confirm"), "{err}");
+    }
+
+    #[test]
+    fn check_binding_rejects_an_unbound_credential() {
+        let err = check_binding("https://dafni.atlassian.net", None).unwrap_err();
+        assert!(err.contains("not bound"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_a_credential_bound_to_a_different_url() {
+        // Credential approved for example.com, tool now points at atlassian.
+        let wrong = wrap_stored_secret(
+            &toolspec::canonical_base_url("https://example.com").unwrap(),
+            r#"{"username":"a@b.c","password":"t"}"#,
+        );
+        let outcome = forward(
+            &jira_integration(),
+            Some(wrong),
+            &args(serde_json::json!({"method": "GET", "path": "/rest/api/3/myself"})),
+            &reqwest::Client::new(),
+        )
+        .await;
+        match outcome {
+            mcp::ToolOutcome::Error(text) => assert!(text.contains("re-confirm"), "{text}"),
+            other => panic!("expected binding error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_an_unbound_legacy_credential() {
+        let outcome = forward(
+            &jira_integration(),
+            // A bare credential with no envelope (pre-binding).
+            Some(r#"{"username":"a@b.c","password":"t"}"#.to_string()),
+            &args(serde_json::json!({"method": "GET", "path": "/rest/api/3/myself"})),
+            &reqwest::Client::new(),
+        )
+        .await;
+        match outcome {
+            mcp::ToolOutcome::Error(text) => assert!(text.contains("not bound"), "{text}"),
+            other => panic!("expected binding error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_binding_covers_the_tri_state() {
+        let base = "https://dafni.atlassian.net";
+        let good = wrap_stored_secret(
+            &toolspec::canonical_base_url(base).unwrap(),
+            r#"{"token":"t"}"#,
+        );
+        let bad = wrap_stored_secret(
+            &toolspec::canonical_base_url("https://evil.com").unwrap(),
+            r#"{"token":"t"}"#,
+        );
+
+        assert_eq!(classify_binding(base, None), BindingState::NotConfigured);
+        assert_eq!(classify_binding(base, Some(&good)), BindingState::Configured);
+        match classify_binding(base, Some(&bad)) {
+            BindingState::DestinationChanged { bound_url } => {
+                assert_eq!(
+                    bound_url.as_deref(),
+                    Some(toolspec::canonical_base_url("https://evil.com").unwrap().as_str())
+                );
+            }
+            other => panic!("expected DestinationChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_binding_reports_a_legacy_unbound_value_as_changed_with_no_url() {
+        match classify_binding("https://h.example.com", Some(r#"{"token":"t"}"#)) {
+            BindingState::DestinationChanged { bound_url } => assert!(bound_url.is_none()),
+            other => panic!("expected DestinationChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bound_secret_for_the_integration_passes_its_own_binding_check() {
+        // The credential `set_tool_secret` writes (bound to the integration's own
+        // canonical base_url) must clear `check_binding` against that same tool —
+        // the no-false-reject guarantee, hermetically (no network).
+        let integration = jira_integration();
+        let parsed = parse_stored_secret(&bound_jira_secret());
+        assert!(
+            check_binding(&integration.def.base_url, parsed.bound_url.as_deref()).is_ok(),
+            "a freshly-bound credential must pass its own tool's binding check"
+        );
     }
 
     // --- auth injection (build the request and inspect it, no network) ------

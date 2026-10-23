@@ -237,6 +237,51 @@ pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
     Ok(resolved)
 }
 
+/// Produces a stable, canonical string for an integration's `base_url`, used to
+/// **bind a stored credential to the exact destination it was approved for**
+/// (URL-binding — see `gavmo-tools-config-plan.md` §5).
+///
+/// The canonical form captures *everything that determines where a credential is
+/// sent* and nothing else: scheme, host, effective port, and the base path
+/// prefix — normalized so cosmetically-equal URLs compare equal (lowercased
+/// scheme/host, default ports made explicit so `https://h` == `https://h:443`,
+/// the path forced to end in `/` exactly as [`lock_url`] treats it), while a
+/// genuinely different destination (other host, other port, other tenant path
+/// like `/ex/jira/A/` vs `/ex/jira/B/`) compares different. Query and fragment
+/// are dropped — a `base_url` shouldn't carry them, and they don't change the
+/// endpoint a credential reaches.
+///
+/// Deliberately **does not** include `auth`, `header_name`, `description`, etc.:
+/// those change *how* a token is attached on-origin, not *where* it goes, so
+/// binding to them would only cause pointless re-prompts on a harmless edit. By
+/// reusing the same scheme/host/port/path normalization as [`lock_url`], binding
+/// and host-locking can never disagree about what "the same destination" means.
+pub fn canonical_base_url(base_url: &str) -> Result<String, HostLockError> {
+    let mut url = Url::parse(base_url).map_err(|e| HostLockError::InvalidBaseUrl(e.to_string()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| HostLockError::BaseUrlHasNoHost(base_url.to_string()))?
+        .to_ascii_lowercase();
+
+    // Match lock_url's "base path ends in /" treatment so a credential approved
+    // for `.../CLOUDID` and one for `.../CLOUDID/` are the same destination.
+    if !url.path().ends_with('/') {
+        let with_slash = format!("{}/", url.path());
+        url.set_path(&with_slash);
+    }
+
+    let scheme = url.scheme().to_ascii_lowercase();
+    // Effective port (explicit default == implicit default), so `https://h` and
+    // `https://h:443` bind identically.
+    let port = url.port_or_known_default();
+    let path = url.path();
+
+    Ok(match port {
+        Some(p) => format!("{scheme}://{host}:{p}{path}"),
+        None => format!("{scheme}://{host}{path}"),
+    })
+}
+
 /// A compact "scheme://host:port" for error messages (best-effort; only used in
 /// the rejected path).
 fn origin_string(u: &Url) -> String {
@@ -445,5 +490,60 @@ tools:
         // https://h:443 is the same origin as https://h.
         let u = lock_url("https://h.example.com", "https://h.example.com:443/x").unwrap();
         assert_eq!(u.host_str(), Some("h.example.com"));
+    }
+
+    // --- canonical_base_url (URL-binding) ----------------------------------
+
+    #[test]
+    fn canonical_base_url_is_stable_and_includes_the_path_prefix() {
+        assert_eq!(
+            canonical_base_url("https://api.atlassian.com/ex/jira/CLOUDID").unwrap(),
+            "https://api.atlassian.com:443/ex/jira/CLOUDID/"
+        );
+    }
+
+    #[test]
+    fn canonical_base_url_normalizes_cosmetic_differences_to_the_same_string() {
+        // Trailing slash, explicit default port, and host case must not matter —
+        // these are all the *same* destination and must not trigger a re-prompt.
+        let a = canonical_base_url("https://Dafni.Atlassian.net").unwrap();
+        let b = canonical_base_url("https://dafni.atlassian.net/").unwrap();
+        let c = canonical_base_url("https://dafni.atlassian.net:443").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn canonical_base_url_distinguishes_same_host_different_tenant_path() {
+        // The attack origin-only binding would miss: same host, different tenant.
+        let good = canonical_base_url("https://api.atlassian.com/ex/jira/GOOD").unwrap();
+        let evil = canonical_base_url("https://api.atlassian.com/ex/jira/EVIL").unwrap();
+        assert_ne!(good, evil);
+    }
+
+    #[test]
+    fn canonical_base_url_distinguishes_host_port_and_scheme() {
+        let base = canonical_base_url("https://h.example.com").unwrap();
+        assert_ne!(base, canonical_base_url("https://evil.example.com").unwrap());
+        assert_ne!(base, canonical_base_url("https://h.example.com:8443").unwrap());
+        assert_ne!(base, canonical_base_url("http://h.example.com").unwrap());
+    }
+
+    #[test]
+    fn canonical_base_url_drops_query_and_fragment() {
+        // A base_url shouldn't carry these, but if it does they don't change the
+        // destination a credential reaches, so they must not affect the binding.
+        assert_eq!(
+            canonical_base_url("https://h.example.com/base?x=1#frag").unwrap(),
+            canonical_base_url("https://h.example.com/base").unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_base_url_rejects_a_non_url() {
+        assert!(matches!(
+            canonical_base_url("not a url"),
+            Err(HostLockError::InvalidBaseUrl(_))
+        ));
     }
 }

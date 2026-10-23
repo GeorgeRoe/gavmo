@@ -307,10 +307,13 @@ outbound request and reaches **no** VM-visible surface.
   panel), and/or inspect opencode state from a context that isn't itself being
   recorded.
 
-- **Hardening** (see `gavmo-tools-config-plan.md` §11): the encrypted Option-B
-  vault behind the `SecretStore` trait is now **built** (`secrets::VaultStore` —
-  one XChaCha20-Poly1305 file, data-key as a single keyring entry, fail-closed,
-  lazily opened); URL-binding of credentials remains deferred.
+- **Hardening** (see `gavmo-tools-config-plan.md` §11): both originally-deferred
+  seams are now **built** — the encrypted Option-B vault behind the `SecretStore`
+  trait (`secrets::VaultStore` — one XChaCha20-Poly1305 file, data-key as a single
+  keyring entry, fail-closed, lazily opened) and credential URL-binding
+  (`toolspec::canonical_base_url` + a `{bound_url, credential}` vault envelope,
+  enforced fail-closed at release in `integrations::forward` — see §8a). The only
+  remaining deferred item is a friendlier keystore-unavailable UX.
 - **Open tidy-ups** (ibid. §13): ~~rename `crates/teamspec`~~ (done — renamed
   to `crates/toolspec`); ~~pick + pin an AEAD crate~~ (done — XChaCha20-Poly1305,
   `chacha20poly1305 =0.11.0`). (Git-remote-else-path workspace identity was

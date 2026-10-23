@@ -542,6 +542,30 @@ button.danger:hover:not(:disabled) {
   color: var(--ok);
 }
 
+.tool-status--warn {
+  color: var(--warn);
+}
+
+.tool-warning {
+  margin: 0.4rem 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  background: rgba(240, 180, 41, 0.08);
+  font-size: 0.78rem;
+}
+
+.tool-warning p {
+  margin: 0.3rem 0 0;
+  color: var(--muted);
+}
+
+.tool-warning code {
+  color: var(--text);
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
 .tool-desc {
   margin: 0.4rem 0 0.2rem;
   font-size: 0.82rem;

@@ -133,8 +133,18 @@ pub struct ToolConfig {
     pub secret_name: String,
     /// Optional setup help from the config.
     pub instructions: Option<String>,
-    /// Whether a credential is currently stored for this tool.
+    /// Whether a credential is currently stored for this tool *and* bound to the
+    /// current `base_url` (i.e. usable). False when nothing is stored, or when a
+    /// stored credential's destination no longer matches (see `url_changed`).
     pub configured: bool,
+    /// True when a credential *is* stored but was approved for a different
+    /// destination than the tool now declares (URL-binding mismatch). The tool is
+    /// disabled until re-confirmed; the UI shows a warning with `bound_url`.
+    pub url_changed: bool,
+    /// The destination the stored credential was originally approved for, shown in
+    /// the mismatch warning ("was X, now Y"). `Some` only when `url_changed` and
+    /// the stored value carried a binding; `None` for an unbound/legacy value.
+    pub bound_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +1571,8 @@ fn ToolRow(
     let auth = tool.auth.clone();
     let is_basic = auth == "basic";
     let configured = tool.configured;
+    let url_changed = tool.url_changed;
+    let bound_url = tool.bound_url.clone();
     let tool = StoredValue::new(tool);
 
     let username = RwSignal::new(String::new());
@@ -1629,7 +1641,9 @@ fn ToolRow(
         <div class="tool-row">
             <div class="tool-head">
                 <span class="tool-name">{header.id.clone()}</span>
-                {if configured {
+                {if url_changed {
+                    view! { <span class="tool-status tool-status--warn">"destination changed"</span> }.into_any()
+                } else if configured {
                     view! { <span class="tool-status tool-status--ok">"configured"</span> }.into_any()
                 } else {
                     view! { <span class="tool-status">"not configured"</span> }.into_any()
@@ -1640,6 +1654,31 @@ fn ToolRow(
                 <span class="tool-url-label">"Sends your credential to: "</span>
                 <code>{header.base_url.clone()}</code>
             </p>
+            {url_changed.then(|| view! {
+                <div class="tool-warning">
+                    <strong>"This tool's destination changed."</strong>
+                    {match bound_url.clone() {
+                        Some(was) => view! {
+                            <p>
+                                "Your saved credential was approved for "
+                                <code>{was}</code>
+                                " but this tool now points at "
+                                <code>{header.base_url.clone()}</code>
+                                "."
+                            </p>
+                        }.into_any(),
+                        None => view! {
+                            <p>
+                                "Your saved credential wasn't bound to a destination (it predates \
+                                 URL-binding). Re-enter it to confirm it should go to "
+                                <code>{header.base_url.clone()}</code>
+                                "."
+                            </p>
+                        }.into_any(),
+                    }}
+                    <p>"The credential is disabled until you re-enter it below to confirm."</p>
+                </div>
+            })}
             {header.instructions.clone().map(|text| view! {
                 <p class="hint">{text}</p>
             })}

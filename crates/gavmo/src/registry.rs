@@ -6,7 +6,7 @@
 //! mechanism behind the daemon's server functions. See
 //! `crates/gavmo/plan.md` §§6–7.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -632,12 +632,24 @@ impl AppState {
     /// `running`-lock callers.
     async fn resolve_integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
         let candidates = self.candidates_for(id).await;
-        let present = self
-            .secrets_present(candidates.iter().map(|c| c.secret_key.clone()).collect())
+        // Fetch values (not just presence) so a tool whose stored credential is
+        // bound to a *different* destination than its current `base_url` isn't
+        // advertised to the agent at all — defense-in-depth above the hard
+        // release-time check in `integrations::forward`.
+        let values = self
+            .secrets_fetch_many(candidates.iter().map(|c| c.secret_key.clone()).collect())
             .await;
         candidates
             .into_iter()
-            .filter(|candidate| present.contains(&candidate.secret_key))
+            .filter(|candidate| {
+                matches!(
+                    crate::integrations::classify_binding(
+                        &candidate.def.base_url,
+                        values.get(&candidate.secret_key).map(String::as_str),
+                    ),
+                    crate::integrations::BindingState::Configured
+                )
+            })
             .map(CandidateTool::into_resolved)
             .collect()
     }
@@ -723,14 +735,15 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
-    /// Checks which of `keys` currently have a stored value, in a single
-    /// blocking batch (one `spawn_blocking` for the whole set rather than one per
-    /// key).
-    async fn secrets_present(&self, keys: Vec<String>) -> HashSet<String> {
+    /// Fetches the stored value for each of `keys` (absent/errored keys are
+    /// simply missing from the returned map), in a single blocking batch. Used
+    /// where the *value* (not just presence) is needed — the URL-binding check,
+    /// which must read each credential's bound destination.
+    async fn secrets_fetch_many(&self, keys: Vec<String>) -> HashMap<String, String> {
         let store = self.inner.secret_store.clone();
         tokio::task::spawn_blocking(move || {
             keys.into_iter()
-                .filter(|key| store.get(key).ok().flatten().is_some())
+                .filter_map(|key| store.get(&key).ok().flatten().map(|v| (key, v)))
                 .collect()
         })
         .await
@@ -741,29 +754,46 @@ impl AppState {
     /// each has its credential configured (see [`crate::app::ToolConfig`]).
     pub async fn list_tool_configs(&self, id: &str) -> Vec<ToolConfig> {
         let candidates = self.candidates_for(id).await;
-        let present = self
-            .secrets_present(candidates.iter().map(|c| c.secret_key.clone()).collect())
+        // Need the stored *values* (not just presence) to classify the URL-binding
+        // tri-state: not-configured / configured / destination-changed.
+        let values = self
+            .secrets_fetch_many(candidates.iter().map(|c| c.secret_key.clone()).collect())
             .await;
 
         candidates
             .into_iter()
-            .map(|tool| ToolConfig {
-                configured: present.contains(&tool.secret_key),
-                id: tool.id,
-                description: tool
-                    .def
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
-                base_url: tool.def.base_url,
-                auth: match tool.def.auth {
-                    toolspec::AuthScheme::Basic => "basic",
-                    toolspec::AuthScheme::Bearer => "bearer",
-                    toolspec::AuthScheme::Header => "header",
+            .map(|tool| {
+                let state = crate::integrations::classify_binding(
+                    &tool.def.base_url,
+                    values.get(&tool.secret_key).map(String::as_str),
+                );
+                let (configured, url_changed, bound_url) = match state {
+                    crate::integrations::BindingState::NotConfigured => (false, false, None),
+                    crate::integrations::BindingState::Configured => (true, false, None),
+                    crate::integrations::BindingState::DestinationChanged { bound_url } => {
+                        (false, true, bound_url)
+                    }
+                };
+                ToolConfig {
+                    configured,
+                    url_changed,
+                    bound_url,
+                    id: tool.id,
+                    description: tool
+                        .def
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
+                    base_url: tool.def.base_url,
+                    auth: match tool.def.auth {
+                        toolspec::AuthScheme::Basic => "basic",
+                        toolspec::AuthScheme::Bearer => "bearer",
+                        toolspec::AuthScheme::Header => "header",
+                    }
+                    .to_string(),
+                    secret_name: tool.def.secret,
+                    instructions: tool.def.instructions,
                 }
-                .to_string(),
-                secret_name: tool.def.secret,
-                instructions: tool.def.instructions,
             })
             .collect()
     }
@@ -794,7 +824,16 @@ impl AppState {
             }
         };
 
-        self.secret_set(tool.secret_key, value.to_string()).await
+        // URL-binding: record the canonical destination this credential is being
+        // approved for (the control panel showed it to the user before Save), so
+        // a later `base_url` change in the untrusted `gavmo.yaml` fails closed and
+        // re-prompts rather than silently redirecting the token. See
+        // `crate::integrations::{wrap_stored_secret, check_binding}`.
+        let canonical = toolspec::canonical_base_url(&tool.def.base_url)
+            .map_err(|e| format!("tool base_url could not be canonicalized: {e}"))?;
+        let bound = crate::integrations::wrap_stored_secret(&canonical, &value.to_string());
+
+        self.secret_set(tool.secret_key, bound).await
     }
 
     /// Removes a tool's stored credential (disabling it on the next open).
