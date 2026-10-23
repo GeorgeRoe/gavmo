@@ -270,14 +270,43 @@ and how it differs from this early sketch:
   destination URL, configure-secret form, and Save/Update/Test/Clear. Supplying
   the secret *is* the user's approval — a repo cannot self-enable a tool.
 
-**Still to do:**
+**P4.4 ✅ verified on real hardware** — the token-exfiltration property is
+confirmed: a configured integration credential is injected host-side into the
+outbound request and reaches **no** VM-visible surface.
 
-- **P4.4** — the full real-tool flow (a read-only Jira/Supabase integration)
-  verified end-to-end on real hardware through the Tools panel, asserting the
-  real token never reaches any VM-visible surface (files, env, prompts, MCP
-  results, logs). The pipeline it rides on (P4.0) is now hardware-confirmed, and
-  the integration tools are already wired into the live `ToolExecutor`
-  (`crates/gavmo/src/registry.rs`), so this is a verification pass, not new code.
+- **Test setup.** A temporary `gavmo.yaml` at the repo root declared one tool
+  (`exfil-probe`, `type: http`, `auth: bearer`, `base_url: https://example.com`,
+  `test_path: /`). `example.com` was used deliberately: it host-locks and
+  resolves cleanly, exercising the full inject-credential forward path without
+  any real service or real secret. The credential was a distinctive sentinel
+  (`testing`) stored via the Tools panel.
+- **Forwarder works end-to-end.** Calling `exfil-probe` (GET `/`) through the
+  gateway returned `HTTP 200` with only example.com's HTML body — the host
+  attached the credential to the *outbound* request and returned only the
+  response to the caller; the sentinel was never echoed back to the agent.
+- **The credential reaches no guest surface.** Verified from inside the guest:
+  - `/etc/gavmo/mcp/token.env` held **only** `GAVMO_MCP_TOKEN=<uuid>` — not the
+    sentinel. (`-rw------- agent`, 53 bytes.)
+  - The sentinel was **absent** from the opencode process environment
+    (`/proc/<pid>/environ`).
+  - The sentinel was **absent** from `/etc/gavmo` (token + gcloud shares) and
+    from `/workspace` (bar the `gavmo.yaml` itself and the ordinary English word
+    "testing" in docs/source — never as a stored credential).
+  - opencode's own state (`~/.local/share/opencode/opencode.db*`, `log/`) held
+    **no** `"authorization":"Bearer <sentinel>"` field — the credential was never
+    recorded as an actual header anywhere in session/tool-call state.
+- **Test-harness caveat (important for whoever re-runs this).** Because the
+  sentinel was the literal word `testing` and the verification was driven from
+  *inside* an opencode session, opencode journaled the grep commands (and this
+  agent's own messages) into its WAL — so naive `grep 'Bearer testing'` over
+  opencode state produces **self-inflicted** matches that grow every time you
+  grep again (a feedback loop). The authoritative check is whether the sentinel
+  appears in an actual request-header *field* (it does not), not a raw substring
+  count. Next time: use a sentinel that is **not** a common English word and is
+  **never typed into a shell command** (e.g. configure it only through the Tools
+  panel), and/or inspect opencode state from a context that isn't itself being
+  recorded.
+
 - **Deferred hardening** (see `gavmo-tools-config-plan.md` §11): encrypted
   Option-B vault behind the `SecretStore` trait; URL-binding of credentials.
 - **Open tidy-ups** (ibid. §13): git-remote-else-path workspace identity; rename
