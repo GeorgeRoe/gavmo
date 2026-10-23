@@ -11,7 +11,8 @@
 //!       <base-image.qcow2> <repo-dir> <gcloud-dir> <host-port>
 //!
 //! Then open http://127.0.0.1:<host-port> in a browser — it should show a
-//! file listing of <repo-dir>, served from inside the VM over 9p.
+//! file listing of <repo-dir>, served from inside the VM over virtiofs.
+//! Requires a `virtiofsd` binary on `PATH` (see `share.rs::VirtiofsShare`).
 //! Ctrl-C to request a graceful shutdown.
 
 use std::path::PathBuf;

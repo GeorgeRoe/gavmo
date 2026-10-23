@@ -38,7 +38,7 @@ pub enum Error {
     /// The guest's `gavmo-rebuild` service (M2 — see
     /// `nix/base/configuration.nix`) failed to apply the repo's `gavmo.nix`.
     /// Detected via the `rebuild-failed` marker file in `VmConfig::state_dir`
-    /// (host-visible over the 9p `/workspace` share), which the guest writes
+    /// (host-visible over the virtiofs `/workspace` share), which the guest writes
     /// instead of ever starting opencode — this resolves much faster than
     /// waiting out [`Error::HealthTimeout`]. `log_file` is the filename
     /// (relative to `state_dir`) of the full `nixos-rebuild` output, for the

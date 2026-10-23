@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::health::{probe_once, wait_for_ready};
 use crate::qemu::spawn_qemu;
 use crate::qmp;
-use crate::share::{NinePShare, ShareBackend, ShareSpec};
+use crate::share::{ShareBackend, ShareSpec, VirtiofsShare};
 
 /// How long to wait for `opencode web` to become reachable during boot.
 ///
@@ -53,8 +53,9 @@ pub enum VmStatus {
     Failed { reason: String },
 }
 
-/// A booted VM: owns the qemu process (and any share-backend helper
-/// processes, currently none for 9p) plus the config it was booted with.
+/// A booted VM: owns the qemu process (and its share-backend helper
+/// processes — one `virtiofsd` per share) plus the config it was booted
+/// with.
 ///
 /// Dropping a `RunningVm` without calling [`RunningVm::stop`] will still
 /// kill the qemu child (via `kill_on_drop`), but won't attempt a graceful
@@ -73,13 +74,13 @@ pub struct RunningVm {
 
 impl RunningVm {
     /// Boots a VM per `cfg`, sharing `/workspace` (read-write) and the
-    /// gcloud credentials directory (read-only) via 9p, and waits for
+    /// gcloud credentials directory (read-only) via virtiofs, and waits for
     /// `opencode web` to answer on the forwarded host port before
     /// returning.
     pub async fn boot(cfg: VmConfig) -> Result<Self> {
         ensure_overlay(&cfg.base_image, &cfg.disk_path()).await?;
 
-        let nine_p = NinePShare;
+        let virtiofs = VirtiofsShare;
         let workspace_share = ShareSpec {
             host_path: cfg.repo_dir.clone(),
             mount_tag: MOUNT_TAG_WORKSPACE,
@@ -96,9 +97,9 @@ impl RunningVm {
             read_only: true,
         };
         let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
-            (&nine_p, workspace_share),
-            (&nine_p, gcloud_share),
-            (&nine_p, mcp_share),
+            (&virtiofs, workspace_share),
+            (&virtiofs, gcloud_share),
+            (&virtiofs, mcp_share),
         ];
 
         // Clear a stale M2 failure marker from a previous boot attempt

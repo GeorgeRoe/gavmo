@@ -2,6 +2,23 @@
 
 > George's Agent Virtual Machine Orchestrator
 
+## Running the daemon locally
+
+The daemon drives QEMU directly, and each VM's filesystem shares run over
+**virtiofs**, which needs a `virtiofsd` binary on `PATH` in addition to
+`qemu-system-x86_64` — both must be present when you launch it, e.g.:
+
+```sh
+nix-shell -p qemu virtiofsd --command 'env \
+  GAVMO_BASE_IMAGE="$(readlink -f result/nixos.qcow2)" \
+  cargo leptos watch --project gavmo'
+```
+
+Forgetting `virtiofsd` fails a VM boot immediately with `failed to spawn
+"virtiofsd": No such file or directory`, before qemu ever starts (so no
+`console.log` is written for that attempt either) — if you see that, this is
+almost certainly why.
+
 ## Customizing your repo's VM with `gavmo.nix`
 
 Each repo's VM runs GAVMO's fixed base system by default. If your repo's root
@@ -15,6 +32,7 @@ shell it spawns, run inside the environment you declare.
 {
   environment.systemPackages = [ pkgs.nodejs pkgs.jq ];
   virtualisation.docker.enable = true;
+  users.users.agent.extraGroups = [ "docker" ];
 }
 ```
 
@@ -31,13 +49,16 @@ A few things worth knowing:
   base config — list-valued options (like `environment.systemPackages`)
   concatenate; most other options just work as expected. Don't try to redefine
   options the base config already fixes — in particular, the `/workspace` and
-  `/etc/gavmo/gcloud` 9p mounts and the `gavmo-opencode` service are owned by
-  GAVMO and shouldn't be touched.
+  `/etc/gavmo/gcloud` virtiofs mounts and the `gavmo-opencode` service are
+  owned by GAVMO and shouldn't be touched.
 - **It runs as root, at VM-boot time**, via an in-guest `nixos-rebuild test`
-  (activates immediately, never touches the bootloader). The VM is GAVMO's
-  trust boundary — same stance as OpenCode's own wide-open permission policy
-  inside the VM — so treat `gavmo.nix` as trusted, repo-owned configuration,
-  not sandboxed input.
+  (activates immediately, never touches the bootloader) — so treat `gavmo.nix`
+  itself as trusted, repo-owned configuration, not sandboxed input. This is a
+  separate claim from what the *agent* can do once booted, though: the agent
+  (`opencode` and every `bash` command it runs) runs as an unprivileged,
+  non-root `agent` user with no `sudo`, confined by the kernel to writing only
+  `/workspace`, its own home, and a private `/tmp` — see "Granting the agent
+  more" below for how `gavmo.nix` is also the lever for loosening that.
 - **No `gavmo.nix`? Nothing changes.** The rebuild step is skipped entirely and
   the VM behaves exactly as it does today.
 - **A broken `gavmo.nix` blocks the agent, deliberately.** If it fails to
@@ -52,6 +73,70 @@ A few things worth knowing:
 
 See `nix/spike-m2.md` for the full design and the hardware-validated results
 behind this mechanism.
+
+See `examples/playwright/` for a worked `gavmo.nix` + `opencode.json` that
+install the Playwright MCP server and a Nix-provided Chromium, so the agent
+can drive a real browser - one action at a time, nothing written to the repo
+- to validate its own work (e.g. hitting a Nuxt dev server) instead of just
+reading source.
+
+## Granting the agent more
+
+The base image's default posture for the `agent` user (that runs `opencode`)
+is strict: no `sudo`, no group memberships beyond its own, and a systemd
+sandbox (`ProtectSystem=strict`, `NoNewPrivileges`, an empty
+`CapabilityBoundingSet`, …) that confines its writes to `/workspace`, its own
+home, and a private `/tmp`. Most "the agent needs more power" asks are solved
+declaratively — grant the specific thing a project's agent needs via its own
+`gavmo.nix`, rather than the agent escalating privilege at runtime:
+
+- **Docker / containers.** Enable the daemon and add `agent` to its group —
+  the agent then runs `docker build`/`docker run` with no `sudo`; the
+  root-run daemon does the privileged work.
+  ```nix
+  virtualisation.docker.enable = true;
+  users.users.agent.extraGroups = [ "docker" ];
+  ```
+- **Binding low ports (<1024)**, e.g. testing on `:80`/`:443`:
+  ```nix
+  boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 0;
+  ```
+- **A service for integration tests** (Postgres, Redis, …) — declare it, it
+  comes up as root at boot, the agent just connects to it:
+  ```nix
+  services.postgresql.enable = true;
+  ```
+
+For the rare case where a repo's actual work is systems programming
+(containers, kernel modules, mounts, etc.) and the agent genuinely needs
+ad-hoc root at runtime, `gavmo.nix` can re-enable `sudo` for it — this
+requires overriding **both** of the sandbox options that would otherwise
+block it, not just adding a sudoers rule:
+
+```nix
+{ lib, ... }:
+{
+  systemd.services.gavmo-opencode.serviceConfig = {
+    # Sudo relies on a setuid-root exec gaining privileges it didn't start
+    # with — NoNewPrivileges forbids exactly that outright.
+    NoNewPrivileges = lib.mkForce false;
+    # The bounding set is a hard ceiling no exec can exceed regardless of
+    # uid; widen it to exactly what the workflow needs rather than clearing
+    # it entirely.
+    CapabilityBoundingSet = lib.mkForce [ "CAP_SYS_ADMIN" ];
+  };
+  security.sudo.extraRules = [
+    {
+      users = [ "agent" ];
+      commands = [ { command = "ALL"; options = [ "NOPASSWD" ]; } ];
+    }
+  ];
+}
+```
+
+Treat this as a last resort: granting broad `sudo` plus capabilities
+re-widens exactly the hole the default posture exists to close, scoped only
+to that one repo.
 
 ## Long-running shell commands
 

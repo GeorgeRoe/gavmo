@@ -187,28 +187,25 @@ import { useServer } from "@/context/server"' \
 in
 {
   # Milestone 1 image: real `opencode web`, authenticated to Google Vertex
-  # AI, running against the live 9p-shared /workspace. Builds directly on
-  # the milestone-0 "plumbing proof" (QEMU + 9p + port-forward + health +
-  # QMP stop), which is unchanged below. The only things new in M1 are:
+  # AI, running against the live virtiofs-shared /workspace. Builds directly
+  # on the milestone-0 "plumbing proof" (originally QEMU + 9p + port-forward
+  # + health + QMP stop; the share transport moved from 9p to virtiofs at
+  # M3 — see `share.rs::VirtiofsShare`'s doc comment for why — everything
+  # else below is otherwise unchanged). The only things new in M1 were:
   #   - installing `opencode` + `git`,
   #   - a managed (non-overridable) /etc/opencode/opencode.json, so a repo
   #     cannot swap the provider/model allowlist out from under GAVMO,
   #   - a minimal /etc/gavmo/AGENTS.md baked in via `instructions`,
   #   - the `gavmo-opencode` systemd service replacing the M0 dummy server.
   #
-  # No Rust changes: the `vm` crate and crates/vm/examples/boot.rs are
-  # unchanged from M0 - same guest port, same mounts, same command.
-  #
   # See nix/base/flake.nix for how this gets built into a qcow2, and
   # crates/vm/examples/boot.rs for the runner that boots it.
 
-  # Kernel modules for the 9p shares. Not strictly required (kmod can often
-  # autoload filesystem modules on demand), but explicit here so the mounts
-  # don't depend on autodetection in a minimal image.
+  # Kernel modules for the virtiofs shares. Not strictly required (kmod can
+  # often autoload filesystem modules on demand), but explicit here so the
+  # mounts don't depend on autodetection in a minimal image.
   boot.kernelModules = [
-    "9p"
-    "9pnet"
-    "9pnet_virtio"
+    "virtiofs"
   ];
 
   # M2: lets the in-guest `nixos-rebuild --flake ...` (see `flake.nix`'s
@@ -219,18 +216,29 @@ in
     "flakes"
   ];
 
+  # M3: the unprivileged `agent` user (see `users.users.agent` below) must
+  # not be able to reach the nix-daemon directly — this is what makes
+  # `nix.settings.allowed-users`'s exclusion of `agent` an enforceable
+  # boundary rather than a tripwire: with `agent` holding no sudo (see
+  # `gavmo-opencode` below), there is no path for it to re-present as a
+  # trusted/root caller. `root` is always implicitly allowed/trusted by the
+  # daemon regardless of this list — that's what lets `gavmo-rebuild` below
+  # keep working unaffected. A repo that genuinely wants its agent to use
+  # nix directly can re-add it via its own `gavmo.nix`
+  # (`nix.settings.allowed-users = [ "agent" ]` — list options concatenate,
+  # see the README's "Customizing your repo's VM").
+  nix.settings.allowed-users = lib.mkDefault [ "root" ];
+
   # --- The Rust <-> image contract -----------------------------------------
   # Mount tags here MUST match MOUNT_TAG_WORKSPACE / MOUNT_TAG_GCLOUD in
-  # crates/vm/src/handle.rs, and cache=none matches the daemon's share spec
-  # decision (favor coherence over speed) from crates/vm/plan.md.
+  # crates/vm/src/handle.rs. `cache=auto` mirrors the daemon's virtiofsd
+  # invocation (`share.rs::build_virtiofsd_args`'s `--cache=auto`) — the two
+  # must agree since virtiofs's host and guest sides both derive their
+  # coherence behavior from the same cache mode.
   fileSystems."/workspace" = {
     device = "workspace";
-    fsType = "9p";
+    fsType = "virtiofs";
     options = [
-      "trans=virtio"
-      "version=9p2000.L"
-      "cache=none"
-      "msize=1048576"
       "rw"
       "nofail"
       "x-systemd.device-timeout=10s"
@@ -239,12 +247,8 @@ in
 
   fileSystems."/etc/gavmo/gcloud" = {
     device = "gcloud";
-    fsType = "9p";
+    fsType = "virtiofs";
     options = [
-      "trans=virtio"
-      "version=9p2000.L"
-      "cache=none"
-      "msize=1048576"
       "ro"
       "nofail"
       "x-systemd.device-timeout=10s"
@@ -253,25 +257,48 @@ in
 
   # Phase 4 / P4.0 (see `crates/mcp/plan.md`): the per-workspace MCP
   # capability token share. Mirrors the gcloud mount above exactly (same
-  # 9p options, same read-only posture) - the only dynamic per-workspace
-  # value the host needs to get into the guest for the tool gateway is this
-  # one bearer token (see `VmConfig::mcp_dir` in `crates/vm/src/config.rs`
-  # for why it's a dedicated share and not just a file under `/workspace`).
-  # `EnvironmentFile` on `gavmo-opencode` below loads `token.env` from here
-  # directly - no guest-side script needed to turn it into an env var.
+  # virtiofs options, same read-only posture) - the only dynamic
+  # per-workspace value the host needs to get into the guest for the tool
+  # gateway is this one bearer token (see `VmConfig::mcp_dir` in
+  # `crates/vm/src/config.rs` for why it's a dedicated share and not just a
+  # file under `/workspace`). `EnvironmentFile` on `gavmo-opencode` below
+  # loads `token.env` from here directly - no guest-side script needed to
+  # turn it into an env var. Read by root (systemd's `EnvironmentFile` is
+  # processed before the service drops to `agent`), so this share's
+  # ownership/uid-mapping doesn't matter for it the way it does for
+  # `/workspace`/gcloud.
   fileSystems."/etc/gavmo/mcp" = {
     device = "mcp";
-    fsType = "9p";
+    fsType = "virtiofs";
     options = [
-      "trans=virtio"
-      "version=9p2000.L"
-      "cache=none"
-      "msize=1048576"
       "ro"
       "nofail"
       "x-systemd.device-timeout=10s"
     ];
   };
+
+  # --- M3: the unprivileged agent user --------------------------------------
+  # `opencode` (and every `bash` command it runs) executes as this user, not
+  # root (see `gavmo-opencode` below) — see the design discussion that landed
+  # this change for the full rationale. Its uid/gid are pinned to fixed
+  # numbers (rather than left to NixOS's normal dynamic allocation) because
+  # `crates/vm/src/share.rs`'s `GUEST_AGENT_UID`/`GUEST_AGENT_GID` constants
+  # must match them exactly for virtiofsd's host-owner-to-guest-agent uid
+  # mapping to land on the right guest user — like `GAVMO_MCP_PORT` elsewhere
+  # in this codebase, there is no automatic sharing between the Rust constant
+  # and this declaration, so a change to one must be mirrored in the other by
+  # hand. No `extraGroups` (in particular, **not** `wheel`) and no sudo rule
+  # is granted by this base config — a repo's own `gavmo.nix` is the place to
+  # add group memberships (e.g. `docker`) or capabilities a specific
+  # project's agent genuinely needs (see the README).
+  users.users.agent = {
+    isNormalUser = true;
+    uid = 1000;
+    group = "agent";
+    createHome = true;
+    home = "/home/agent";
+  };
+  users.groups.agent.gid = 1000;
 
   # --- M2 hardening: keep Nix's regenerable caches off the persistent disk --
   # Nix runs its fetcher-cache and eval-cache SQLite DBs with `pragma
@@ -296,10 +323,11 @@ in
   #
   # Deliberately narrow (not all of `/root/.cache`): only Nix's own caches
   # need this - the `/nix/store` itself (the expensive, valuable cache) and
-  # OpenCode's session SQLite (`/root/.local/share`, see the `gavmo-opencode`
-  # comment below) are both NOT touched by this mount and stay persistent on
-  # the overlay exactly as before. Unlike Nix's cache, OpenCode's session DB
-  # uses normal (crash-safe) SQLite settings, so it was never at risk here.
+  # OpenCode's session SQLite (`/home/agent/.local/share` since M3 - see the
+  # `gavmo-opencode` comment below) are both NOT touched by this mount and
+  # stay persistent on the overlay exactly as before. Unlike Nix's cache,
+  # OpenCode's session DB uses normal (crash-safe) SQLite settings, so it was
+  # never at risk here.
   fileSystems."/root/.cache/nix" = {
     device = "tmpfs";
     fsType = "tmpfs";
@@ -375,15 +403,26 @@ in
       headers.Authorization = "Bearer {env:GAVMO_MCP_TOKEN}";
     };
 
-    # The VM is the security boundary, not opencode's permission system -
-    # once `bash` is allow-all, per-category denies (read/external_directory/
-    # etc.) are bypassable via a shell command anyway (e.g. a denied
-    # external_directory read is just `cat <path>` through bash), so they'd
-    # only add prompting friction without adding real protection. Hence a
-    # top-level catch-all rather than allowing some categories and not
-    # others. The git-remote denies below are a tripwire only (equally
-    # bypassable, e.g. via a wrapper script) - harmless to keep since there
-    # are no git credentials in the VM for them to work anyway.
+    # opencode's own permission system is deliberately wide open (catch-all
+    # allow) rather than denying specific categories - once `bash` is
+    # allow-all, per-category denies (read/external_directory/etc.) are
+    # bypassable via a shell command anyway (e.g. a denied external_directory
+    # read is just `cat <path>` through bash), so they'd only add prompting
+    # friction without adding real protection. The git-remote denies below
+    # are a tripwire only (equally bypassable, e.g. via a wrapper script) -
+    # harmless to keep since there are no git credentials in the VM for them
+    # to work anyway.
+    #
+    # This does NOT mean "anything goes inside the VM", though - that was
+    # the M1 stance, superseded at M3: `gavmo-opencode`'s `serviceConfig`
+    # (`User=agent` + `ProtectSystem=strict` + friends) is a second,
+    # independent, OS-level boundary underneath opencode's own permission
+    # layer, and that one is NOT bypassable via bash (it's enforced by the
+    # kernel against the whole process tree, not interpreted by opencode).
+    # The two layers serve different purposes: this `permission` block is
+    # about prompting friction for a cooperative agent; `serviceConfig` is
+    # about what the agent process can durably do to the guest system even
+    # if it tries.
     permission = {
       "*" = "allow";
       bash = {
@@ -412,6 +451,15 @@ in
 
     Changes you make to files under `/workspace` are written directly back
     to the user's real project on their machine.
+
+    This VM runs NixOS, and you run as an unprivileged user (not root) with
+    no `sudo`. You can read anything, but can only write `/workspace`, your
+    own home directory, and `/tmp`. There is no `apt`/`yum` - to add a
+    system package, service, or anything else system-wide, ask the user to
+    add it to the repo's `gavmo.nix` (or edit it yourself if it already
+    exists) rather than reaching for `sudo`, which will not work. Per-user
+    tools (`nix profile install`, `cargo install`, `pipx`, etc.) work
+    normally without any elevated privileges.
   '';
 
   # --- M2: per-repo environment via gavmo.nix --------------------------------
@@ -472,7 +520,7 @@ in
   # --- Host-visible failure signal (the Rust <-> image contract, part 2) ---
   # Since M1.5's console logging got turned off above (clutter, no live
   # audience), the only channel left to tell the host daemon *why* a boot
-  # never came up is the 9p-shared `/workspace` itself. This service writes
+  # never came up is the virtiofs-shared `/workspace` itself. This service writes
   # into `/workspace/.gavmo/vm/` - which is `state_dir` in
   # `crates/vm/src/config.rs::VmConfig`, i.e. exactly where the host daemon
   # already keeps this VM's disk overlay/QMP socket/console log:
@@ -566,16 +614,19 @@ in
   # --- opencode web -----------------------------------------------------
   # Replaces the M0 dummy server on the same fixed guest port.
   #
-  # Session state lives on the VM's own overlay disk (HOME=/root), NOT on
-  # the 9p-shared /workspace. This was tried first (state in
+  # Session state lives on the VM's own overlay disk (HOME=/home/agent), NOT
+  # on the virtiofs-shared /workspace. This was tried first (state in
   # /workspace/.gavmo/local, host-visible, surviving a VM reset) but
   # OpenCode's SQLite session database threw `disk I/O error`
-  # (SQLITE_IOERR) on startup every time - 9p's locking/IO semantics don't
-  # satisfy SQLite, even with cache=none. Native ext4 on the overlay disk
-  # works reliably. The tradeoff: session history persists across VM
-  # stop/restart (the overlay persists) but is wiped on a full VM reset,
-  # and isn't visible from the host. Your actual project files in
-  # /workspace are unaffected - only OpenCode's internal DB moved.
+  # (SQLITE_IOERR) on startup every time under the *original* 9p transport -
+  # 9p's locking/IO semantics didn't satisfy SQLite, even with `cache=none`.
+  # Native ext4 on the overlay disk works reliably. The tradeoff: session
+  # history persists across VM stop/restart (the overlay persists) but is
+  # wiped on a full VM reset, and isn't visible from the host. Your actual
+  # project files in /workspace are unaffected - only OpenCode's internal DB
+  # moved. (Virtiofs's stronger POSIX/locking semantics than 9p might make
+  # moving this back onto `/workspace` viable someday - not revisited as
+  # part of the M3 transport switch, since it's an orthogonal question.)
   #
   # opencode's shell tool kills any command that runs longer than this many
   # milliseconds (upstream default: 2 minutes - see
@@ -600,8 +651,13 @@ in
   environment.sessionVariables.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS =
     lib.mkDefault "300000";
 
+  # M3: runs as the unprivileged `agent` user (see `users.users.agent`
+  # above), not root. See this service's `serviceConfig` below for the
+  # write-confinement this enables, and the README for how a repo's own
+  # `gavmo.nix` can grant a specific project's agent more (group
+  # memberships, capabilities, even sudo) when it's genuinely needed.
   systemd.services.gavmo-opencode = {
-    description = "GAVMO milestone-1 opencode web server";
+    description = "GAVMO opencode web server";
     # Only `network.target` (not `network-online.target`): opencode doesn't
     # need working network to start listening, only later for Vertex calls,
     # and depending on "online" risks stalling on NixOS's wait-online
@@ -636,28 +692,122 @@ in
       VERTEX_LOCATION = "global";
       # Force `safe.directory = *` via git's env-var config injection rather
       # than /etc/gitconfig (nixpkgs' git doesn't reliably read that) - this
-      # guarantees it applies to every git call opencode makes, sidestepping
-      # "dubious ownership" errors git can raise over 9p-shared repos.
+      # guarantees it applies to every git call opencode makes. Belt-and-
+      # suspenders: virtiofsd's uid mapping (`share.rs::GUEST_AGENT_UID`)
+      # should make `/workspace` present as owned by `agent` itself, which
+      # alone would already satisfy git's ownership check - this covers any
+      # case where a subdirectory doesn't map as cleanly (e.g. paths created
+      # by tooling with a different host uid).
       GIT_CONFIG_COUNT = "1";
       GIT_CONFIG_KEY_0 = "safe.directory";
       GIT_CONFIG_VALUE_0 = "*";
-      # Native filesystem (the overlay disk), not the 9p /workspace share -
-      # see the comment above this service for why.
-      HOME = "/root";
+      # Native filesystem (the overlay disk), not the virtiofs /workspace
+      # share - see the comment above this service for why. `/home/agent`
+      # (not `/root`) because this service now runs as the unprivileged
+      # `agent` user - see `serviceConfig.User` below.
+      HOME = "/home/agent";
     };
     serviceConfig = {
-      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /root/.local/share /root/.config /root/.cache";
+      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /home/agent/.local/share /home/agent/.config /home/agent/.cache";
       WorkingDirectory = "/workspace";
+
+      # --- M3: run as the unprivileged agent user, confined to its own
+      # write set ---------------------------------------------------------
+      # `User`/`Group` drop this service (and every `bash` child opencode
+      # spawns, since they inherit the same process credentials and mount
+      # namespace) off root entirely - no `wheel`, no sudo rule granted here.
+      # Combined with the sandboxing options below, this makes "the agent
+      # can only write /workspace, its own home, and a private /tmp" a real,
+      # kernel-enforced boundary rather than a convention - see the design
+      # discussion that landed this change for why this supersedes the
+      # earlier "the VM alone is the trust boundary" stance (this is a
+      # second, independent layer on top of it, not a replacement for it).
+      User = "agent";
+      Group = "agent";
+
+      # Every option below is `lib.mkDefault`ed so a specific repo's own
+      # `gavmo.nix` can loosen exactly what it needs via `lib.mkForce`
+      # (see the README's "Customizing your repo's VM" for worked examples:
+      # Docker access, low ports, etc.). The base posture here is meant to
+      # be the strict default, not a hard ceiling.
+      #
+      # `ProtectSystem = "strict"` remounts the *entire* visible filesystem
+      # read-only (including separately-mounted filesystems like the
+      # virtiofs shares) except API pseudo-filesystems (`/proc`, `/sys`,
+      # `/dev`) and whatever `ReadWritePaths` exempts below - this, not
+      # `User`/`Group` alone, is what stops the agent from durably mutating
+      # the guest system (`/etc`, `/nix`, `/var`, …). The read-only virtiofs
+      # shares (gcloud, mcp) stay readable - `ProtectSystem` only forbids
+      # writes, not reads.
+      ProtectSystem = lib.mkDefault "strict";
+      # `/workspace` is the live project checkout and must stay writable;
+      # `/home/agent` is where opencode's session DB/config/cache live (see
+      # `HOME` above) and must too.
+      #
+      # Deliberately NOT paired with `ProtectHome = true`: that was tried and
+      # found to shadow `/home` with an empty, read-only mount *inside this
+      # service's namespace* even with `/home/agent` listed here - in
+      # practice `ExecStartPre`'s `mkdir -p /home/agent/...` failed outright
+      # with "cannot create directory '/home': Permission denied" (the
+      # namespace never saw a real `/home` to create `agent`'s subdirectory
+      # under). `ProtectSystem = "strict"` alone already remounts everything
+      # else read-only, so dropping `ProtectHome` costs only "/root and other
+      # users' homes are readable" (there are no other users, and `/root` has
+      # nothing sensitive - the gcloud creds live under `/etc/gavmo/gcloud`)
+      # - the actual write-confinement goal is unaffected.
+      ReadWritePaths = [
+        "/workspace"
+        "/home/agent"
+      ];
+      # Gives this service its own private, writable `/tmp` - scratch space
+      # the agent can freely use (builds, downloads, package manager caches)
+      # that is isolated from the host-visible `/tmp` and from other units,
+      # and - since it lives in the service's own ephemeral mount namespace,
+      # not under `ReadWritePaths` - vanishes with the process rather than
+      # persisting on the overlay disk.
+      PrivateTmp = lib.mkDefault true;
+      # `NoNewPrivileges` is the knob that would need `lib.mkForce false` in
+      # a repo's `gavmo.nix` to enable sudo for its agent (sudo relies on a
+      # setuid-root exec gaining privileges it didn't start with, which this
+      # option forbids outright) - see the README for the full worked
+      # example, including why `CapabilityBoundingSet` below also needs
+      # widening for that to actually grant useful privileges.
+      NoNewPrivileges = lib.mkDefault true;
+      # Strips every Linux capability from this service's bounding set, so
+      # even a hypothetical privilege-escalation bug (or a future repo that
+      # re-enables sudo without also revisiting this) can't regain
+      # `CAP_SYS_ADMIN` (remounting the read-only paths above away) or any
+      # other capability - the bounding set is a hard ceiling no exec can
+      # exceed regardless of uid. A repo granting itself sudo for, say,
+      # Docker should extend this list with exactly the capabilities that
+      # workflow needs rather than clearing it.
+      CapabilityBoundingSet = lib.mkDefault [ ];
+      # Blocks creating new mount/user/etc. namespaces from inside the
+      # service (e.g. a sandboxed `unshare`-based tool) - defense in depth
+      # alongside the empty capability set above, since namespace creation
+      # is itself a capability-gated operation these two overlap on.
+      RestrictNamespaces = lib.mkDefault true;
+      ProtectKernelModules = lib.mkDefault true;
+      ProtectKernelTunables = lib.mkDefault true;
+      ProtectControlGroups = lib.mkDefault true;
+      ProtectClock = lib.mkDefault true;
+      # Blocks *creating* new setuid/setgid files - does not block
+      # *executing* an already-setuid binary (e.g. `sudo`, if a repo adds
+      # it), so this stays on even for a repo that re-enables sudo.
+      RestrictSUIDSGID = true;
+
       # `GAVMO_MCP_TOKEN` for the managed `mcp.gavmo-tools` config entry
       # above, loaded straight from the read-only MCP token share - no
-      # script-side parsing needed. Leading `-` makes a missing file
-      # non-fatal (same `nofail`-style posture as the 9p mounts themselves):
-      # if `/etc/gavmo/mcp` hasn't finished mounting by the time this starts
-      # (no explicit unit ordering against it, same as the gcloud share
-      # above), the service still starts with no token, and `Restart =
-      # "always"` below means the next restart picks it up once the mount
-      # has settled - at the cost of the gateway rejecting calls (empty
-      # bearer) until then.
+      # script-side parsing needed. Read as root (systemd processes
+      # `EnvironmentFile` before dropping to `User`/`Group` above), so this
+      # is unaffected by the agent's own reduced privileges. Leading `-`
+      # makes a missing file non-fatal (same `nofail`-style posture as the
+      # virtiofs mounts themselves): if `/etc/gavmo/mcp` hasn't finished
+      # mounting by the time this starts (no explicit unit ordering against
+      # it, same as the gcloud share above), the service still starts with
+      # no token, and `Restart = "always"` below means the next restart
+      # picks it up once the mount has settled - at the cost of the gateway
+      # rejecting calls (empty bearer) until then.
       EnvironmentFile = "-/etc/gavmo/mcp/token.env";
       Restart = "always";
       RestartSec = "1";

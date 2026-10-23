@@ -78,7 +78,7 @@ impl VmConfig {
     /// *contents* are the filename (also under `state_dir`) of the full
     /// `nixos-rebuild` log. Host-visible because `state_dir` is conventionally
     /// `<repo>/.gavmo/vm`, which is `/workspace/.gavmo/vm` from the guest's
-    /// side of the 9p share.
+    /// side of the virtiofs share.
     pub fn rebuild_failed_marker_path(&self) -> PathBuf {
         self.state_dir.join("rebuild-failed")
     }

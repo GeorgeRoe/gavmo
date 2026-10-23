@@ -4,6 +4,19 @@ use tokio::process::Command;
 
 use crate::error::{Error, Result};
 
+/// Virtual size given to every overlay disk, regardless of the backing
+/// image's own size. `nix/base/flake.nix` builds the base qcow with no
+/// explicit `diskSize`, so `nixos-generators` auto-sizes it to roughly the
+/// base closure plus ~512 MiB of headroom - nowhere near enough once a
+/// repo's own `gavmo.nix` pulls in anything substantial (e.g.
+/// `examples/playwright/gavmo.nix`'s Chromium bundle). `qemu-img create -b`
+/// happily creates an overlay *larger* than its backing file, and qcow2 is
+/// sparse - this costs no real host disk space until the guest actually
+/// writes that far - so there's no real downside to being generous here.
+/// `boot.growPartition` + `fileSystems."/".autoResize` in `nix/base/disk.nix`
+/// grow the guest's ext4 root to fill it on boot.
+const OVERLAY_DISK_SIZE: &str = "32G";
+
 /// Builds the `qemu-img create` argument list for a copy-on-write overlay
 /// backed by a read-only base image. Pure, for unit testing without
 /// `qemu-img` installed.
@@ -17,6 +30,7 @@ pub fn build_overlay_args(base_image: &Path, overlay_path: &Path) -> Vec<String>
         "-b".to_string(),
         base_image.display().to_string(),
         overlay_path.display().to_string(),
+        OVERLAY_DISK_SIZE.to_string(),
     ]
 }
 
@@ -83,6 +97,7 @@ mod tests {
                 "-b",
                 "/var/lib/gavmo/base.qcow2",
                 "/home/user/project/.gavmo/vm/disk.qcow2",
+                OVERLAY_DISK_SIZE,
             ]
         );
     }

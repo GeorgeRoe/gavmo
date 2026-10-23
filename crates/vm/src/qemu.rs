@@ -13,8 +13,12 @@ use crate::share::{ShareBackend, ShareSpec};
 pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]) -> Vec<String> {
     let mut args = Vec::new();
 
-    // Hardware acceleration is Linux-only (KVM). A Windows host would use
-    // WHPX instead; that's a future cfg-gated addition, not part of the MVP.
+    // Hardware acceleration via KVM (Linux-only). Windows host support was
+    // dropped when the share backend moved from 9p to virtiofs (see
+    // `share.rs`'s `VirtiofsShare` doc comment / `plan.md`), so there is no
+    // longer a non-Linux host target to cfg-gate this against in practice —
+    // the `cfg` is kept only so a non-Linux *development* build of this
+    // crate still compiles.
     #[cfg(target_os = "linux")]
     {
         args.push("-enable-kvm".to_string());
@@ -26,6 +30,24 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
     args.push(cfg.vcpus.to_string());
     args.push("-m".to_string());
     args.push(cfg.memory_mib.to_string());
+
+    // virtiofs requires guest RAM to live in a *shared* memory backend (not
+    // plain anonymous mmap), so `virtiofsd` can map pages directly into the
+    // guest's address space rather than copying through a 9p-style
+    // round-trip. `-numa node,memdev=mem` is QEMU's mechanism for actually
+    // wiring a (single-node) guest's RAM to that backend — required even
+    // though this guest has no real multi-NUMA topology of its own. Only
+    // emitted when there's at least one share, since a share-less boot (as
+    // in several unit tests below) has no virtiofsd to back.
+    if !shares.is_empty() {
+        args.push("-object".to_string());
+        args.push(format!(
+            "memory-backend-memfd,id=mem,size={mem}M,share=on",
+            mem = cfg.memory_mib,
+        ));
+        args.push("-numa".to_string());
+        args.push("node,memdev=mem".to_string());
+    }
 
     args.push("-drive".to_string());
     args.push(format!(
@@ -43,7 +65,7 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
     args.push("virtio-net-pci,netdev=net0".to_string());
 
     for (backend, spec) in shares {
-        args.extend(backend.qemu_args(spec));
+        args.extend(backend.qemu_args(&cfg.state_dir, spec));
     }
 
     args.push("-qmp".to_string());
@@ -90,7 +112,7 @@ pub async fn spawn_qemu(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::share::NinePShare;
+    use crate::share::VirtiofsShare;
     use std::path::PathBuf;
 
     fn test_cfg() -> VmConfig {
@@ -142,10 +164,10 @@ mod tests {
     #[test]
     fn args_include_each_share() {
         let cfg = test_cfg();
-        let nine_p = NinePShare;
+        let virtiofs = VirtiofsShare;
         let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
             (
-                &nine_p,
+                &virtiofs,
                 ShareSpec {
                     host_path: cfg.repo_dir.clone(),
                     mount_tag: "workspace",
@@ -153,7 +175,7 @@ mod tests {
                 },
             ),
             (
-                &nine_p,
+                &virtiofs,
                 ShareSpec {
                     host_path: cfg.gcloud_dir.clone(),
                     mount_tag: "gcloud",
@@ -161,7 +183,7 @@ mod tests {
                 },
             ),
             (
-                &nine_p,
+                &virtiofs,
                 ShareSpec {
                     host_path: cfg.mcp_dir.clone(),
                     mount_tag: "mcp",
@@ -172,14 +194,51 @@ mod tests {
 
         let args = build_qemu_args(&cfg, &shares);
 
-        assert!(args.iter().any(|a| a.contains("mount_tag=workspace")));
-        assert!(args.iter().any(|a| a.contains("mount_tag=gcloud")));
-        assert!(args.iter().any(|a| a.contains("mount_tag=mcp")));
-        assert_eq!(
-            args.iter().filter(|a| a.contains("readonly=on")).count(),
-            2,
-            "gcloud and mcp shares are read-only; workspace is not"
+        assert!(
+            args.iter()
+                .any(|a| a == "vhost-user-fs-pci,chardev=char-workspace,tag=workspace")
         );
+        assert!(
+            args.iter()
+                .any(|a| a == "vhost-user-fs-pci,chardev=char-gcloud,tag=gcloud")
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "vhost-user-fs-pci,chardev=char-mcp,tag=mcp")
+        );
+    }
+
+    /// virtiofs requires guest RAM to be backed by a *shared* memory
+    /// mapping; this is only needed once a share is actually present.
+    #[test]
+    fn args_add_shared_memory_backend_when_shares_are_present() {
+        let cfg = test_cfg();
+        let virtiofs = VirtiofsShare;
+        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![(
+            &virtiofs,
+            ShareSpec {
+                host_path: cfg.repo_dir.clone(),
+                mount_tag: "workspace",
+                read_only: false,
+            },
+        )];
+
+        let args = build_qemu_args(&cfg, &shares);
+
+        assert!(
+            args.iter()
+                .any(|a| a == "memory-backend-memfd,id=mem,size=4096M,share=on")
+        );
+        assert!(args.iter().any(|a| a == "node,memdev=mem"));
+    }
+
+    #[test]
+    fn args_omit_shared_memory_backend_when_there_are_no_shares() {
+        let cfg = test_cfg();
+
+        let args = build_qemu_args(&cfg, &[]);
+
+        assert!(!args.iter().any(|a| a.contains("memory-backend-memfd")));
     }
 
     #[cfg(target_os = "linux")]
