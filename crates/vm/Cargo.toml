@@ -7,3 +7,8 @@ edition = "2024"
 tokio = { version = "1", features = ["process", "net", "rt-multi-thread", "macros", "time", "io-util", "fs", "sync", "signal"] }
 qapi = { version = "0.15", features = ["qmp"] }
 thiserror = "2"
+# `qapi_spec::Any` (what `qom-get`/`qom-set` use for arbitrary-shaped QOM
+# property values) is a re-export of `serde_json::Value` - needed directly
+# in `qmp.rs` to build/parse those values (balloon stats), not just
+# transitively through `qapi`.
+serde_json = "1"

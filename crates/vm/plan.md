@@ -21,6 +21,7 @@
 | Responsibility split | daemon owns ports/paths/identity/registry; `vm` crate is pure mechanism |
 | Acceleration | `-enable-kvm -cpu host`, Linux-only |
 | Guest agent privilege | unprivileged `agent` user (uid/gid `1000`, see `share::GUEST_AGENT_UID`/`_GID`), not root — see "Why virtiofs, not 9p" |
+| Guest memory stats | **`virtio-balloon-pci`** + `qom-get .../guest-stats` over QMP (never inflated) — see "Why guest-reported memory, not host RSS" below |
 
 ### Why virtiofs, not 9p (M3 — supersedes the original MVP decision below)
 
@@ -91,6 +92,36 @@ exactly what happened once the cross-platform requirement was dropped.
 virtiofs resolves the ownership tradeoff by construction (uid mapping) and is
 generally expected to perform better, though that hasn't been freshly re-benchmarked
 as part of this change.
+
+### Why guest-reported memory, not host RSS (M3.1 — a real bug the virtiofs switch introduced)
+
+The control panel's Memory stat originally showed qemu's host-side process `VmRSS` (the
+same thing `top`/`htop` would show for its pid) against the configured memory cap. This
+was always a slight approximation ("qemu's footprint", not "what the guest is actually
+using"), but the M3 virtiofs switch above made it **actively misleading**: guest RAM is
+now a `memory-backend-memfd` (a shared, host-backed mapping — see §6's qemu invocation),
+and once the guest touches a page — for real heap *or* for purely reclaimable page
+cache, e.g. reading every file under a large `node_modules`/`.git` while running tests —
+that page is allocated in the memfd and stays in qemu's RSS, with nothing to reclaim it
+(no balloon inflation, no free-page reporting). Confirmed on real hardware: an `npm
+test` run pinned the RSS-based bar at ~100%, while `free -m` *inside the guest at the
+same moment* showed ~3 GB still genuinely available — the guest was nowhere near memory
+pressure; only the host-side measurement was wrong.
+
+The fix is a `virtio-balloon-pci` device (`qemu.rs`), used **purely as a stats channel**
+— we never inflate it (no `-balloon`/`qom-set size=...` calls anywhere in this
+codebase), so it has no effect on the guest's actual available memory or virtiofs's
+reclaim semantics. `qmp::set_balloon_stats_interval` tells the guest's balloon driver to
+report every few seconds; `qmp::guest_memory` reads those reports back via `qom-get
+.../guest-stats` and reports `used = total - available` (`available` meaning the
+guest's own `MemAvailable` — already treats reclaimable cache as free). This is what
+`app::VmStats::mem_used_bytes`/`mem_total_bytes` now carry, replacing the old
+`mem_bytes`/`mem_cap_bytes` (host RSS vs. configured cap) fields entirely — there's no
+"keep both" fallback; RSS was the wrong number, not just an imprecise one.
+
+A VM whose balloon driver hasn't reported yet (e.g. moments after boot) has no stats to
+show — `mem_used_bytes`/`mem_total_bytes` are `None` and the UI shows a placeholder,
+never a 0%-or-full bar presented as real data.
 
 ## 2. The Rust ↔ base-image contract
 
@@ -216,6 +247,7 @@ qemu-system-x86_64 \
   -drive file=.gavmo/vm/disk.qcow2,if=virtio,format=qcow2 \
   -netdev user,id=net0,hostfwd=tcp:127.0.0.1:<host_port>-:7080 \
   -device virtio-net-pci,netdev=net0 \
+  -device virtio-balloon-pci,id=balloon0,deflate-on-oom=on \
   -chardev socket,id=char-workspace,path=.gavmo/vm/virtiofs-workspace.sock \
   -device vhost-user-fs-pci,chardev=char-workspace,tag=workspace \
   -chardev socket,id=char-gcloud,path=.gavmo/vm/virtiofs-gcloud.sock \
@@ -225,7 +257,9 @@ qemu-system-x86_64 \
 ```
 
 (The third share, the MCP token mount, follows the same `gcloud` pattern and is
-omitted above for brevity — see `handle.rs::boot`.)
+omitted above for brevity — see `handle.rs::boot`. The balloon device is present
+unconditionally, independent of shares — see §1's "Why guest-reported memory, not
+host RSS".)
 
 Validated on real hardware (virtiofsd 1.13.3) — see §1's "Why virtiofs, not 9p" for
 why `--translate-uid`/`--translate-gid` + `--sandbox none` is the combination that
@@ -236,22 +270,30 @@ works fully unprivileged, and what was tried first and didn't.
 - `tokio` — async process/io/time.
 - `qapi` — QMP client (async/tokio integration).
 - `thiserror` — error enum.
-- `serde` / `serde_json` — config and QMP payloads.
+- `serde_json` — direct dependency (not just transitive through `qapi`) because
+  `qapi_spec::Any` — the type `qom-get`/`qom-set` use for arbitrary QOM property
+  values, i.e. the balloon's `guest-stats` — is a re-export of `serde_json::Value`
+  (`qmp.rs` builds/parses it directly).
 - `tracing` — logging.
 
 ## 8. Testing strategy
 
 - **In the workbench sidecar (available now):** unit-test `build_qemu_args`,
-  `VirtiofsShare::qemu_args`, `build_virtiofsd_args`, overlay path logic, and QMP
-  message encode/decode — all pure functions, no `qemu`/`virtiofsd`/`/dev/kvm`
-  required. The sidecar has cargo but **not** qemu or `/dev/kvm`, so this is the
-  right boundary. (`build_virtiofsd_args` is deliberately split out from
-  `VirtiofsShare::start`'s stat+spawn for exactly this reason, mirroring
-  `disk.rs`'s `build_overlay_args`/`ensure_overlay` split.)
+  `VirtiofsShare::qemu_args`, `build_virtiofsd_args`, `qmp::parse_guest_stats`, overlay
+  path logic, and QMP message encode/decode — all pure functions, no
+  `qemu`/`virtiofsd`/`/dev/kvm` required. The sidecar has cargo but **not** qemu or
+  `/dev/kvm`, so this is the right boundary. (`build_virtiofsd_args` and
+  `parse_guest_stats` are both deliberately split out from the functions that do real
+  IO — `VirtiofsShare::start`'s stat+spawn, `qmp::guest_memory`'s QMP round-trip — for
+  exactly this reason, mirroring `disk.rs`'s `build_overlay_args`/`ensure_overlay`
+  split.)
 - **On the real host (NixOS, KVM available):** one integration test that actually
   boots a VM end-to-end, gated behind an env var or feature flag so `cargo test` in
   the sidecar stays green. This is also how the `virtiofsd` flag syntax (see §1/§6)
-  was confirmed for real against virtiofsd 1.13.3.
+  was confirmed for real against virtiofsd 1.13.3, and how the RSS-vs-guest-memory bug
+  (see §1's "Why guest-reported memory, not host RSS") was originally caught — a real
+  `npm test` run pinning the old RSS-based bar at ~100% while the guest's own `free -m`
+  showed ~3 GB available.
 
 ## 9. Open items for later (not MVP)
 

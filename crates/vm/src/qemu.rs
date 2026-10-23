@@ -4,6 +4,13 @@ use crate::config::{GUEST_OPENCODE_PORT, VmConfig};
 use crate::error::{Error, Result};
 use crate::share::{ShareBackend, ShareSpec};
 
+/// The `id=` given to the `virtio-balloon-pci` device below. QEMU places a
+/// `-device`'s QOM object under `/machine/peripheral/<id>`, so this single
+/// constant is what `qmp.rs`'s `BALLOON_QOM_PATH` derives from — keeping the
+/// device's advertised id and the path used to query it in one place rather
+/// than two string literals that could drift apart.
+pub(crate) const BALLOON_DEVICE_ID: &str = "balloon0";
+
 /// Builds the full `qemu-system-x86_64` argument list for a VM boot, given
 /// its config and the shares it should expose.
 ///
@@ -63,6 +70,20 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
     ));
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
+
+    // Exposes the guest's own memory stats (used/available, not just what
+    // qemu's host-side RSS happens to have touched) over QMP via
+    // `qom-get .../guest-stats` — see `qmp::guest_memory`. We never inflate
+    // the balloon (no `-balloon`/`qom-set size=...` calls anywhere in this
+    // codebase); it exists purely as a stats channel, so it has no effect
+    // on the guest's actual available memory or virtiofs's reclaim
+    // semantics. `deflate-on-oom=on` is a free safety net (lets the guest
+    // kernel ask the balloon to shrink under memory pressure) that costs
+    // nothing since we never grow it in the first place.
+    args.push("-device".to_string());
+    args.push(format!(
+        "virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"
+    ));
 
     for (backend, spec) in shares {
         args.extend(backend.qemu_args(&cfg.state_dir, spec));
@@ -248,5 +269,19 @@ mod tests {
         let args = build_qemu_args(&cfg, &[]);
 
         assert!(args.contains(&"-enable-kvm".to_string()));
+    }
+
+    /// Always present (even with no shares) — the balloon is the memory
+    /// stats channel for the UI, independent of virtiofs.
+    #[test]
+    fn args_include_the_balloon_device_for_guest_memory_stats() {
+        let cfg = test_cfg();
+        let args = build_qemu_args(&cfg, &[]);
+
+        assert!(
+            args.iter()
+                .any(|a| a
+                    == &format!("virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"))
+        );
     }
 }

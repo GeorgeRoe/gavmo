@@ -871,37 +871,42 @@ impl AppState {
     }
 
     /// Host-side resource usage for a `Running` workspace's VM — CPU
-    /// (top-style, per-core percentage), memory (RSS vs. the configured
-    /// cap), uptime, overlay disk size, and the forwarded host port. For
-    /// the live stats panel in the detail modal, polled while `Running`
-    /// the same way [`Self::read_console_log`] is polled while `Booting`.
+    /// (top-style, per-core percentage), memory (the *guest's own*
+    /// used/total, from its virtio-balloon driver — see
+    /// [`VmStats::mem_used_bytes`]'s doc comment for why this isn't qemu's
+    /// host-side RSS), uptime, overlay disk size, and the forwarded host
+    /// port. For the live stats panel in the detail modal, polled while
+    /// `Running` the same way [`Self::read_console_log`] is polled while
+    /// `Booting`.
     ///
-    /// Returns `None` whenever there's nothing meaningful to show: the
-    /// workspace isn't `Running`, its qemu process has already exited
+    /// Returns `None` whenever there's nothing meaningful to show *at all*:
+    /// the workspace isn't `Running`, its qemu process has already exited
     /// (`RunningVm::qemu_pid` returning `None`), or a `/proc` read failed
-    /// (e.g. the process exited in the narrow window between this
-    /// function grabbing its pid and actually sampling it) — all treated
-    /// as "no stats this tick" rather than an error a caller needs to
-    /// handle specially, consistent with this being a best-effort,
-    /// frequently-repolled display rather than a one-shot query.
+    /// (e.g. the process exited in the narrow window between this function
+    /// grabbing its pid and actually sampling it) — all treated as "no
+    /// stats this tick" rather than an error a caller needs to handle
+    /// specially, consistent with this being a best-effort,
+    /// frequently-repolled display rather than a one-shot query. Memory
+    /// specifically has its own, narrower "not available" path: see
+    /// `guest_mem` below.
     ///
-    /// Deliberately does **not** hold the `running` lock across the
-    /// `CPU_SAMPLE_INTERVAL` sleep between the two `/proc` samples this
-    /// needs (see `vm::stats::cpu_percent_per_core`) — it copies out the
-    /// handful of `Copy` values it needs from the `RunningVm` up front and
-    /// releases the lock before sampling, so a concurrent `stop`/`reset`
-    /// for this (or any other) workspace is never blocked behind a stats
-    /// poll in flight.
+    /// Deliberately does **not** hold the `running` lock across either the
+    /// `CPU_SAMPLE_INTERVAL` sleep between the two `/proc` samples
+    /// (`vm::stats::cpu_percent_per_core`) or the QMP round-trip to the
+    /// guest's balloon driver — it copies out the handful of `Copy`/cheap
+    /// values it needs from the `RunningVm` up front and releases the lock
+    /// before doing either, so a concurrent `stop`/`reset` for this (or any
+    /// other) workspace is never blocked behind a stats poll in flight.
     pub async fn vm_stats(&self, id: &str) -> Option<VmStats> {
-        let (pid, uptime_secs, mem_cap_mib, vcpus, host_port) = {
+        let (pid, uptime_secs, vcpus, host_port, qmp_socket_path) = {
             let mut running = self.inner.running.lock().await;
             match running.get_mut(id) {
                 Some(VmSlot::Running(vm)) => (
                     vm.qemu_pid()?,
                     vm.uptime().as_secs(),
-                    vm.memory_mib(),
                     vm.vcpus(),
                     vm.host_port(),
+                    vm.qmp_socket_path(),
                 ),
                 _ => return None,
             }
@@ -915,11 +920,20 @@ impl AppState {
         let cur = vm::stats::sample(pid).ok()?;
         let cpu_percent = vm::stats::cpu_percent_per_core(prev, cur);
 
+        // Its own best-effort fallback, narrower than the rest of this
+        // function's `?`-propagated "no stats this tick": a VM whose
+        // virtio-balloon driver hasn't reported yet (fresh boot, or
+        // `RunningVm::boot`'s `set_balloon_stats_interval` call failed)
+        // simply shows no memory figures — `VmStats::mem_used_bytes`/
+        // `mem_total_bytes` are `None` — rather than discarding the CPU/
+        // uptime/disk stats this call already has in hand.
+        let guest_mem = vm::guest_memory(&qmp_socket_path).await.ok().flatten();
+
         Some(VmStats {
             cpu_percent,
             vcpus,
-            mem_bytes: cur.rss_bytes,
-            mem_cap_bytes: u64::from(mem_cap_mib) * 1024 * 1024,
+            mem_used_bytes: guest_mem.map(|m| m.total_bytes.saturating_sub(m.available_bytes)),
+            mem_total_bytes: guest_mem.map(|m| m.total_bytes),
             uptime_secs,
             disk_bytes,
             host_port,

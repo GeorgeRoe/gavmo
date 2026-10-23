@@ -201,11 +201,15 @@ in
   # See nix/base/flake.nix for how this gets built into a qcow2, and
   # crates/vm/examples/boot.rs for the runner that boots it.
 
-  # Kernel modules for the virtiofs shares. Not strictly required (kmod can
-  # often autoload filesystem modules on demand), but explicit here so the
-  # mounts don't depend on autodetection in a minimal image.
+  # Kernel modules for the virtiofs shares and the memory-stats balloon
+  # device (`-device virtio-balloon-pci` in `crates/vm/src/qemu.rs`, queried
+  # over QMP by `crates/vm/src/qmp.rs::guest_memory` for the control panel's
+  # Memory stat). Not strictly required (kmod can often autoload these on
+  # demand), but explicit here so neither depends on autodetection in a
+  # minimal image.
   boot.kernelModules = [
     "virtiofs"
+    "virtio_balloon"
   ];
 
   # M2: lets the in-guest `nixos-rebuild --flake ...` (see `flake.nix`'s

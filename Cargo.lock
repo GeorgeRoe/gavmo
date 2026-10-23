@@ -3552,6 +3552,7 @@ name = "vm"
 version = "0.1.0"
 dependencies = [
  "qapi",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
 ]

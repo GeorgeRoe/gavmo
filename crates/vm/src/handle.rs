@@ -29,6 +29,13 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// SIGKILL directly.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the guest's virtio-balloon driver should report memory stats
+/// back to qemu (`qmp::set_balloon_stats_interval`, set once at the end of
+/// `boot()` below) — the control panel's Memory stat is only as fresh as
+/// this. 2s is snappy for a live stats panel without being a meaningful
+/// polling burden.
+const BALLOON_STATS_INTERVAL_SECS: u32 = 2;
+
 /// The guest-visible mount tag for the repository share. Must match the
 /// base NixOS image's fstab.
 const MOUNT_TAG_WORKSPACE: &str = "workspace";
@@ -129,6 +136,16 @@ impl RunningVm {
         // the dying guest process.
         wait_for_ready(host_port, &marker_path, BOOT_HEALTH_TIMEOUT).await?;
 
+        // Best-effort: tell the guest's virtio-balloon driver to start
+        // reporting memory stats (see `qmp::guest_memory`/`app::VmStats`).
+        // Deliberately not `?` — a VM this fails for still boots and runs
+        // completely normally, it just never gets live memory stats (the
+        // control panel shows "—" for Memory instead of a number). Not
+        // worth failing an otherwise-healthy boot over a stats nicety.
+        let _ =
+            qmp::set_balloon_stats_interval(&vm.cfg.qmp_socket_path(), BALLOON_STATS_INTERVAL_SECS)
+                .await;
+
         Ok(vm)
     }
 
@@ -223,16 +240,19 @@ impl RunningVm {
         self.qemu.id()
     }
 
-    /// Configured guest memory, in MiB — used by the stats panel to show
-    /// resident memory against the configured cap.
-    pub fn memory_mib(&self) -> u32 {
-        self.cfg.memory_mib
-    }
-
     /// Configured guest vCPU count — used by the stats panel to show CPU
     /// usage against the configured core count.
     pub fn vcpus(&self) -> u32 {
         self.cfg.vcpus
+    }
+
+    /// Path to this VM's QMP control socket, for the stats panel's
+    /// [`crate::qmp::guest_memory`] query. Public (unlike most of `cfg`)
+    /// specifically for that caller — `stop()`/`status()` above use
+    /// `self.cfg.qmp_socket_path()` directly since they're already methods
+    /// on this type.
+    pub fn qmp_socket_path(&self) -> std::path::PathBuf {
+        self.cfg.qmp_socket_path()
     }
 
     /// Path to this VM's persistent overlay disk, for the stats panel's

@@ -57,13 +57,36 @@ pub struct VmStats {
     /// Configured guest vCPU count — the denominator `cpu_percent` is
     /// scaled against.
     pub vcpus: u32,
-    /// Host-side resident memory (RSS) of the qemu process, in bytes. This
-    /// is qemu's actual host footprint (guest pages it has touched, plus
-    /// its own overhead) — not a guest-internal "memory used" figure.
-    pub mem_bytes: u64,
-    /// The configured guest memory cap, in bytes (`VmConfig::memory_mib`),
-    /// shown alongside `mem_bytes` for context.
-    pub mem_cap_bytes: u64,
+    /// The guest's own reported memory usage, in bytes: `total - available`
+    /// (`available` meaning the guest kernel's own `MemAvailable` — already
+    /// counts reclaimable page cache as free, not "used").
+    ///
+    /// Deliberately **not** qemu's host-side process RSS. An earlier version
+    /// of this stat used RSS, and it was actively misleading once the
+    /// `/workspace` share moved to virtiofs (see `crates/vm/plan.md`):
+    /// virtiofs backs guest RAM with a shared `memfd`, so every page the
+    /// guest touches — including purely reclaimable page cache from reading
+    /// through a large `node_modules`/`.git` tree — stays resident in
+    /// qemu's RSS with nothing to reclaim it. In practice this pinned the
+    /// bar at ~100% during ordinary, non-memory-constrained work (a real
+    /// case: an `npm test` run that left the guest with ~3 GB still
+    /// genuinely available, confirmed via `free -m` inside the guest, while
+    /// the old RSS-based bar showed full). These fields instead come from
+    /// the guest's own virtio-balloon driver (`vm::guest_memory`), which
+    /// reports what the guest kernel itself considers used/available — the
+    /// same number `free -m` inside the guest would show.
+    ///
+    /// `None` (both fields together) means the guest's balloon driver
+    /// hasn't reported yet — e.g. moments after boot — not that usage is
+    /// zero. The UI should show a placeholder (e.g. "—"), never a 0%/100%
+    /// bar, in that case.
+    pub mem_used_bytes: Option<u64>,
+    /// The guest's total RAM as it reports it, in bytes — shown alongside
+    /// `mem_used_bytes` for context. See that field's doc comment for why
+    /// this is guest-reported rather than `VmConfig::memory_mib` restated;
+    /// in practice the two should be very close, but this is what the
+    /// guest itself sees.
+    pub mem_total_bytes: Option<u64>,
     /// How long the qemu process has existed, in seconds (from spawn, not
     /// from when it first became healthy — see `vm::RunningVm::uptime`).
     pub uptime_secs: u64,
@@ -1403,19 +1426,32 @@ fn WorkspaceModal(
                         </div>
                         <div class="stat-row">
                             <span class="stat-label">"Memory"</span>
-                            <div class="stat-bar">
-                                <div
-                                    class="stat-bar-fill"
-                                    style:width=format!(
-                                        "{}%",
-                                        (s.mem_bytes as f32 / s.mem_cap_bytes.max(1) as f32 * 100.0)
-                                            .clamp(0.0, 100.0)
-                                    )
-                                ></div>
-                            </div>
-                            <span class="stat-value">
-                                {format!("{} / {}", format_bytes(s.mem_bytes), format_bytes(s.mem_cap_bytes))}
-                            </span>
+                            // Guest-reported (virtio-balloon), not qemu's host-side
+                            // RSS - see `VmStats::mem_used_bytes`'s doc comment for
+                            // why. `None` means the guest's balloon driver hasn't
+                            // reported yet (e.g. moments after boot) - show a plain
+                            // placeholder rather than a misleading 0%/full bar.
+                            {match (s.mem_used_bytes, s.mem_total_bytes) {
+                                (Some(used), Some(total)) => view! {
+                                    <div class="stat-bar">
+                                        <div
+                                            class="stat-bar-fill"
+                                            style:width=format!(
+                                                "{}%",
+                                                (used as f32 / total.max(1) as f32 * 100.0)
+                                                    .clamp(0.0, 100.0)
+                                            )
+                                        ></div>
+                                    </div>
+                                    <span class="stat-value">
+                                        {format!("{} / {}", format_bytes(used), format_bytes(total))}
+                                    </span>
+                                }.into_any(),
+                                _ => view! {
+                                    <div class="stat-bar"></div>
+                                    <span class="stat-value">"—"</span>
+                                }.into_any(),
+                            }}
                         </div>
                         <div class="stat-row stat-row--plain">
                             <span class="stat-label">"Uptime"</span>
