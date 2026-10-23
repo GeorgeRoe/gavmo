@@ -6,16 +6,18 @@
 > mechanism as it's built, the same "as-built reference" style as
 > `crates/vm/plan.md` and `crates/gavmo/plan.md`.
 >
-> **Status: 🔜 P4.0 in progress — hardware gate run once, found and fixed a
-> real bug, fix not yet re-verified.** First real-hardware pass confirmed the
-> design's single biggest unverified assumption — the guest reaches the host
-> gateway via `10.0.2.2` — but surfaced a genuine bug: rmcp's default
-> DNS-rebinding `Host`-header allowlist rejected every guest request with a
-> bare `403 Forbidden` before any auth/tool code ran (see §4.1). Fixed in
-> `service()`'s config and covered by a regression test, but **not yet
-> re-verified against real hardware** — do not consider P4.0 done until a
-> fresh run confirms `gavmo_ping` actually works end-to-end and token
-> invalidation after stop is confirmed too.
+> **Status: ✅ P4.0 done — re-verified on real hardware.** The first
+> real-hardware pass confirmed the design's single biggest unverified
+> assumption — the guest reaches the host gateway via `10.0.2.2` — but surfaced
+> a genuine bug: rmcp's default DNS-rebinding `Host`-header allowlist rejected
+> every guest request with a bare `403 Forbidden` before any auth/tool code ran
+> (see §4.1). That was fixed in `service()`'s config and covered by a regression
+> test. A second real-hardware pass then confirmed the fix end-to-end:
+> `gavmo_ping` is discovered and callable from a booted workspace, a *current*
+> workspace token lists `gavmo_ping` (HTTP 200), and a *stale* token (from a
+> stopped VM) returns an empty tool list (`{"tools":[]}`) — confirming
+> invalidation — isolated to Stop's `clear_mcp_token` (confirmed with no daemon
+> restart). See §4.1 for the full result.
 
 ## 1. What this crate is
 
@@ -154,10 +156,28 @@ host-side (`http://127.0.0.1:7071/mcp`) and guest-side
   asserting both loopback and `10.0.2.2` are present in the built
   service's config, so a future refactor that drops this can't regress
   silently.
-- **Not yet re-verified:** the fix above has not been re-run against real
-  hardware. Steps 1–3 above still need a fresh pass confirming `gavmo_ping`
-  actually succeeds (not just that the TCP connection and token delivery
-  work) and that token invalidation after stop holds.
+- **Re-verified (second real-hardware pass):** the fix above now holds
+  end-to-end.
+  - **Steps 1–2 (discovery + call):** a booted workspace's OpenCode discovers
+    `gavmo_ping` and calling it returns the pong with the correct workspace id
+    — the `403` is gone.
+  - **Step 3 (invalidation):** with the daemon running, `curl`ing the gateway
+    (`POST http://127.0.0.1:7071/mcp`, `tools/list`) with a workspace's
+    *current* token returns HTTP 200 and lists `gavmo_ping`; with a *stale*
+    token (captured before stopping that VM) it returns HTTP 200 with an empty
+    list (`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`). The empty list is
+    the gateway's "always-on, empty-by-default" response to a token that no
+    longer resolves to a workspace (`list_tools` returns `vec![]` for an
+    unauthorized caller — see `src/lib.rs`), i.e. invalidation working.
+  - **Observed:** each Open mints a fresh per-session token; a stale token stays
+    rejected even after the same VM is brought back up (the old token is never
+    re-added to the daemon's in-memory map).
+  - **Isolated to Stop:** invalidation was attributed to Stop's
+    `clear_mcp_token` specifically (not merely a daemon restart wiping the map):
+    with the daemon left running, a workspace's current token listed `gavmo_ping`
+    (HTTP 200, non-empty), and after stopping that VM — with **no** daemon
+    restart — the *same* token flipped to the empty list. Since the in-memory map
+    was never wiped, `clear_mcp_token` on stop is what dropped it.
 - **Operational note for whoever re-runs the gate:** this fix is
   daemon-only — no VM image rebuild needed. But restarting the daemon
   wipes its in-memory token map, so a VM that's still running (or whose
@@ -196,10 +216,11 @@ sidecar, transport/hardware behavior verified for real.
     significant undertaking for a stateless SDK whose exact wire contract is
     exactly the piece that needs real-world (not reimplemented-by-us)
     verification anyway — see the hardware gate above instead.
-- **On the real NixOS host:** §4's three-point gate. Run once (§4.1) —
-  reachability and token delivery confirmed, one bug found and fixed; the
-  fix itself has not yet been re-verified — see status banner at the top of
-  this doc.
+- **On the real NixOS host:** §4's three-point gate — **passed** (§4.1). The
+  first run confirmed reachability + token delivery and found/fixed one bug
+  (the `Host`-header allowlist); a second run re-verified the fix end-to-end:
+  `gavmo_ping` discovery + call, a current token lists the tool, and a stopped
+  VM's token is invalidated (isolated to Stop's `clear_mcp_token`).
 
 ## 6. Known risks / accepted gaps (carried from the top-level plan)
 
@@ -229,18 +250,35 @@ sidecar, transport/hardware behavior verified for real.
   P4.2+) legitimately returns — mitigated later via minimal fields/result
   caps, not eliminated by this gateway's existence alone.
 
-## 7. What's next (not yet built)
+## 7. What's next
 
-See `gavmo-chatgpt-plan.md` §11/§15 Phase 4 and the plan discussion that
-produced this crate for the full sequencing:
+The original P4.1–P4.3 sketch below has since been **built**, though the design
+evolved — see `gavmo-tools-config-plan.md` for the as-built project-scoped slice
+and how it differs from this early sketch:
 
-- **P4.1** — host secret store (`keyring` crate) + `gavmo.toml` schema
-  (TOML, not the brief's originally-sketched `.agent.yaml`) + parser.
-- **P4.2** — the actual Jira tool (`jira_search`/`jira_get_issue`/
-  `jira_get_comments`), read-only by construction, via `reqwest`.
-- **P4.3** — control-panel UI: per-workspace requested-tools panel, a
-  "configure secret" form (supplying the secret *is* the user's approval —
-  a repo cannot self-enable a tool).
-- **P4.4** — security tests + the full Jira flow verified on real hardware,
-  asserting the real Jira token never reaches any VM-visible surface (files,
-  env, prompts, MCP results, logs).
+- **P4.1 ✅ built** — host secret store (`crates/secrets`, `keyring` backend) +
+  the repo tool-request schema. Landed as **`gavmo.yaml` (YAML)**, not the
+  `gavmo.toml` sketched here (GAVMO standardized on YAML; see
+  `gavmo-tools-config-plan.md` §5), parsed/validated in `crates/teamspec`.
+- **P4.2 ✅ built, generalized** — instead of typed per-service Jira tools, a
+  single generic **host-locked HTTP forwarder** (`type: http`) covers Jira,
+  Supabase, etc. with zero per-service code (`crate::integrations::forward`;
+  read-only is delegated to the credential's own scopes). See
+  `gavmo-tools-config-plan.md` §7–§8.
+- **P4.3 ✅ built** — the control-panel Tools panel (`WorkspaceTools`/`ToolRow`
+  in `crates/gavmo/src/app.rs`): per-workspace requested tools, shown
+  destination URL, configure-secret form, and Save/Update/Test/Clear. Supplying
+  the secret *is* the user's approval — a repo cannot self-enable a tool.
+
+**Still to do:**
+
+- **P4.4** — the full real-tool flow (a read-only Jira/Supabase integration)
+  verified end-to-end on real hardware through the Tools panel, asserting the
+  real token never reaches any VM-visible surface (files, env, prompts, MCP
+  results, logs). The pipeline it rides on (P4.0) is now hardware-confirmed, and
+  the integration tools are already wired into the live `ToolExecutor`
+  (`crates/gavmo/src/registry.rs`), so this is a verification pass, not new code.
+- **Deferred hardening** (see `gavmo-tools-config-plan.md` §11): encrypted
+  Option-B vault behind the `SecretStore` trait; URL-binding of credentials.
+- **Open tidy-ups** (ibid. §13): git-remote-else-path workspace identity; rename
+  `crates/teamspec` (no longer a "team" spec); pick + pin an AEAD crate.

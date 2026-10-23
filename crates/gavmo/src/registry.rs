@@ -949,12 +949,11 @@ impl TokenAuthority for AppState {
 }
 
 /// The daemon's tool implementation, consumed by the `mcp` gateway (see
-/// [`mcp::ToolExecutor`]). This is the seam where real tools (the generic
-/// host-locked HTTP forwarder, resolving credentials from the secret store)
-/// will land in V1.3+. For now it ports P4.0's connectivity probe `gavmo_ping`
-/// onto the trait so the gateway's behavior is unchanged: an authorized
-/// workspace sees exactly `gavmo_ping`, and calling it echoes back the
-/// workspace id.
+/// [`mcp::ToolExecutor`]). Exposes P4.0's connectivity probe `gavmo_ping` plus
+/// one generic host-locked HTTP forwarder tool per enabled integration for the
+/// authorized workspace — the forwarder resolves its credential from the secret
+/// store fresh at call time (see [`crate::integrations::forward`]). An
+/// authorized workspace with no integrations sees exactly `gavmo_ping`.
 impl ToolExecutor for AppState {
     fn list_tools(&self, scope: &WorkspaceScope) -> Vec<ToolDescriptor> {
         // Always expose the connectivity probe, plus one generic forwarder tool

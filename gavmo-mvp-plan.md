@@ -15,12 +15,12 @@
 | **M1.6** — opencode-web UI defaults | Patches opencode's own source at image-build time so useful web-UI panels (file tree, command palette, etc.) are on by default | ✅ Done |
 | **M3** — daemon + Leptos control panel | Turns the proven `vm` crate into an actual usable app | ✅ Done — see `crates/gavmo/plan.md` |
 | **M2** — `gavmo.nix` rebuild-on-open | Per-repo NixOS config applied via `nixos-rebuild switch` at boot | ✅ Done — see §4 |
-| **Phase 4 / P4.0** — MCP tool gateway transport proof | Bearer-token-gated MCP server (`crates/mcp`), per-workspace token share, `gavmo_ping` round trip | 🔜 In progress — implemented + sidecar-tested, **hardware gate not yet run** — see `crates/mcp/plan.md` |
+| **Phase 4 / P4.0** — MCP tool gateway transport proof | Bearer-token-gated MCP server (`crates/mcp`), per-workspace token share, `gavmo_ping` round trip | ✅ Done — hardware gate passed (discovery + call, valid-token lists, stopped-VM token invalidated) — see `crates/mcp/plan.md` |
 
 See `crates/vm/plan.md` for the VM-management crate's design (implemented, boot-tested).
 See `crates/gavmo/plan.md` for the daemon + control-panel design (M3, ✅ implemented —
 see its §12 for as-built notes/deviations).
-See `crates/mcp/plan.md` for the host-side tool-gateway design (brief Phase 4, in progress).
+See `crates/mcp/plan.md` for the host-side tool-gateway design (brief Phase 4, P4.0 ✅ done).
 
 ## 1. What the MVP is (scope lock)
 
