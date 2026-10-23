@@ -115,7 +115,7 @@ pub struct DirEntry {
 }
 
 /// A tool a workspace's `gavmo.yaml` requests, for the control panel's Tools
-/// panel. `auth` is a plain string — not the `ssr`-only `teamspec` enum — so
+/// panel. `auth` is a plain string — not the `ssr`-only `toolspec` enum — so
 /// this type is usable in the wasm/hydrate build too.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolConfig {

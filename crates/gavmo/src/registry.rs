@@ -747,9 +747,9 @@ impl AppState {
                     .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
                 base_url: tool.def.base_url,
                 auth: match tool.def.auth {
-                    teamspec::AuthScheme::Basic => "basic",
-                    teamspec::AuthScheme::Bearer => "bearer",
-                    teamspec::AuthScheme::Header => "header",
+                    toolspec::AuthScheme::Basic => "basic",
+                    toolspec::AuthScheme::Bearer => "bearer",
+                    toolspec::AuthScheme::Header => "header",
                 }
                 .to_string(),
                 secret_name: tool.def.secret,
@@ -773,13 +773,13 @@ impl AppState {
         let tool = self.candidate(id, tool_id).await?;
 
         let value = match tool.def.auth {
-            teamspec::AuthScheme::Basic => {
+            toolspec::AuthScheme::Basic => {
                 let username = username
                     .filter(|u| !u.is_empty())
                     .ok_or_else(|| "basic auth requires a username/email".to_string())?;
                 serde_json::json!({ "username": username, "password": token })
             }
-            teamspec::AuthScheme::Bearer | teamspec::AuthScheme::Header => {
+            toolspec::AuthScheme::Bearer | toolspec::AuthScheme::Header => {
                 serde_json::json!({ "token": token })
             }
         };

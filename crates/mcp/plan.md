@@ -259,7 +259,7 @@ and how it differs from this early sketch:
 - **P4.1 ✅ built** — host secret store (`crates/secrets`, `keyring` backend) +
   the repo tool-request schema. Landed as **`gavmo.yaml` (YAML)**, not the
   `gavmo.toml` sketched here (GAVMO standardized on YAML; see
-  `gavmo-tools-config-plan.md` §5), parsed/validated in `crates/teamspec`.
+  `gavmo-tools-config-plan.md` §5), parsed/validated in `crates/toolspec`.
 - **P4.2 ✅ built, generalized** — instead of typed per-service Jira tools, a
   single generic **host-locked HTTP forwarder** (`type: http`) covers Jira,
   Supabase, etc. with zero per-service code (`crate::integrations::forward`;
@@ -309,7 +309,7 @@ outbound request and reaches **no** VM-visible surface.
 
 - **Deferred hardening** (see `gavmo-tools-config-plan.md` §11): encrypted
   Option-B vault behind the `SecretStore` trait; URL-binding of credentials.
-- **Open tidy-ups** (ibid. §13): rename `crates/teamspec` (no longer a "team"
-  spec); pick + pin an AEAD crate. (Git-remote-else-path workspace identity was
+- **Open tidy-ups** (ibid. §13): ~~rename `crates/teamspec`~~ (done — renamed
+  to `crates/toolspec`); pick + pin an AEAD crate. (Git-remote-else-path workspace identity was
   considered and **declined** — the absolute host path stays the permanent
   identity; see `gavmo-tools-config-plan.md` §6.)

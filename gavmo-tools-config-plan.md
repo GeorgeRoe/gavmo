@@ -174,7 +174,7 @@ typed per-service tools (`jira_search`/…) and "built-in types only".
 
 ## 8. Host-lock (the one security-relevant primitive, built)
 
-`teamspec::lock_url(base_url, path)` resolves an agent-supplied path against an
+`toolspec::lock_url(base_url, path)` resolves an agent-supplied path against an
 integration's `base_url` and returns the full URL **only if it stays on the exact
 same scheme + host + port**. Any attempt to reach a different origin — an
 absolute URL, a scheme-relative `//other-host`, a different port, a userinfo
@@ -198,10 +198,10 @@ preserved. This is tool correctness, not optional hardening — it is always on.
 - **`crates/secrets`** (ssr-only, mechanism): `SecretStore` trait (`get`/`set`/
   `delete` by key) + `keyring` backend + in-memory backend for tests + the
   `secret_key(workspace_id, name)` composer. No knowledge of Jira/workspaces.
-- **`crates/teamspec`** (pure): the `gavmo.yaml` YAML schema (`GavmoConfig` /
+- **`crates/toolspec`** (pure): the `gavmo.yaml` YAML schema (`GavmoConfig` /
   `ToolDef` / `ToolKind` / `AuthScheme`), parse/validate, and the host-lock
-  `lock_url`. Bytes-in, no I/O. *(Name is historical — it no longer models a
-  "team" spec; renaming it is a possible future tidy-up.)*
+  `lock_url`. Bytes-in, no I/O. *(Renamed from `teamspec` — it no longer models
+  a "team" spec, only the per-repo tool-request schema.)*
 - **`crates/mcp`** (extend): the daemon-implemented `ToolExecutor` trait
   (`list_tools`/`call_tool`) so `reqwest` + credentials never enter this crate;
   `WorkspaceScope` carries the workspace id and the executor looks integrations
@@ -214,7 +214,7 @@ preserved. This is tool correctness, not optional hardening — it is always on.
 ## 10. What's built
 
 - **`crates/secrets`** — keyring + in-memory backends, `secret_key` composer.
-- **`crates/teamspec`** — `gavmo.yaml` schema + parse/validate + host-lock
+- **`crates/toolspec`** — `gavmo.yaml` schema + parse/validate + host-lock
   `lock_url`, exhaustively unit-tested.
 - **`ToolExecutor` seam in `crates/mcp`** — transport-neutral
   `ToolDescriptor`/`ToolOutcome`; `gavmo_ping` ported onto it.
@@ -266,7 +266,9 @@ without a rewrite:
    a moved/re-cloned repo losing its secrets is accepted as the user's problem
    (see §6 for the rationale).
 2. **AEAD crate** for the eventual vault: pick + pin a vetted construction.
-3. **Rename `crates/teamspec`** now that it no longer models a team spec.
+3. ~~**Rename `crates/teamspec`** now that it no longer models a team spec.~~
+   **Resolved — done.** Renamed to `crates/toolspec` (it only models the
+   per-repo tool-request schema + host-lock, not a "team" spec).
 
 ## 14. Relationship to existing docs
 

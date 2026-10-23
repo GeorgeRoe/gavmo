@@ -23,7 +23,7 @@ uuid = { version = "1", features = ["v4"], optional = true }
 vm = { path = "../vm", optional = true }
 mcp = { path = "../mcp", optional = true }
 secrets = { path = "../secrets", optional = true }
-teamspec = { path = "../teamspec", optional = true }
+toolspec = { path = "../toolspec", optional = true }
 # The host-side HTTP forwarder. rustls (not native-tls) to avoid an OpenSSL
 # build/system dependency, matching the cross-platform, easy-install goal.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
@@ -84,7 +84,7 @@ ssr = [
     "dep:vm",
     "dep:mcp",
     "dep:secrets",
-    "dep:teamspec",
+    "dep:toolspec",
     "dep:reqwest",
     "dep:web-sys",
     "leptos/ssr",

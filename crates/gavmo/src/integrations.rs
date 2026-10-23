@@ -2,7 +2,7 @@
 //! the host secret store (see `gavmo-tools-config-plan.md`).
 //!
 //! This module is the daemon's *policy* layer between the untrusted repo config
-//! (`teamspec::GavmoConfig`), the secret store (`secrets::SecretStore`), and the
+//! (`toolspec::GavmoConfig`), the secret store (`secrets::SecretStore`), and the
 //! transport-neutral tool interface the gateway consumes (`mcp::ToolDescriptor`
 //! / `mcp::ToolOutcome`).
 //!
@@ -16,12 +16,12 @@
 //! actually use for lack of credentials.
 //!
 //! [`forward`] performs the real HTTP call: it host-locks the URL (via
-//! [`teamspec::lock_url`]), injects the configured credential, forwards any
+//! [`toolspec::lock_url`]), injects the configured credential, forwards any
 //! method, and returns a size-capped response.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use teamspec::{AuthScheme, GavmoConfig, ToolDef};
+use toolspec::{AuthScheme, GavmoConfig, ToolDef};
 
 /// Hard cap on how much of a tool response is returned to the agent. A read-only
 /// API can still return large payloads (big JQL result sets, long issue
@@ -167,7 +167,7 @@ pub fn select_integrations(
 pub async fn read_config(workspace_path: &str) -> GavmoConfig {
     let path = std::path::Path::new(workspace_path).join("gavmo.yaml");
     match tokio::fs::read_to_string(&path).await {
-        Ok(text) => match teamspec::parse_config(&text) {
+        Ok(text) => match toolspec::parse_config(&text) {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("gavmo: ignoring invalid {}: {e}", path.display());
@@ -268,7 +268,7 @@ pub async fn forward(
     let body = args.get("body").and_then(Value::as_str).map(str::to_string);
 
     // Host-lock: refuse to send anywhere but the integration's own origin.
-    let url = match teamspec::lock_url(&integration.def.base_url, path) {
+    let url = match toolspec::lock_url(&integration.def.base_url, path) {
         Ok(url) => url,
         Err(e) => return mcp::ToolOutcome::Error(format!("request blocked by host-lock: {e}")),
     };
@@ -387,7 +387,7 @@ tools:
 "#;
 
     fn jira_config() -> GavmoConfig {
-        teamspec::parse_config(JIRA_CONFIG).unwrap()
+        toolspec::parse_config(JIRA_CONFIG).unwrap()
     }
 
     /// Helper: a MemoryStore with the jira secret already configured for `/ws`.
@@ -430,7 +430,7 @@ tools:
 
     #[test]
     fn inline_tool_enabled_when_secret_configured() {
-        let config = teamspec::parse_config(
+        let config = toolspec::parse_config(
             "tools:\n  pdocs:\n    type: http\n    base_url: https://p.example.com\n    auth: bearer\n    secret: pdocs-token\n",
         )
         .unwrap();
@@ -446,7 +446,7 @@ tools:
 
     #[test]
     fn secret_is_scoped_to_its_workspace() {
-        let config = teamspec::parse_config(
+        let config = toolspec::parse_config(
             "tools:\n  pdocs:\n    type: http\n    base_url: https://p.example.com\n    auth: bearer\n    secret: pdocs-token\n",
         )
         .unwrap();
