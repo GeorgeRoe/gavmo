@@ -479,7 +479,7 @@ in
   # else below is otherwise unchanged). The only things new in M1 were:
   #   - installing `opencode` + `git`,
   #   - a managed (non-overridable) /etc/opencode/opencode.json, so a repo
-  #     cannot swap the provider/model allowlist out from under GAVMO,
+  #     cannot swap the provider pin out from under GAVMO,
   #   - a minimal /etc/gavmo/AGENTS.md baked in via `instructions`,
   #   - the `gavmo-opencode` systemd service replacing the M0 dummy server.
   #
@@ -644,9 +644,12 @@ in
   # --- Managed OpenCode config ----------------------------------------------
   # /etc/opencode/ is OpenCode's highest-priority, non-overridable "managed
   # settings" location (see https://opencode.ai/docs/config/#managed-settings).
-  # Baking the provider/model allowlist here means a repo's own opencode.json
-  # cannot widen it - mirrors DAFNAI's config verbatim (same project, same
-  # 4-model Claude whitelist via google-vertex-anthropic).
+  # Baking the provider pin here means a repo's own opencode.json cannot
+  # redirect the agent at a different provider/backend. We deliberately do NOT
+  # curate a model allowlist on top of that pin (that used to mirror DAFNAI's
+  # 4-model whitelist) - every Claude model Vertex offers is selectable; see
+  # the `enabled_providers` block below for why the pin alone is the boundary
+  # that matters.
   environment.etc."opencode/opencode.json".text = builtins.toJSON {
     "$schema" = "https://opencode.ai/config.json";
 
@@ -663,16 +666,18 @@ in
     # session, this just avoids having to flip it manually every time.
     default_agent = "plan";
 
-    model = "google-vertex-anthropic/claude-sonnet-5@default";
-    small_model = "google-vertex-anthropic/claude-haiku-4-5@20251001";
+    model = "google-vertex-anthropic/claude-sonnet-5-5@default";
+    small_model = "google-vertex-anthropic/claude-haiku-5-5@default";
     enabled_providers = [ "google-vertex-anthropic" ];
 
-    provider.google-vertex-anthropic.whitelist = [
-      "claude-haiku-4-5@20251001"
-      "claude-sonnet-5@default"
-      "claude-opus-4-8@default"
-      "claude-fable-5@default"
-    ];
+    # No model whitelist: every Claude variant Vertex exposes under this
+    # provider is selectable, so users aren't boxed into a hand-curated few
+    # and newer models become available without an image change. The managed
+    # boundary that matters is still intact - `enabled_providers` pins the
+    # provider to google-vertex-anthropic only, so this uses the same
+    # ADC-backed Vertex credentials and never reaches a different, possibly
+    # attacker-controlled backend (see the provider-pin rationale below and
+    # the non-overridable /etc/opencode location comment above).
 
     # Phase 4 (see `crates/mcp/plan.md`): GAVMO's host-side tool gateway.
     # `10.0.2.2` is QEMU user-mode networking's address for the host from
