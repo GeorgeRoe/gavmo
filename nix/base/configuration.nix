@@ -618,19 +618,26 @@ in
   # --- opencode web -----------------------------------------------------
   # Replaces the M0 dummy server on the same fixed guest port.
   #
-  # Session state lives on the VM's own overlay disk (HOME=/home/agent), NOT
-  # on the virtiofs-shared /workspace. This was tried first (state in
-  # /workspace/.gavmo/local, host-visible, surviving a VM reset) but
-  # OpenCode's SQLite session database threw `disk I/O error`
-  # (SQLITE_IOERR) on startup every time under the *original* 9p transport -
-  # 9p's locking/IO semantics didn't satisfy SQLite, even with `cache=none`.
-  # Native ext4 on the overlay disk works reliably. The tradeoff: session
-  # history persists across VM stop/restart (the overlay persists) but is
-  # wiped on a full VM reset, and isn't visible from the host. Your actual
-  # project files in /workspace are unaffected - only OpenCode's internal DB
-  # moved. (Virtiofs's stronger POSIX/locking semantics than 9p might make
-  # moving this back onto `/workspace` viable someday - not revisited as
-  # part of the M3 transport switch, since it's an orthogonal question.)
+  # Session state (SQLite DB, message/session history, snapshots) lives on
+  # the virtiofs-shared /workspace, under `/workspace/.gavmo/opencode`
+  # (`XDG_DATA_HOME`, set in this service's `environment` below), NOT on the
+  # VM's overlay disk. `HOME` itself stays on the overlay (/home/agent) - only
+  # the *data* dir is redirected - so the regenerable cache (`$HOME/.cache`)
+  # and managed config stay off the share.
+  #
+  # History: this was tried at M1 (state under /workspace) and failed hard -
+  # OpenCode's SQLite DB threw `disk I/O error` (SQLITE_IOERR) on startup
+  # every time under the *original 9p transport* (9p's locking/IO semantics
+  # didn't satisfy SQLite, even with `cache=none`), so state was moved onto
+  # the overlay disk as a workaround. The M3 switch to virtiofs (stronger
+  # POSIX/locking semantics, `--cache=auto`) is what makes putting it back on
+  # /workspace viable - exactly the revisit the old workaround comment
+  # anticipated. The payoff: session history now survives a full VM *reset*
+  # (which wipes the overlay disk and recreates a fresh one), not just
+  # stop/restart, and is visible from the host. Gitignored on the host
+  # (`.gitignore`'s `.gavmo/opencode`) so it persists on disk without being
+  # committed. Your actual project files in /workspace are unaffected either
+  # way - this only concerns OpenCode's own internal state dir.
   #
   # opencode's shell tool kills any command that runs longer than this many
   # milliseconds (upstream default: 2 minutes - see
@@ -705,14 +712,35 @@ in
       GIT_CONFIG_COUNT = "1";
       GIT_CONFIG_KEY_0 = "safe.directory";
       GIT_CONFIG_VALUE_0 = "*";
-      # Native filesystem (the overlay disk), not the virtiofs /workspace
-      # share - see the comment above this service for why. `/home/agent`
-      # (not `/root`) because this service now runs as the unprivileged
-      # `agent` user - see `serviceConfig.User` below.
+      # `HOME` stays on the native overlay disk (`/home/agent`, not `/root`
+      # since this runs as the unprivileged `agent` user - see
+      # `serviceConfig.User` below), so OpenCode's regenerable cache
+      # (`$HOME/.cache`) and anything else HOME-relative stays off the
+      # virtiofs share. Only the *data* dir is redirected onto `/workspace`
+      # via `XDG_DATA_HOME` below.
       HOME = "/home/agent";
+      # OpenCode's session state (SQLite DB, message/session history,
+      # snapshots) lives under `$XDG_DATA_HOME/opencode`. Pointing this at
+      # the virtiofs-shared `/workspace` means session history survives a
+      # full VM *reset* (which wipes the overlay disk - see the comment
+      # above this service), not just stop/restart, and is visible from the
+      # host. This was tried at M1 and failed with `SQLITE_IOERR` under the
+      # *9p* transport, which is why state originally moved to the overlay;
+      # virtiofs (M3, `--cache=auto`) has stronger POSIX/locking semantics,
+      # so this is the revisit that comment anticipated. Gitignored on the
+      # host (`.gitignore`'s `.gavmo/opencode`), so it persists on disk but
+      # isn't committed. Only the data dir moves - config stays managed
+      # (`/etc/opencode`) and cache stays on the overlay (regenerable).
+      XDG_DATA_HOME = "/workspace/.gavmo/opencode";
     };
     serviceConfig = {
-      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /home/agent/.local/share /home/agent/.config /home/agent/.cache";
+      # `/workspace/.gavmo/opencode` is `XDG_DATA_HOME` (see `environment`
+      # above) - OpenCode's session state dir, on the virtiofs share so it
+      # survives a VM reset. The `/home/agent/.{config,cache}` dirs stay
+      # HOME-relative on the overlay (config is managed anyway, cache is
+      # regenerable). `/home/agent/.local/share` is no longer where data
+      # lands (XDG_DATA_HOME overrides it) but is cheap to keep creating.
+      ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /workspace/.gavmo/opencode /home/agent/.local/share /home/agent/.config /home/agent/.cache";
       WorkingDirectory = "/workspace";
 
       # --- M3: run as the unprivileged agent user, confined to its own
