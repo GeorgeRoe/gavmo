@@ -50,9 +50,15 @@ host, and no extra port is opened.
 Once both files are in place and the VM has rebooted, ask the agent to use
 the browser tools directly rather than writing a script, e.g.:
 
-> Start the dev server, then use the browser tools to open
-> http://localhost:3000, click the "Login" link, and take a snapshot of the
-> result. Don't write any Playwright scripts to disk.
+> Start the dev server with `gproc start web -- npm run dev`, then use the
+> browser tools to open http://localhost:3000, click the "Login" link, and
+> take a snapshot of the result. Don't write any Playwright scripts to disk.
+
+(The dev server has to keep running while the browser tools drive it, which
+is exactly what `gproc` is for — see the main README's "Long-lived background
+processes". Running `npm run dev` directly through the shell tool would block
+until it times out and is killed, so the page would never be up to navigate
+to. The agent can check it came up with `gproc logs web` before navigating.)
 
 > Use the browser tools to fill in the signup form at /signup with a test
 > email and password, submit it, and confirm the success message appears.

@@ -167,3 +167,37 @@ Or, for a one-off long command, just ask the agent to run it with a larger
 timeout — the shell tool takes a `timeout` (in milliseconds) per call, with
 no upper limit, so this needs no `gavmo.nix` change at all.
 
+## Long-lived background processes (`gproc`)
+
+Raising the timeout only helps commands that *eventually finish*. A process
+that is **meant to run indefinitely** — a dev server (`nuxt dev`, `vite`), a
+file/test watcher, a background worker — is a different problem: the shell
+tool blocks on it until the timeout, then kills it, so there's no timeout
+value that's ever right. The base image ships a small tool, **`gproc`**, that
+the agent uses instead to start such a process *detached* from the shell
+tool's lifetime (the bash call returns immediately while the process keeps
+running) and with its logs in a known place:
+
+```sh
+gproc start web -- npm run dev     # start detached; returns right away
+gproc list                         # name, pid, status, command, for each
+gproc logs web                     # print its output (add -n N for last N lines)
+gproc stop web                     # SIGTERM (then SIGKILL) the process group
+gproc restart web                  # stop, then re-run its saved command
+```
+
+`gproc logs` is a one-shot snapshot, not a live stream — there is deliberately
+no follow/`-f` mode, since the agent can't interrupt one and would hang until
+the shell tool's timeout. To see newer output, just run `gproc logs` again.
+
+Logs live on the host-visible virtiofs share at
+`/workspace/.gavmo/proc/<name>/log`, so they survive a VM reset and are
+inspectable from the host (gitignored, like `.gavmo/opencode`). It's a plain
+`setsid`-based supervisor (not systemd — the agent is unprivileged and has no
+user systemd instance), so a started process lives in opencode's own cgroup:
+it survives individual shell calls but is cleaned up if opencode itself
+restarts — exactly the lifetime a dev server wants. The agent is told about
+`gproc` in its baked-in `/etc/gavmo/AGENTS.md`, so it should reach for it on
+its own; if it still tries to run a dev server directly through the shell
+tool, remind it to use `gproc`.
+

@@ -184,6 +184,291 @@ import { useServer } from "@/context/server"' \
   # that service's comment for why it needs re-prepending there instead of
   # just using `systemd.services.*.path`).
   xdgOpenShim = pkgs.writeShellScriptBin "xdg-open" "exit 0";
+
+  # --- gproc: a long-lived-process manager for the agent -------------------
+  # opencode's shell tool blocks on, and (past
+  # `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`, see `gavmo-opencode`
+  # below) *kills*, any command it runs - which is exactly wrong for a
+  # process that's *supposed* to run indefinitely (a `nuxt dev`/`vite` dev
+  # server, a test watcher, …). The agent has no good way to start one of
+  # those and keep working: either the command blocks the tool forever, or
+  # the timeout reaps it mid-run (surfacing as a confusing `<shell_metadata>`
+  # "terminated command after exceeding timeout" note). `gproc` gives the
+  # agent a dedicated verb for this: start a process *detached* from the
+  # shell tool's lifetime (so the bash call returns instantly while the
+  # process keeps running), and always know where its logs are.
+  #
+  # Mechanism: deliberately NOT systemd. There is no `systemd --user`
+  # instance for the `agent` user (no lingering is enabled), and
+  # `gavmo-opencode`'s sandbox (`NoNewPrivileges`, `RestrictNamespaces`, an
+  # empty `CapabilityBoundingSet` - see that service below) blocks
+  # `systemd-run` from spawning a system/scope unit too. So `gproc` uses
+  # plain `setsid` + a redirected log + a pidfile, all doable as the
+  # unprivileged agent. Spawned processes stay inside `gavmo-opencode`'s own
+  # cgroup/mount namespace (incl. its `PrivateTmp`), so they correctly die if
+  # opencode itself restarts (a dev server shouldn't outlive the agent) but
+  # survive any individual bash tool call. `setsid` also puts each process in
+  # its own session/process-group, so the shell tool killing *its* process
+  # group on timeout can't take the detached process with it, and
+  # `gproc stop` can signal the whole group.
+  #
+  # State/logs live under `/workspace/.gavmo/proc/<name>/` - the virtiofs
+  # share, so they're host-visible (inspectable from the host / control
+  # panel), survive a VM reset, and sit alongside the existing
+  # `.gavmo/opencode` and `.gavmo/vm` state dirs. Gitignored on the host
+  # (see `.gitignore`), so they persist without being committed.
+  #
+  # `writeShellApplication` runs `shellcheck` at image-build time (so a
+  # mistake here fails the build loudly rather than shipping a broken tool)
+  # and gives the script a clean `PATH` of exactly its declared
+  # `runtimeInputs` - `util-linux` for `setsid`, `procps` for `kill`/liveness
+  # checks, `coreutils` for the rest. It's added to
+  # `environment.systemPackages` below so it lands in
+  # `/run/current-system/sw/bin`, which `gavmo-opencode`'s `/etc/profile`
+  # sourcing puts on the agent's `PATH` (same delivery path the playwright
+  # example's wrapper relies on - a `PATH` session variable would NOT work,
+  # since that startup re-derives `PATH` from scratch).
+  gproc = pkgs.writeShellApplication {
+    name = "gproc";
+    runtimeInputs = [ pkgs.coreutils pkgs.util-linux pkgs.procps ];
+    text = ''
+      # Root of all gproc state, on the host-visible virtiofs share.
+      root="''${GPROC_ROOT:-/workspace/.gavmo/proc}"
+
+      usage() {
+        cat >&2 <<'EOF'
+      gproc - manage long-lived processes (dev servers, watchers, …) that
+      must outlive a single shell-tool call.
+
+      Usage:
+        gproc start <name> -- <cmd> [args...]   start a detached process
+        gproc list                              list managed processes
+        gproc logs <name> [-n N]                print its log (or last N lines)
+        gproc stop <name>                       stop it (SIGTERM, then SIGKILL)
+        gproc restart <name>                    stop, then start its saved cmd
+        gproc rm <name>                         remove a stopped process's state
+
+      Logs live at <root>/<name>/log (root: $GPROC_ROOT or
+      /workspace/.gavmo/proc), host-visible and persistent across VM resets.
+      EOF
+        exit 2
+      }
+
+      # True if the process recorded for <name> is currently alive. Treats a
+      # missing/empty/dead pidfile as not-running, so a stale pidfile left by
+      # a previous boot (the pid may now belong to something else, or
+      # nothing) never reads as a live process.
+      is_running() {
+        local dir="$1" pid
+        [ -f "$dir/pid" ] || return 1
+        pid="$(cat "$dir/pid" 2>/dev/null || true)"
+        [ -n "$pid" ] || return 1
+        kill -0 "$pid" 2>/dev/null
+      }
+
+      cmd_start() {
+        local name="$1"; shift
+        [ -n "$name" ] || usage
+        # Require the `--` separator so the command is unambiguous.
+        [ "''${1:-}" = "--" ] || usage
+        shift
+        [ "$#" -gt 0 ] || usage
+
+        local dir="$root/$name"
+        if is_running "$dir"; then
+          echo "gproc: '$name' is already running (pid $(cat "$dir/pid"))." >&2
+          echo "gproc: stop it first, or use 'gproc restart $name'." >&2
+          exit 1
+        fi
+
+        mkdir -p "$dir"
+        # Record the command (one arg per line) so `list`/`restart` can show
+        # and re-run it. `printf %s\n` per-arg keeps args with spaces intact.
+        : > "$dir/cmd"
+        local a
+        for a in "$@"; do printf '%s\n' "$a" >> "$dir/cmd"; done
+        # Clear any leftover pid/status from a previous run of this name
+        # (e.g. a `restart`, or a reused name after a reboot) *before*
+        # launching, so the poll below can never read stale state and mistake
+        # the previous run for this one.
+        rm -f "$dir/pid" "$dir/status"
+
+        # Detach: `setsid` gives the child its own session + process group, so
+        # it survives this shell returning and the shell tool's group-kill on
+        # timeout. A tiny wrapper records its own pid, then (once the command
+        # exits) its exit status - so `list` can show "exited (code)" rather
+        # than just "stopped". `pid` is written to a temp path and atomically
+        # `mv`d into place so a reader never sees a half-written/empty file.
+        setsid sh -c '
+          echo "$$" > "'"$dir"'/pid.tmp"
+          mv "'"$dir"'/pid.tmp" "'"$dir"'/pid"
+          "$@"
+          echo "$?" > "'"$dir"'/status"
+        ' sh "$@" >> "$dir/log" 2>&1 &
+
+        # Wait until the launch resolves one way or the other: the process is
+        # actually alive (`is_running` - pidfile written *and* that pid is
+        # live), or it already recorded an exit `status`. Polling on real
+        # liveness (not just "pidfile non-empty") is what makes a fast
+        # `restart` report accurately instead of racing the pidfile write.
+        local i=0
+        while ! is_running "$dir" && [ ! -f "$dir/status" ] && [ "$i" -lt 50 ]; do
+          sleep 0.1; i=$((i + 1))
+        done
+
+        if is_running "$dir"; then
+          echo "gproc: started '$name' (pid $(cat "$dir/pid"))."
+          echo "gproc: logs at $dir/log (view with: gproc logs $name; re-run for newer output)"
+        else
+          # Exited before we even looked - almost always a bad command or an
+          # immediate crash. Surface the tail of its log inline so the failure
+          # is visible without a second call, and fail nonzero so the agent
+          # doesn't read this as a healthy start.
+          echo "gproc: '$name' exited immediately. Last log lines:" >&2
+          tail -n 20 "$dir/log" >&2 || true
+          echo "gproc: full log at $dir/log" >&2
+          exit 1
+        fi
+      }
+
+      cmd_list() {
+        if [ ! -d "$root" ] || [ -z "$(ls -A "$root" 2>/dev/null || true)" ]; then
+          echo "gproc: no managed processes."
+          return 0
+        fi
+        printf '%-16s %-8s %-10s %s\n' NAME PID STATUS COMMAND
+        local dir name pid status cmd
+        for dir in "$root"/*/; do
+          [ -d "$dir" ] || continue
+          name="$(basename "$dir")"
+          if is_running "$dir"; then
+            pid="$(cat "$dir/pid")"; status="running"
+          else
+            pid="-"
+            if [ -f "$dir/status" ]; then
+              status="exited($(cat "$dir/status"))"
+            else
+              status="stopped"
+            fi
+          fi
+          cmd="$(tr '\n' ' ' < "$dir/cmd" 2>/dev/null || true)"
+          printf '%-16s %-8s %-10s %s\n' "$name" "$pid" "$status" "$cmd"
+        done
+      }
+
+      # Deliberately a *snapshot* read, never a live stream. Follow mode
+      # (`tail -f`) is intentionally NOT supported: the agent driving this
+      # can't send Ctrl-C, so a `-f` would block until the shell tool's
+      # timeout kills it - exactly the hang `gproc` exists to avoid. So this
+      # parses only an optional `-n <N>` itself (rather than forwarding `$@`
+      # to `tail`, which would let `-f`/`--follow` slip through) and rejects
+      # everything else with guidance to just run `logs` again for newer
+      # output.
+      cmd_logs() {
+        local name="$1"; shift || true
+        [ -n "''${name:-}" ] || usage
+        local dir="$root/$name"
+
+        local lines=""
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            -f|-F|--follow)
+              echo "gproc: 'logs $name -f' (follow) is not supported - it would block forever." >&2
+              echo "gproc: re-run 'gproc logs $name' for the latest output, or 'gproc logs $name -n <N>' for the last N lines." >&2
+              exit 2
+              ;;
+            -n)
+              shift
+              lines="''${1:-}"
+              [ -n "$lines" ] || { echo "gproc: '-n' needs a line count, e.g. 'gproc logs $name -n 50'." >&2; exit 2; }
+              case "$lines" in
+                *[!0-9]*) echo "gproc: '-n' needs a number, got '$lines'." >&2; exit 2 ;;
+              esac
+              ;;
+            -n*)
+              lines="''${1#-n}"
+              case "$lines" in
+                *[!0-9]*) echo "gproc: '-n' needs a number, got '$lines'." >&2; exit 2 ;;
+              esac
+              ;;
+            *)
+              echo "gproc: unknown option '$1' for logs (supported: -n <N>)." >&2
+              exit 2
+              ;;
+          esac
+          shift
+        done
+
+        [ -f "$dir/log" ] || { echo "gproc: no log for '$name'." >&2; exit 1; }
+        if [ -n "$lines" ]; then
+          tail -n "$lines" "$dir/log"
+        else
+          cat "$dir/log"
+        fi
+      }
+
+      cmd_stop() {
+        local name="$1"
+        [ -n "''${name:-}" ] || usage
+        local dir="$root/$name"
+        if ! is_running "$dir"; then
+          echo "gproc: '$name' is not running." >&2
+          exit 1
+        fi
+        local pid; pid="$(cat "$dir/pid")"
+        # Negative pid signals the whole process group `setsid` created, so
+        # child processes a dev server spawned go down with it.
+        kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        local i=0
+        while is_running "$dir" && [ "$i" -lt 50 ]; do
+          sleep 0.1; i=$((i + 1))
+        done
+        if is_running "$dir"; then
+          kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+          sleep 0.2
+        fi
+        echo "gproc: stopped '$name'."
+      }
+
+      cmd_restart() {
+        local name="$1"
+        [ -n "''${name:-}" ] || usage
+        local dir="$root/$name"
+        [ -f "$dir/cmd" ] || { echo "gproc: no saved command for '$name'." >&2; exit 1; }
+        if is_running "$dir"; then cmd_stop "$name"; fi
+        # Re-read the saved command, one arg per line, back into positional
+        # params and re-run through cmd_start.
+        local args=()
+        while IFS= read -r line; do args+=("$line"); done < "$dir/cmd"
+        cmd_start "$name" -- "''${args[@]}"
+      }
+
+      cmd_rm() {
+        local name="$1"
+        [ -n "''${name:-}" ] || usage
+        local dir="$root/$name"
+        [ -d "$dir" ] || { echo "gproc: no such process '$name'." >&2; exit 1; }
+        if is_running "$dir"; then
+          echo "gproc: '$name' is still running - stop it first." >&2
+          exit 1
+        fi
+        rm -rf "$dir"
+        echo "gproc: removed '$name'."
+      }
+
+      sub="''${1:-}"; shift || true
+      case "$sub" in
+        start)   cmd_start "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        logs)    cmd_logs "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        restart) cmd_restart "$@" ;;
+        rm)      cmd_rm "$@" ;;
+        ""|-h|--help|help) usage ;;
+        *) echo "gproc: unknown command '$sub'" >&2; usage ;;
+      esac
+    '';
+  };
 in
 {
   # Milestone 1 image: real `opencode web`, authenticated to Google Vertex
@@ -351,6 +636,9 @@ in
   environment.systemPackages = [
     opencodeWeb
     pkgs.git
+    # `gproc` (defined above): the agent's long-lived-process manager, on the
+    # agent's `PATH` via the system profile - see its `let`-binding comment.
+    gproc
   ];
 
   # --- Managed OpenCode config ----------------------------------------------
@@ -464,6 +752,26 @@ in
     exists) rather than reaching for `sudo`, which will not work. Per-user
     tools (`nix profile install`, `cargo install`, `pipx`, etc.) work
     normally without any elevated privileges.
+
+    ## Long-running processes
+
+    Your shell tool blocks on, and eventually kills, any command it runs -
+    so it is the wrong tool for a process that is *meant* to run
+    indefinitely (a dev server like `nuxt dev`/`vite`, a test watcher, a
+    background worker). Use `gproc` for those instead:
+
+    - `gproc start <name> -- <cmd...>` - start it detached; the call returns
+      immediately while the process keeps running in the background.
+    - `gproc list` - see what is running and each one's log path.
+    - `gproc logs <name>` - print its output so far (add `-n <N>` for just
+      the last N lines). This is a one-shot snapshot, not a live stream:
+      run it again whenever you want to see newer output. There is no
+      follow/`-f` mode - that would block forever (you can't interrupt it).
+    - `gproc stop <name>` / `gproc restart <name>` - stop or restart it.
+
+    Example: `gproc start web -- npm run dev`, then `gproc logs web` to check
+    it came up, then carry on with other work. Logs live at
+    `/workspace/.gavmo/proc/<name>/log`.
   '';
 
   # --- M2: per-repo environment via gavmo.nix --------------------------------
