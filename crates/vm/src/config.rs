@@ -1,15 +1,13 @@
 use std::path::PathBuf;
 
-/// The fixed guest-side port `opencode web` listens on. This is baked into
-/// the base NixOS image's bootstrap service and is not configurable per-VM
-/// — only the host-side forwarded port (`VmConfig::host_port`) varies.
+/// The fixed guest-side port `opencode web` listens on. Baked into the base
+/// image; only the host-side forwarded port (`VmConfig::host_port`) varies.
 pub const GUEST_OPENCODE_PORT: u16 = 7080;
 
 /// Configuration for a single VM instance.
 ///
-/// Constructed and owned by the daemon. This crate treats it as an opaque
-/// set of inputs: it does not allocate ports, resolve the base image, or
-/// decide workspace identity — see `plan.md` for the responsibility split.
+/// Owned by the daemon; this crate does not allocate ports, resolve the
+/// base image, or decide workspace identity.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     /// Stable identifier for the workspace this VM belongs to. Used only
@@ -33,16 +31,10 @@ pub struct VmConfig {
     /// the guest so `opencode` can authenticate to Vertex AI.
     pub gcloud_dir: PathBuf,
 
-    /// Host path to this workspace's MCP token share — a small daemon-owned
-    /// directory (**not** under `repo_dir`/`state_dir`; see
-    /// `crates/gavmo/src/registry.rs`'s `mcp_dir_for`) containing a
-    /// `token.env` the guest loads as `GAVMO_MCP_TOKEN` (via systemd's
-    /// `EnvironmentFile`, see `nix/base/configuration.nix`). Shared
-    /// read-only into the guest at `/etc/gavmo/mcp`, parallel to
-    /// `gcloud_dir` — see `crates/mcp/plan.md` for the full design (why a
-    /// dedicated share rather than reusing `state_dir`: keeps the
-    /// capability token out of the user's repo, which `state_dir`, being
-    /// under `repo_dir/.gavmo/vm`, is not).
+    /// Host path to this workspace's MCP token dir, holding a `token.env` the
+    /// guest loads as `GAVMO_MCP_TOKEN`. Shared read-only at `/etc/gavmo/mcp`.
+    /// A dedicated share outside `repo_dir` keeps the capability token out
+    /// of the user's repo (`state_dir` lives under the repo).
     pub mcp_dir: PathBuf,
 
     /// Guest memory, in MiB.
@@ -72,13 +64,9 @@ impl VmConfig {
         self.state_dir.join("console.log")
     }
 
-    /// Path to the M2 `gavmo-rebuild` failure marker (see
-    /// `nix/base/configuration.nix`). Written by the guest, inside
-    /// `state_dir`, only when a repo's `gavmo.nix` fails to build — its
-    /// *contents* are the filename (also under `state_dir`) of the full
-    /// `nixos-rebuild` log. Host-visible because `state_dir` is conventionally
-    /// `<repo>/.gavmo/vm`, which is `/workspace/.gavmo/vm` from the guest's
-    /// side of the virtiofs share.
+    /// Path to the `gavmo-rebuild` failure marker, written by the guest (via
+    /// the `/workspace` share) only when `gavmo.nix` fails to build. Its
+    /// contents are the filename, under `state_dir`, of the full rebuild log.
     pub fn rebuild_failed_marker_path(&self) -> PathBuf {
         self.state_dir.join("rebuild-failed")
     }

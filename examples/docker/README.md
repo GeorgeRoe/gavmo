@@ -21,8 +21,6 @@ One file, copied/merged into your repo root:
 
 ## How it works
 
-See the comments at the top of [`gavmo.nix`](./gavmo.nix). In short:
-
 - The Docker daemon runs as a **root** systemd service at VM boot - it does
   the privileged container work, so the agent never needs `sudo`.
 - The `agent` user (which runs opencode and every shell it spawns) is added

@@ -10,96 +10,45 @@ use crate::error::{Error, Result};
 pub struct ShareSpec {
     /// Host directory to expose.
     pub host_path: PathBuf,
-    /// Guest-visible mount tag. Must match the tag the base NixOS image's
-    /// fstab expects (see `plan.md`'s Rust-to-base-image contract).
+    /// Guest-visible mount tag. Must match the mounts in
+    /// `nix/base/configuration.nix`.
     pub mount_tag: &'static str,
     /// Whether the guest should only get read access.
     pub read_only: bool,
 }
 
-/// The guest-side uid/gid of the unprivileged `agent` user that runs
-/// `opencode` (see `users.users.agent` in `nix/base/configuration.nix`).
-/// Pinned here *and* there as plain numeric literals — like
-/// `GAVMO_MCP_PORT`/`mcp.gavmo-tools` elsewhere in this codebase, there is no
-/// automatic sharing between the two declarations, so a change to one must be
-/// mirrored in the other by hand. [`VirtiofsShare`] maps each share's host
-/// owner to this uid/gid so `agent` (not root) can read/write it without the
-/// host and guest uid *numbers* needing to match.
+/// Guest uid/gid of the unprivileged `agent` user that runs `opencode`.
+/// Must match `users.users.agent` in `nix/base/configuration.nix` by hand.
+/// Each share's host owner is mapped to these.
 pub const GUEST_AGENT_UID: u32 = 1000;
 pub const GUEST_AGENT_GID: u32 = 1000;
 
 /// How a host directory is made available inside the guest.
-///
-/// [`VirtiofsShare`] is the only implementation (GAVMO M3 onward — see
-/// `plan.md`'s "Why virtiofs now" for the Windows-support tradeoff that
-/// motivated the switch from the original 9p backend). The trait seam is
-/// kept mainly so a share backend remains swappable without touching
-/// `qemu.rs`/`handle.rs`.
+/// [`VirtiofsShare`] is the only implementation.
 pub trait ShareBackend: Send + Sync {
     /// QEMU command-line arguments contributed by this share.
     fn qemu_args(&self, state_dir: &Path, spec: &ShareSpec) -> Vec<String>;
 
-    /// Spawns any helper process this backend needs. virtiofs needs one
-    /// `virtiofsd` per share; the default implementation (for a hypothetical
-    /// future backend that needs none) returns `Ok(None)`.
+    /// Spawns any helper process this backend needs (`virtiofsd` per share).
     fn start(&self, _state_dir: &Path, _spec: &ShareSpec) -> Result<Option<Child>> {
         Ok(None)
     }
 }
 
-/// virtiofs share backend (`vhost-user-fs-pci` + a per-share `virtiofsd`
-/// helper process), replacing the original 9p transport.
+/// virtiofs share backend: `vhost-user-fs-pci` plus one `virtiofsd` per
+/// share.
 ///
-/// ## Why virtiofs instead of 9p
+/// virtiofs rather than 9p because virtiofsd can map the share's real host
+/// owner to the unprivileged guest `agent` user; 9p's xattr-mapped
+/// ownership leaves a non-root agent unable to write. Linux hosts only.
 ///
-/// 9p's `security_model=mapped-xattr` stores guest-visible file ownership in
-/// host-side xattrs, decoupled from real host uids. That's fine for a
-/// **root** guest agent (root bypasses DAC entirely, so whatever ownership
-/// the guest sees doesn't matter) but becomes load-bearing the moment the
-/// guest agent is unprivileged: if pre-existing files present with
-/// unexpected/root ownership, a non-root agent can neither write `/workspace`
-/// nor read the mounted credentials.
-///
-/// virtiofsd's **internal** UID/GID translation (`--translate-uid`/
-/// `--translate-gid` below) sidesteps this entirely: it translates the
-/// *real* host owner of the shared directory to the guest's unprivileged
-/// `agent` user, so ownership "just works" without xattr quirks or
-/// host/guest uid numbers needing to numerically coincide. This is the
-/// change that makes a non-root guest agent (see
-/// `nix/base/configuration.nix`) practical. The cost is dropping Windows
-/// host support: `virtiofsd` is a Linux-only (FUSE-based) daemon. See
-/// `plan.md` for the full history of that tradeoff.
-///
-/// ## Why `--translate-uid`/`--translate-gid`, not `--uid-map`/`--gid-map`
-///
-/// virtiofsd has two different UID/GID remapping mechanisms, and only one
-/// works unprivileged (confirmed against `virtiofsd --help`, version 1.13.3):
-///
-/// - `--uid-map`/`--gid-map`: mapping performed by the **user namespace**
-///   virtiofsd places itself into via `--sandbox=namespace` — requires that
-///   namespace's root-mapping to succeed, which needs privilege virtiofsd
-///   doesn't have when run as a plain unprivileged user (confirmed by real
-///   hardware testing: this produced `Couldn't set the process uid as root`
-///   and left `/workspace` with its raw, untranslated host ownership).
-/// - **`--translate-uid`/`--translate-gid`**: mapping performed **internally
-///   by virtiofsd itself**, explicitly documented as *"does not require
-///   using a user namespace"*. This is what we use. Combined with
-///   `--sandbox none` (below), virtiofsd needs no special privilege at all —
-///   it runs as whatever unprivileged user the GAVMO daemon itself runs as,
-///   which already owns the shared directories it's translating.
-///
-/// We use each type's `map:<guest base>:<host base>:<count>` form — a
-/// bidirectional 1:1 map between [`GUEST_AGENT_UID`]/[`GUEST_AGENT_GID`] and
-/// the share's real host owner (stat'd at `start()` time, so this is
-/// correct for *any* host uid/gid, not just a coincidentally-matching one).
+/// `--translate-uid`/`--translate-gid` rather than `--uid-map`/`--gid-map`:
+/// the latter need a user namespace, which fails unprivileged.
 pub struct VirtiofsShare;
 
 impl VirtiofsShare {
-    /// Path to this share's virtiofsd unix socket, under the VM's state dir.
-    /// Must agree between [`Self::start`] (which binds it) and
-    /// [`Self::qemu_args`] (which tells qemu where to connect) — both derive
-    /// it from the same `state_dir` + `mount_tag` rather than threading a
-    /// socket path through `ShareSpec`.
+    /// Path to this share's virtiofsd unix socket, shared by
+    /// [`Self::start`] (binds) and [`Self::qemu_args`] (connects).
     fn socket_path(state_dir: &Path, mount_tag: &str) -> PathBuf {
         state_dir.join(format!("virtiofs-{mount_tag}.sock"))
     }
@@ -128,8 +77,8 @@ impl ShareBackend for VirtiofsShare {
     fn start(&self, state_dir: &Path, spec: &ShareSpec) -> Result<Option<Child>> {
         let socket_path = Self::socket_path(state_dir, spec.mount_tag);
 
-        // Best-effort: a stale socket left behind by a previous (e.g.
-        // crashed) boot would otherwise make virtiofsd fail to bind.
+        // A stale socket from a crashed boot would make virtiofsd fail to
+        // bind.
         let _ = std::fs::remove_file(&socket_path);
 
         let meta = std::fs::metadata(&spec.host_path).map_err(|source| Error::Spawn {
@@ -151,16 +100,8 @@ impl ShareBackend for VirtiofsShare {
     }
 }
 
-/// Builds the `virtiofsd` argument list for one share. Pure (takes the host
-/// owner's uid/gid as plain arguments rather than stat-ing `spec.host_path`
-/// itself) so it's unit-testable without touching the filesystem — mirrors
-/// `disk.rs::build_overlay_args`'s split of "pure arg-building" from
-/// "actual spawn" for the same reason.
-///
-/// Validated against real hardware (virtiofsd 1.13.3) as part of the design
-/// discussion that landed this — see [`VirtiofsShare`]'s doc comment for why
-/// `--translate-uid`/`--translate-gid` + `--sandbox none` is the combination
-/// that works fully unprivileged.
+/// Builds the `virtiofsd` argument list for one share. Pure (host owner
+/// passed in rather than stat'd) for unit testing.
 fn build_virtiofsd_args(
     socket_path: &Path,
     spec: &ShareSpec,
@@ -172,34 +113,16 @@ fn build_virtiofsd_args(
         socket_path.display().to_string(),
         "--shared-dir".to_string(),
         spec.host_path.display().to_string(),
+        // Must match the guest-side mount's cache mode.
         "--cache=auto".to_string(),
-        // No user namespace: `--translate-uid`/`--translate-gid` below do
-        // their own internal mapping and need no privilege to do it (see
-        // VirtiofsShare's doc comment) - `--sandbox=namespace` (the
-        // default) would otherwise require a privilege virtiofsd doesn't
-        // have when run as a plain unprivileged user.
+        // The default namespace sandbox needs privilege virtiofsd lacks
+        // when run unprivileged; uid/gid translation doesn't need it.
         "--sandbox".to_string(),
         "none".to_string(),
-        // Unprivileged virtiofsd can't use `name_to_handle_at` (needs
-        // `CAP_DAC_READ_SEARCH`) to reference inodes via file handles - left
-        // at the default ("prefer"), it tries anyway, fails, and logs a
-        // "file handles do not appear safe" warning before falling back.
-        // `never` skips straight to the fallback (plain `O_PATH` file
-        // descriptors) with no wasted attempt or warning.
-        //
-        // One combined `--flag=value` token, NOT two separate args: clap
-        // marks this specific option require-equals (per `virtiofsd --help`:
-        // `--inode-file-handles=<INODE_FILE_HANDLES>`, unlike e.g. `--cache
-        // <CACHE>`) - confirmed on real hardware, `--inode-file-handles
-        // never` as two args is rejected with "equal sign is needed when
-        // assigning values to '--inode-file-handles=<INODE_FILE_HANDLES>'",
-        // which aborts virtiofsd before it ever binds its socket.
+        // File handles need CAP_DAC_READ_SEARCH; `never` skips the doomed
+        // attempt and its warning. Must be one `=` token (clap require-equals).
         "--inode-file-handles=never".to_string(),
-        // Maps the share's real host owner to the guest's unprivileged
-        // `agent` uid/gid (`GUEST_AGENT_UID`/`_GID`) so `agent` - not root -
-        // can access it correctly, regardless of what the host uid actually
-        // is. Internal to virtiofsd (see this function's doc comment), so
-        // needs no privilege.
+        // Map the share's host owner to the guest `agent` uid/gid.
         "--translate-uid".to_string(),
         format!("map:{GUEST_AGENT_UID}:{host_uid}:1"),
         "--translate-gid".to_string(),
@@ -299,9 +222,8 @@ mod tests {
         );
     }
 
-    /// Distinct uid and gid values (unlike the test above, which reuses the
-    /// same number for both) - guards against a copy-paste bug swapping the
-    /// uid/gid translation targets.
+    /// Distinct uid and gid values guard against swapping the uid/gid
+    /// translation targets.
     #[test]
     fn virtiofsd_args_translate_uid_and_gid_independently() {
         let spec = ShareSpec {

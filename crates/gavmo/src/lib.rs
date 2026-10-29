@@ -1,10 +1,8 @@
-//! GAVMO daemon + Leptos control panel (M3).
+//! GAVMO daemon + Leptos control panel.
 //!
-//! A single crate compiled twice by cargo-leptos: natively (the `ssr`
-//! feature) as the axum server binary, and for `wasm32` (the `hydrate`
-//! feature) as the browser bundle. The VM-management `vm` crate is an
-//! `ssr`-only optional dependency and must never reach the wasm build —
-//! see `crates/gavmo/plan.md` §5.
+//! Compiled twice by cargo-leptos: natively (`ssr`) as the axum server and
+//! for `wasm32` (`hydrate`) as the browser bundle. Server-only modules and
+//! dependencies (e.g. `vm`) must never reach the wasm build.
 
 pub mod app;
 

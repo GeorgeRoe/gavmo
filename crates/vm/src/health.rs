@@ -1,16 +1,11 @@
 //! Health checking for a booting/running VM.
 //!
-//! We treat "`opencode web` answers on the forwarded host port" as the
-//! definition of healthy. This is a minimal raw HTTP probe rather than a
-//! full HTTP client, since we don't otherwise need an HTTP client
-//! dependency in this crate.
+//! Healthy means `opencode web` answers on the forwarded host port, checked
+//! with a raw HTTP probe to avoid an HTTP client dependency.
 //!
-//! During boot we also race that probe against the M2 `gavmo-rebuild`
-//! failure marker (see `VmConfig::rebuild_failed_marker_path` and
-//! `nix/base/configuration.nix`) — a repo's broken `gavmo.nix` means
-//! opencode will never start, so waiting for [`Error::HealthTimeout`] alone
-//! would take the full boot timeout to report what's actually a fast,
-//! already-known failure.
+//! During boot the probe is raced against the `gavmo-rebuild` failure
+//! marker: a broken `gavmo.nix` means opencode never starts, so this fails
+//! fast instead of waiting out the full boot timeout.
 
 use std::path::Path;
 use std::time::Duration;
@@ -25,13 +20,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Polls `127.0.0.1:port` until `opencode web` answers, the `gavmo-rebuild`
-/// failure marker at `marker_path` appears, or `overall_timeout` elapses —
-/// whichever comes first.
-///
-/// The marker file's contents are the filename (relative to the marker's own
-/// parent directory, i.e. `VmConfig::state_dir`) of the full `nixos-rebuild`
-/// log, which is threaded through as [`Error::RebuildFailed::log_file`] for
-/// the caller to surface.
+/// failure marker at `marker_path` appears, or `overall_timeout` elapses.
+/// The marker's contents become [`Error::RebuildFailed::log_file`].
 pub async fn wait_for_ready(port: u16, marker_path: &Path, overall_timeout: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + overall_timeout;
 
@@ -103,9 +93,8 @@ mod tests {
         assert!(!probe_once(1).await);
     }
 
-    /// A nonexistent marker path must never be mistaken for a failure —
-    /// `read_to_string` erroring (NotFound) is the expected "no marker yet"
-    /// state, not something that should short-circuit the wait.
+    /// A missing marker (NotFound) is the normal "no failure yet" state and
+    /// must not short-circuit the wait.
     #[tokio::test]
     async fn wait_for_ready_times_out_when_nothing_ever_responds_and_no_marker_appears() {
         let dir = std::env::temp_dir().join(format!(
@@ -133,7 +122,7 @@ mod tests {
             .unwrap();
 
         // Port 1 never answers; a long overall_timeout proves the marker
-        // check — not a timeout — is what resolves this.
+        // check, not a timeout, resolves this.
         let result = wait_for_ready(1, &marker, Duration::from_secs(30)).await;
         assert!(matches!(
             result,

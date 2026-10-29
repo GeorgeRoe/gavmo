@@ -4,28 +4,17 @@ use crate::config::{GUEST_OPENCODE_PORT, VmConfig};
 use crate::error::{Error, Result};
 use crate::share::{ShareBackend, ShareSpec};
 
-/// The `id=` given to the `virtio-balloon-pci` device below. QEMU places a
-/// `-device`'s QOM object under `/machine/peripheral/<id>`, so this single
-/// constant is what `qmp.rs`'s `BALLOON_QOM_PATH` derives from — keeping the
-/// device's advertised id and the path used to query it in one place rather
-/// than two string literals that could drift apart.
+/// The `id=` of the `virtio-balloon-pci` device. `qmp.rs` derives the
+/// balloon's QOM path (`/machine/peripheral/<id>`) from this.
 pub(crate) const BALLOON_DEVICE_ID: &str = "balloon0";
 
-/// Builds the full `qemu-system-x86_64` argument list for a VM boot, given
-/// its config and the shares it should expose.
-///
-/// Pure and side-effect free so it can be unit-tested without `qemu`
-/// installed (see `plan.md`'s testing strategy: this is exercised in the
-/// sidecar, which has no `/dev/kvm`).
+/// Builds the full `qemu-system-x86_64` argument list for a VM boot. Pure,
+/// for unit testing without `qemu` or `/dev/kvm`.
 pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]) -> Vec<String> {
     let mut args = Vec::new();
 
-    // Hardware acceleration via KVM (Linux-only). Windows host support was
-    // dropped when the share backend moved from 9p to virtiofs (see
-    // `share.rs`'s `VirtiofsShare` doc comment / `plan.md`), so there is no
-    // longer a non-Linux host target to cfg-gate this against in practice —
-    // the `cfg` is kept only so a non-Linux *development* build of this
-    // crate still compiles.
+    // Hosts are Linux-only (virtiofs); the `cfg` just keeps non-Linux
+    // development builds compiling.
     #[cfg(target_os = "linux")]
     {
         args.push("-enable-kvm".to_string());
@@ -38,14 +27,9 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
     args.push("-m".to_string());
     args.push(cfg.memory_mib.to_string());
 
-    // virtiofs requires guest RAM to live in a *shared* memory backend (not
-    // plain anonymous mmap), so `virtiofsd` can map pages directly into the
-    // guest's address space rather than copying through a 9p-style
-    // round-trip. `-numa node,memdev=mem` is QEMU's mechanism for actually
-    // wiring a (single-node) guest's RAM to that backend — required even
-    // though this guest has no real multi-NUMA topology of its own. Only
-    // emitted when there's at least one share, since a share-less boot (as
-    // in several unit tests below) has no virtiofsd to back.
+    // virtiofs needs guest RAM in a shared memory backend so `virtiofsd`
+    // can map it; `-numa node,memdev=mem` is how QEMU wires guest RAM to
+    // that backend, even for a single-node guest.
     if !shares.is_empty() {
         args.push("-object".to_string());
         args.push(format!(
@@ -71,15 +55,9 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
     args.push("-device".to_string());
     args.push("virtio-net-pci,netdev=net0".to_string());
 
-    // Exposes the guest's own memory stats (used/available, not just what
-    // qemu's host-side RSS happens to have touched) over QMP via
-    // `qom-get .../guest-stats` — see `qmp::guest_memory`. We never inflate
-    // the balloon (no `-balloon`/`qom-set size=...` calls anywhere in this
-    // codebase); it exists purely as a stats channel, so it has no effect
-    // on the guest's actual available memory or virtiofs's reclaim
-    // semantics. `deflate-on-oom=on` is a free safety net (lets the guest
-    // kernel ask the balloon to shrink under memory pressure) that costs
-    // nothing since we never grow it in the first place.
+    // The balloon is never inflated; it exists only so the guest reports
+    // its own memory usage over QMP (host RSS doesn't reflect guest usage).
+    // `deflate-on-oom=on` is a free safety net.
     args.push("-device".to_string());
     args.push(format!(
         "virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"
@@ -102,10 +80,9 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
     args
 }
 
-/// Spawns `qemu-system-x86_64` with the given config and shares, starting
-/// any helper processes the share backends need first (e.g. a future
-/// `virtiofsd`). Returns the qemu child and any helper children, all of
-/// which the caller is responsible for cleaning up.
+/// Spawns `qemu-system-x86_64`, first starting any share helper processes
+/// (`virtiofsd`). The caller is responsible for cleaning up all returned
+/// children.
 pub async fn spawn_qemu(
     cfg: &VmConfig,
     shares: &[(&dyn ShareBackend, ShareSpec)],
@@ -178,10 +155,7 @@ mod tests {
         );
     }
 
-    /// Mirrors the three shares `RunningVm::boot` actually assembles
-    /// (`handle.rs`) — workspace (rw), gcloud (ro), and the MCP token share
-    /// (ro, see `VmConfig::mcp_dir`/`crates/mcp/plan.md`) — even though
-    /// `build_qemu_args` itself is share-count-agnostic.
+    /// Mirrors the three shares `RunningVm::boot` assembles.
     #[test]
     fn args_include_each_share() {
         let cfg = test_cfg();
@@ -229,8 +203,7 @@ mod tests {
         );
     }
 
-    /// virtiofs requires guest RAM to be backed by a *shared* memory
-    /// mapping; this is only needed once a share is actually present.
+    /// virtiofs requires shared guest RAM, but only when a share is present.
     #[test]
     fn args_add_shared_memory_backend_when_shares_are_present() {
         let cfg = test_cfg();
@@ -271,8 +244,7 @@ mod tests {
         assert!(args.contains(&"-enable-kvm".to_string()));
     }
 
-    /// Always present (even with no shares) — the balloon is the memory
-    /// stats channel for the UI, independent of virtiofs.
+    /// The balloon is the memory stats channel, independent of virtiofs.
     #[test]
     fn args_include_the_balloon_device_for_guest_memory_stats() {
         let cfg = test_cfg();

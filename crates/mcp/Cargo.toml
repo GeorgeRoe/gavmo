@@ -4,11 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Pinned exactly (not `"3"`): rmcp's HTTP-transport internals are young and
-# have shifted meaningfully between releases (see crates/mcp/plan.md) -
-# an unpinned bump could silently change `ServerHandler`/`StreamableHttpService`
-# shapes this crate relies on. Bump deliberately, re-verifying against the
-# upstream source, not via an incidental `cargo update`.
+# Pinned exactly: rmcp's HTTP-transport API shifts between releases, so bump
+# deliberately and re-verify `ServerHandler`/`StreamableHttpService` usage.
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 http = "1"
 serde_json = "1"

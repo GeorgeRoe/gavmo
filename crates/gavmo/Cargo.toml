@@ -12,8 +12,8 @@ leptos_router = { version = "0.8.0" }
 leptos_meta = { version = "0.8.0" }
 serde = { version = "1", features = ["derive"] }
 
-# ssr-only (native server build) dependencies. None of these must ever be
-# pulled into the wasm32 hydrate build — see crates/gavmo/plan.md §5.
+# ssr-only (native server build) dependencies. None of these may ever be
+# pulled into the wasm32 hydrate build.
 axum = { version = "0.8.0", optional = true }
 leptos_axum = { version = "0.8.0", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "sync", "macros"], optional = true }
@@ -24,45 +24,26 @@ vm = { path = "../vm", optional = true }
 mcp = { path = "../mcp", optional = true }
 secrets = { path = "../secrets", optional = true }
 toolspec = { path = "../toolspec", optional = true }
-# The host-side HTTP forwarder. rustls (not native-tls) to avoid an OpenSSL
-# build/system dependency, matching the cross-platform, easy-install goal.
+# Host-side HTTP forwarder. rustls (not native-tls) avoids an OpenSSL
+# build/system dependency.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 # hydrate-only (wasm32 browser build) dependencies.
 console_error_panic_hook = { version = "0.1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
-# Used to drive the View Transitions API (card -> modal morph) by calling
-# `document.startViewTransition` dynamically via `js_sys::Reflect` — see
-# `app.rs`'s `start_view_transition`. Dynamic lookup (rather than a typed
-# web-sys binding) avoids needing `--cfg=web_sys_unstable_apis` at all;
-# `leptos_router` itself uses the same trick for its own route transitions.
+# Calls `document.startViewTransition` via `js_sys::Reflect`; dynamic lookup
+# avoids needing `--cfg=web_sys_unstable_apis` for a typed web-sys binding.
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 
-# Used in `app.rs`'s *shared* (both-target) view code for one specific
-# reason: `WorkspaceCard`'s `on:click` handler's event parameter type is
-# `web_sys::MouseEvent` regardless of target (that's just what Leptos's
-# `on:click` always gives you - see `tachys::html::event`'s `EventDescriptor`
-# impl for `click`), so naming it in a function signature compiled for both
-# `ssr`/`hydrate` needs `web-sys` available either way. This is safe: like
-# `wasm-bindgen`/`js-sys`, `web-sys`'s generated bindings are cross-target by
-# design (stub bodies on non-wasm32) - `leptos`'s own `tachys` already pulls
-# it in unconditionally for exactly this reason. The actual DOM calls
-# (`app.rs`'s `click_target`/`set_card_vt_name`) are still `hydrate`-gated
-# internally; nothing here ever runs on the server (there's no click event
-# loop in SSR to begin with).
-#
-# `Element` additionally gives `app.rs`'s console-log auto-scroll
-# (`scroll_top`/`scroll_height`) a typed target for the `<pre>`'s `NodeRef`
-# - same cross-target-safe, `hydrate`-gated-internally story as above.
+# Enabled for both ssr and hydrate: shared view code names `web_sys` types
+# (e.g. `MouseEvent`) in signatures. Bindings stub out on non-wasm32; the
+# actual DOM calls are hydrate-gated.
 web-sys = { version = "0.3", optional = true, features = ["HtmlElement", "CssStyleDeclaration", "Element"] }
 
 [dev-dependencies]
-# Only exercised by `crates/gavmo/src/auth.rs`'s `require_session`/`login_router`
-# tests, via `tower::ServiceExt::oneshot` against a real (minimal) axum
-# `Router` — already present transitively through `axum` itself (see
-# `Cargo.lock`), so this adds no new crate to the dependency tree, just makes
-# its `util` feature (for `oneshot`) available to tests.
+# `ServiceExt::oneshot` for auth router tests. Already a transitive dep of
+# axum; this only enables the `util` feature.
 tower = { version = "0.5", features = ["util"] }
 
 [features]

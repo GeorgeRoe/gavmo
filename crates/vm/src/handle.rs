@@ -11,15 +11,8 @@ use crate::qmp;
 use crate::share::{ShareBackend, ShareSpec, VirtiofsShare};
 
 /// How long to wait for `opencode web` to become reachable during boot.
-///
-/// Also covers M2's `gavmo-rebuild` step (in-guest `nixos-rebuild test`,
-/// which runs before `opencode web` starts if the repo has a `gavmo.nix` —
-/// see `nix/base/configuration.nix` and `nix/spike-m2.md`). The M2 spike's
-/// recorded timings (`nix/spike-m2.md` §9) found this adds only seconds to
-/// low tens-of-seconds even when pulling in a whole new service (Docker),
-/// comfortably inside the existing budget below — no widening needed based
-/// on that evidence. Revisit if a real repo's `gavmo.nix` proves much
-/// heavier (e.g. a large toolchain fetch on a slow link).
+/// Also covers the in-guest `gavmo-rebuild` of the repo's `gavmo.nix`,
+/// which runs before `opencode web` starts.
 const BOOT_HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long to wait for a graceful ACPI shutdown before force-killing.
@@ -29,23 +22,14 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// SIGKILL directly.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often the guest's virtio-balloon driver should report memory stats
-/// back to qemu (`qmp::set_balloon_stats_interval`, set once at the end of
-/// `boot()` below) — the control panel's Memory stat is only as fresh as
-/// this. 2s is snappy for a live stats panel without being a meaningful
-/// polling burden.
+/// How often the guest's balloon driver reports memory stats to qemu; the
+/// control panel's Memory stat is only as fresh as this.
 const BALLOON_STATS_INTERVAL_SECS: u32 = 2;
 
-/// The guest-visible mount tag for the repository share. Must match the
-/// base NixOS image's fstab.
+// Guest-visible virtiofs mount tags. Must match the mounts in
+// `nix/base/configuration.nix`.
 const MOUNT_TAG_WORKSPACE: &str = "workspace";
-
-/// The guest-visible mount tag for the read-only gcloud credentials share.
-/// Must match the base NixOS image's fstab.
 const MOUNT_TAG_GCLOUD: &str = "gcloud";
-
-/// The guest-visible mount tag for the read-only MCP token share (see
-/// `VmConfig::mcp_dir`). Must match the base NixOS image's fstab.
 const MOUNT_TAG_MCP: &str = "mcp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,30 +44,23 @@ pub enum VmStatus {
     Failed { reason: String },
 }
 
-/// A booted VM: owns the qemu process (and its share-backend helper
-/// processes — one `virtiofsd` per share) plus the config it was booted
-/// with.
+/// A booted VM: owns the qemu process, its `virtiofsd` helpers, and the
+/// config it was booted with.
 ///
-/// Dropping a `RunningVm` without calling [`RunningVm::stop`] will still
-/// kill the qemu child (via `kill_on_drop`), but won't attempt a graceful
-/// shutdown or clean up helper processes — prefer `stop()`.
+/// Dropping without [`RunningVm::stop`] still kills qemu (`kill_on_drop`),
+/// but skips graceful shutdown and helper cleanup - prefer `stop()`.
 pub struct RunningVm {
     cfg: VmConfig,
     qemu: Child,
     helpers: Vec<Child>,
-    /// When the qemu process was spawned — *not* when `opencode web`
-    /// first answered (which can be minutes later on a first boot, or a
-    /// `gavmo.nix` rebuild). Used for [`Self::uptime`], so "uptime" means
-    /// "how long has this VM existed", matching what a user watching the
-    /// live boot console would expect, not "how long has it been healthy".
+    /// When qemu was spawned, not when `opencode web` first answered (which
+    /// can be minutes later), so uptime matches what the boot console shows.
     started: Instant,
 }
 
 impl RunningVm {
-    /// Boots a VM per `cfg`, sharing `/workspace` (read-write) and the
-    /// gcloud credentials directory (read-only) via virtiofs, and waits for
-    /// `opencode web` to answer on the forwarded host port before
-    /// returning.
+    /// Boots a VM per `cfg` and waits for `opencode web` to answer on the
+    /// forwarded host port.
     pub async fn boot(cfg: VmConfig) -> Result<Self> {
         ensure_overlay(&cfg.base_image, &cfg.disk_path()).await?;
 
@@ -109,11 +86,8 @@ impl RunningVm {
             (&virtiofs, mcp_share),
         ];
 
-        // Clear a stale M2 failure marker from a previous boot attempt
-        // before this one starts, so `wait_for_ready` below can't mistake
-        // leftover state for this boot's own result. `ensure_overlay` above
-        // already created `state_dir`, so this is just a best-effort remove
-        // (ignore "doesn't exist", which is the common case).
+        // Clear a stale rebuild-failure marker so a previous boot's result
+        // isn't mistaken for this one's. NotFound is the common case.
         let _ = tokio::fs::remove_file(cfg.rebuild_failed_marker_path()).await;
 
         let (qemu, helpers) = spawn_qemu(&cfg, &shares).await?;
@@ -126,22 +100,12 @@ impl RunningVm {
             started: Instant::now(),
         };
 
-        // Races opencode's port answering against the guest's M2
-        // rebuild-failure marker appearing — see `health::wait_for_ready`
-        // and `nix/base/configuration.nix`'s `gavmo-rebuild` service. On
-        // `Err`, `vm` is dropped here without calling `stop()`; its `Child`
-        // has `kill_on_drop` set (see `qemu::spawn_qemu`), so the qemu
-        // process is still torn down — the failure log on the host's
-        // `state_dir` is unaffected since it's written to disk, not held by
-        // the dying guest process.
+        // On `Err`, `vm` is dropped and `kill_on_drop` tears down qemu; the
+        // rebuild log is already on disk in `state_dir`.
         wait_for_ready(host_port, &marker_path, BOOT_HEALTH_TIMEOUT).await?;
 
-        // Best-effort: tell the guest's virtio-balloon driver to start
-        // reporting memory stats (see `qmp::guest_memory`/`app::VmStats`).
-        // Deliberately not `?` — a VM this fails for still boots and runs
-        // completely normally, it just never gets live memory stats (the
-        // control panel shows "—" for Memory instead of a number). Not
-        // worth failing an otherwise-healthy boot over a stats nicety.
+        // Best-effort: without balloon stats the VM runs fine, it just shows
+        // no live memory usage. Not worth failing a healthy boot over.
         let _ =
             qmp::set_balloon_stats_interval(&vm.cfg.qmp_socket_path(), BALLOON_STATS_INTERVAL_SECS)
                 .await;
@@ -184,7 +148,7 @@ impl RunningVm {
                     reason: format!("qemu exited: {exit:?}"),
                 };
             }
-            Ok(None) => {} // still running, continue checking
+            Ok(None) => {}
             Err(e) => {
                 return VmStatus::Failed {
                     reason: format!("failed to check qemu process: {e}"),
@@ -192,10 +156,8 @@ impl RunningVm {
             }
         }
 
-        // The qemu process is alive. Check whether QEMU itself reports the
-        // guest as running (vs. still in early boot) before trusting an
-        // OpenCode health probe — a missing/unresponsive QMP socket just
-        // means we're early in boot, not a failure.
+        // A missing or unresponsive QMP socket just means early boot, not
+        // a failure.
         let qmp_sock = self.cfg.qmp_socket_path();
         if qmp_sock.exists()
             && let Ok(info) = qmp::query_status(&qmp_sock).await
@@ -223,40 +185,30 @@ impl RunningVm {
         &self.cfg.workspace_id
     }
 
-    /// How long ago this VM's qemu process was spawned (see `started`'s
-    /// doc comment for why this is measured from spawn, not from first
-    /// becoming healthy).
+    /// How long ago this VM's qemu process was spawned (not when it first
+    /// became healthy).
     pub fn uptime(&self) -> Duration {
         self.started.elapsed()
     }
 
-    /// The host OS pid of the qemu process, for host-side resource stats
-    /// (see `crate::stats`). `None` only if the process has already exited
-    /// (per `tokio::process::Child::id`'s own doc comment) — in practice
-    /// this doesn't happen for a `RunningVm` still held by the caller
-    /// without `stop()` having been called, but isn't ruled out by the
-    /// type system either.
+    /// The host pid of the qemu process, for host-side resource stats.
+    /// `None` if the process has already exited.
     pub fn qemu_pid(&self) -> Option<u32> {
         self.qemu.id()
     }
 
-    /// Configured guest vCPU count — used by the stats panel to show CPU
-    /// usage against the configured core count.
+    /// Configured guest vCPU count.
     pub fn vcpus(&self) -> u32 {
         self.cfg.vcpus
     }
 
-    /// Path to this VM's QMP control socket, for the stats panel's
-    /// [`crate::qmp::guest_memory`] query. Public (unlike most of `cfg`)
-    /// specifically for that caller — `stop()`/`status()` above use
-    /// `self.cfg.qmp_socket_path()` directly since they're already methods
-    /// on this type.
+    /// Path to this VM's QMP control socket, for
+    /// [`crate::qmp::guest_memory`].
     pub fn qmp_socket_path(&self) -> std::path::PathBuf {
         self.cfg.qmp_socket_path()
     }
 
-    /// Path to this VM's persistent overlay disk, for the stats panel's
-    /// disk-size reading (see `crate::stats::file_size_or_zero`).
+    /// Path to this VM's persistent overlay disk.
     pub fn disk_path(&self) -> std::path::PathBuf {
         self.cfg.disk_path()
     }

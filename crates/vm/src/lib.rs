@@ -3,8 +3,7 @@
 //! This crate drives QEMU to boot, monitor, and stop the per-workspace
 //! NixOS VMs that run `opencode web`. It is pure mechanism: the GAVMO
 //! daemon owns port allocation, paths, and workspace identity and passes
-//! them in via [`VmConfig`]. See `plan.md` in this crate for the full
-//! design and the rationale behind each decision.
+//! them in via [`VmConfig`].
 
 mod config;
 mod disk;

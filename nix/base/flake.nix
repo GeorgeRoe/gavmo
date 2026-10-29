@@ -1,5 +1,5 @@
 {
-  description = "GAVMO base NixOS VM image (Milestone 0: plumbing proof)";
+  description = "GAVMO base NixOS VM image";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,10 +14,8 @@
     let
       system = "x86_64-linux";
 
-      # Shared between the host-built qcow image and the in-guest M2 rebuild
-      # target below, so "the repo's gavmo.nix merged onto the base" can never
-      # silently diverge from what the image itself ships. See
-      # `nix/spike-m2.md` for the full design rationale.
+      # Shared by the qcow image and the in-guest rebuild target so the rebuilt
+      # system can't diverge from what the image ships.
       commonModules = [ ./configuration.nix ];
     in
     {
@@ -27,25 +25,12 @@
         modules = commonModules;
       };
 
-      # --- M2: per-repo environment customization --------------------------
-      # The in-guest `nixos-rebuild` target. NOT built on the host - this is
-      # evaluated/built *inside* the running guest (see
-      # `systemd.services.gavmo-rebuild` in configuration.nix, once Phase 3
-      # lands), against this same flake baked into the image at
-      # /etc/gavmo/system.
-      #
-      # `./disk.nix` replicates the subset of `nixos-generators`' qcow format
-      # module (`formats/qcow.nix`) that matters for a *running* system
-      # (root fs, boot/grub, console) - deliberately NOT included in
-      # `commonModules` above, since `nixos-generators` already injects its
-      # own copy of those same options when building the image, and
-      # redefining e.g. `fileSystems."/".device` again here would conflict.
-      #
-      # The repo's `/workspace/gavmo.nix` is imported conditionally (it may
-      # not exist) via `builtins.pathExists`, which requires `--impure` at
-      # rebuild time - safe here because the VM is the trust boundary, same
-      # stance as the rest of this image's config (see `configuration.nix`'s
-      # OpenCode permission comments).
+      # In-guest `nixos-rebuild` target, built inside the running guest by
+      # gavmo-rebuild against this flake copied to /etc/gavmo/system.
+      # `./disk.nix` is not in `commonModules` because nixos-generators already
+      # sets those options for the image and redefining them would conflict.
+      # The optional repo `gavmo.nix` import needs `--impure`; acceptable since
+      # the VM is the trust boundary.
       nixosConfigurations.gavmo = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = commonModules ++ [

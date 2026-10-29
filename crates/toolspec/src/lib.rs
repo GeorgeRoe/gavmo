@@ -1,49 +1,32 @@
-//! GAVMO's tool-configuration schema + the host-lock URL math (see
-//! `gavmo-tools-config-plan.md`).
+//! Parsing and validation of the per-repo `gavmo.yaml` tool config, plus the
+//! URL math that keeps credentials on their integration's origin: [`lock_url`]
+//! (host-locking) and [`canonical_base_url`] (URL-binding).
 //!
-//! This crate is the shared, mostly-pure vocabulary for *what tools a workspace
-//! wants*:
-//!
-//! - [`GavmoConfig`] — the per-repo `gavmo.yaml`: an **untrusted** list of
-//!   inline tool requests. A repo can only *request* a tool and name a secret
-//!   reference; it can never supply the credential itself.
-//! - [`lock_url`] — the single security-relevant primitive: it resolves an
-//!   agent-supplied path against an integration's `base_url` and **refuses to
-//!   produce a URL on any other host/scheme/port**, so the host can never be
-//!   tricked into forwarding a credential to `evil.com`.
-//!
-//! `gavmo.yaml` is YAML (`serde_yaml`); GAVMO uses no TOML.
+//! `gavmo.yaml` is untrusted: a repo can request a tool and name a secret, but
+//! never supply a credential.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 use url::Url;
 
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
+// --- Schema ---
 
-/// The kind of tool an integration exposes. Exactly one: a generic,
-/// host-locked HTTP forwarder (`type: http`) — one type covers Jira, Supabase,
-/// etc. with zero per-service code. `deny_unknown`-free on purpose:
-/// an unknown `type` is caught by this enum's own deserialization error.
+/// The kind of tool an integration exposes. Unknown `type`s fail
+/// deserialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolKind {
-    /// Generic HTTP forwarder: the host prepends `base_url`, host-locks the
-    /// result (see [`lock_url`]), injects the credential per [`AuthScheme`], and
-    /// forwards the agent's method/path/body.
+    /// Generic HTTP forwarder: the host host-locks the agent's path to
+    /// `base_url`, attaches the credential, and forwards the request.
     Http,
 }
 
-/// How the host authenticates to the integration's endpoint. The credential
-/// value itself lives in the secret store (keyed by [`ToolDef::secret`]); this
-/// only says *how* to attach it.
+/// How the host attaches the credential stored under [`ToolDef::secret`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthScheme {
-    /// HTTP Basic. Credential value is a JSON `{username, password}` — e.g.
-    /// Jira Cloud's `email` + API token.
+    /// HTTP Basic. Credential value is a JSON `{username, password}`.
     Basic,
     /// `Authorization: Bearer <token>`. Credential value is the bare token.
     Bearer,
@@ -51,39 +34,34 @@ pub enum AuthScheme {
     Header,
 }
 
-/// A single integration definition: everything the host needs to forward a
-/// request *except* the secret value. Used by [`GavmoConfig`] inline tools,
-/// where the map key is the id.
+/// One integration: everything needed to forward a request except the secret.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ToolDef {
     #[serde(rename = "type")]
     pub kind: ToolKind,
-    /// The integration's root URL. Every forwarded request is host-locked to
-    /// this (scheme + host + port) — see [`lock_url`].
+    /// Every forwarded request is host-locked to this URL's origin.
     pub base_url: String,
     pub auth: AuthScheme,
-    /// The *name* of the secret the user must supply (a reference, not a value).
+    /// Name of the secret the user must supply (a reference, not a value).
     pub secret: String,
-    /// Required iff `auth == Header`: the header name to carry the token.
+    /// Required iff `auth == Header`.
     #[serde(default)]
     pub header_name: Option<String>,
-    /// Human-facing, optional. Surfaced in the control panel / tool description.
+    /// Shown in the control panel and tool description.
     #[serde(default)]
     pub description: Option<String>,
-    /// Human-facing setup help (e.g. "create a read-only PAT at …").
+    /// Setup help shown to the user.
     #[serde(default)]
     pub instructions: Option<String>,
-    /// Optional path the control panel's "Test" button should GET to verify the
-    /// credential (relative to `base_url`, e.g. `rest/api/3/myself` for Jira).
-    /// Defaults to `/` (a bare reachability check) when omitted.
+    /// Path (relative to `base_url`) the control panel's "Test" button GETs to
+    /// verify the credential; defaults to `/`.
     #[serde(default)]
     pub test_path: Option<String>,
 }
 
 impl ToolDef {
-    /// Checks the self-consistency the type system can't: a non-empty
-    /// `base_url` that is a valid http(s) URL with a host, and a `header_name`
-    /// present exactly when `auth == Header`.
+    /// Requires an http(s) `base_url` with a host, and a `header_name` when
+    /// `auth == Header`.
     pub fn validate(&self, id: &str) -> Result<(), ValidationError> {
         let url = Url::parse(&self.base_url).map_err(|e| ValidationError::BadBaseUrl {
             id: id.to_string(),
@@ -104,20 +82,17 @@ impl ToolDef {
     }
 }
 
-/// The per-repo `gavmo.yaml`. **Untrusted** (repo-controlled): it may only
-/// *request* a tool and name a secret reference, never supply a credential.
+/// The per-repo `gavmo.yaml` (untrusted).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct GavmoConfig {
-    /// Inline tool requests, keyed by id.
+    /// Tool requests, keyed by id.
     pub tools: HashMap<String, ToolDef>,
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors ---
 
-/// Schema-level problems found after a YAML document parses structurally.
+/// Problems found after a YAML document parses structurally.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
     #[error("tool {id:?} has an invalid base_url: {reason}")]
@@ -126,7 +101,6 @@ pub enum ValidationError {
     MissingHeaderName { id: String },
 }
 
-/// Anything that can go wrong turning YAML text into a validated schema value.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("YAML parse error: {0}")]
@@ -135,9 +109,7 @@ pub enum ParseError {
     Validation(#[from] ValidationError),
 }
 
-/// Why a request couldn't be host-locked to an integration's `base_url`. Every
-/// variant means "refuse to send" — these are the states that would otherwise
-/// leak a credential to the wrong place.
+/// Why a request couldn't be host-locked. Every variant means "refuse to send".
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum HostLockError {
     #[error("integration base_url is not a valid URL: {0}")]
@@ -152,9 +124,7 @@ pub enum HostLockError {
     HostMismatch { expected: String, requested: String },
 }
 
-// ---------------------------------------------------------------------------
-// Parsing
-// ---------------------------------------------------------------------------
+// --- Parsing ---
 
 /// Parses and validates a `gavmo.yaml` document.
 pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
@@ -165,35 +135,15 @@ pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
     Ok(config)
 }
 
-// ---------------------------------------------------------------------------
-// Host-lock (the one security-relevant primitive kept in v1)
-// ---------------------------------------------------------------------------
+// --- Host-lock ---
 
-/// Resolves an agent-supplied `path` against an integration's `base_url` and
-/// returns the full URL **only if it stays on the exact same scheme + host +
-/// port**. Any attempt to reach a different origin — an absolute URL, a
-/// scheme-relative `//other-host`, a different port — is rejected with
-/// [`HostLockError::HostMismatch`], so the host never forwards the credential
-/// off-origin.
+/// Resolves an agent-supplied `path` under `base_url` and returns it only if it
+/// stays on the same scheme, host and port; anything else is
+/// [`HostLockError::HostMismatch`], so credentials never leave the origin.
 ///
-/// `path` is always treated as **relative to `base_url`'s full path**, so a
-/// `base_url` with a path prefix (e.g. an Atlassian gateway base like
-/// `https://api.atlassian.com/ex/jira/<cloudId>`) is preserved rather than
-/// discarded. Two normalizations make that work against `Url::join`'s standard
-/// RFC-3986 resolution:
-///
-/// - the base's path is made to end in `/` (so `join` appends under it rather
-///   than replacing its last segment), and
-/// - a *single* leading `/` on `path` is stripped (so a caller writing
-///   `/rest/api/3/myself` means "under the base", not "from the host root").
-///
-/// The single-slash strip is deliberately **not** applied to a `//host` network-
-/// path reference: that form legitimately overrides the host and is exactly the
-/// cross-origin attack the host-lock check below must still catch (see the
-/// `lock_url_rejects_scheme_relative_other_host` test). Absolute URLs
-/// (`https://other/…`) are likewise left for the origin check to reject. So this
-/// normalization only ever changes which same-origin *path* is hit — never
-/// whether the origin check can be bypassed.
+/// `path` is relative to the base's full path, preserving prefixes such as
+/// `https://api.atlassian.com/ex/jira/<cloudId>`. `//host` and absolute URLs
+/// are deliberately not normalized, so the origin check still rejects them.
 pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
     let mut base =
         Url::parse(base_url).map_err(|e| HostLockError::InvalidBaseUrl(e.to_string()))?;
@@ -201,17 +151,14 @@ pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
         return Err(HostLockError::BaseUrlHasNoHost(base_url.to_string()));
     }
 
-    // Ensure the base path ends in `/` so `join` resolves `path` *under* it
-    // rather than replacing its final segment. Harmless for a root-only base
-    // (its path is already `/`).
+    // Without a trailing `/`, `join` replaces the base's last segment.
     if !base.path().ends_with('/') {
         let with_slash = format!("{}/", base.path());
         base.set_path(&with_slash);
     }
 
-    // Treat a single leading slash as "relative to the base path", not "from the
-    // host root". A `//host` network-path reference is left intact so the origin
-    // check still rejects it.
+    // A single leading `/` means "under the base", not "from the host root".
+    // `//host` is left intact so the origin check rejects it.
     let relative_path = if path.starts_with('/') && !path.starts_with("//") {
         &path[1..]
     } else {
@@ -222,8 +169,7 @@ pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
         .join(relative_path)
         .map_err(|e| HostLockError::InvalidResult(e.to_string()))?;
 
-    // Compare the full origin: scheme, host, and effective port. Using
-    // `port_or_known_default` means https default 443 == explicit :443.
+    // Effective port, so an implicit 443 equals an explicit `:443`.
     let same_origin = resolved.scheme() == base.scheme()
         && resolved.host_str() == base.host_str()
         && resolved.port_or_known_default() == base.port_or_known_default();
@@ -237,25 +183,9 @@ pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
     Ok(resolved)
 }
 
-/// Produces a stable, canonical string for an integration's `base_url`, used to
-/// **bind a stored credential to the exact destination it was approved for**
-/// (URL-binding — see `gavmo-tools-config-plan.md` §5).
-///
-/// The canonical form captures *everything that determines where a credential is
-/// sent* and nothing else: scheme, host, effective port, and the base path
-/// prefix — normalized so cosmetically-equal URLs compare equal (lowercased
-/// scheme/host, default ports made explicit so `https://h` == `https://h:443`,
-/// the path forced to end in `/` exactly as [`lock_url`] treats it), while a
-/// genuinely different destination (other host, other port, other tenant path
-/// like `/ex/jira/A/` vs `/ex/jira/B/`) compares different. Query and fragment
-/// are dropped — a `base_url` shouldn't carry them, and they don't change the
-/// endpoint a credential reaches.
-///
-/// Deliberately **does not** include `auth`, `header_name`, `description`, etc.:
-/// those change *how* a token is attached on-origin, not *where* it goes, so
-/// binding to them would only cause pointless re-prompts on a harmless edit. By
-/// reusing the same scheme/host/port/path normalization as [`lock_url`], binding
-/// and host-locking can never disagree about what "the same destination" means.
+/// Canonical form of a `base_url` (scheme, host, effective port, path prefix)
+/// that a stored credential is bound to. Normalized like [`lock_url`] so the two
+/// agree on "same destination"; other fields are excluded to avoid re-prompts.
 pub fn canonical_base_url(base_url: &str) -> Result<String, HostLockError> {
     let mut url = Url::parse(base_url).map_err(|e| HostLockError::InvalidBaseUrl(e.to_string()))?;
     let host = url
@@ -263,16 +193,13 @@ pub fn canonical_base_url(base_url: &str) -> Result<String, HostLockError> {
         .ok_or_else(|| HostLockError::BaseUrlHasNoHost(base_url.to_string()))?
         .to_ascii_lowercase();
 
-    // Match lock_url's "base path ends in /" treatment so a credential approved
-    // for `.../CLOUDID` and one for `.../CLOUDID/` are the same destination.
+    // Same trailing-slash treatment as `lock_url`.
     if !url.path().ends_with('/') {
         let with_slash = format!("{}/", url.path());
         url.set_path(&with_slash);
     }
 
     let scheme = url.scheme().to_ascii_lowercase();
-    // Effective port (explicit default == implicit default), so `https://h` and
-    // `https://h:443` bind identically.
     let port = url.port_or_known_default();
     let path = url.path();
 
@@ -282,8 +209,6 @@ pub fn canonical_base_url(base_url: &str) -> Result<String, HostLockError> {
     })
 }
 
-/// A compact "scheme://host:port" for error messages (best-effort; only used in
-/// the rejected path).
 fn origin_string(u: &Url) -> String {
     match (u.host_str(), u.port_or_known_default()) {
         (Some(h), Some(p)) => format!("{}://{h}:{p}", u.scheme()),
@@ -367,18 +292,16 @@ tools:
     auth: bearer
     secret: s
 "#;
-        // Unknown enum variant -> structural YAML/serde error.
         assert!(matches!(parse_config(yaml), Err(ParseError::Yaml(_))));
     }
 
     #[test]
     fn empty_gavmo_config_is_valid_and_default() {
-        // A repo with an empty gavmo.yaml requests nothing.
         let config = parse_config("{}\n").unwrap();
         assert!(config.tools.is_empty());
     }
 
-    // --- host-lock ---------------------------------------------------------
+    // --- Host-lock ---
 
     #[test]
     fn lock_url_allows_absolute_path_on_same_host() {
@@ -396,13 +319,12 @@ tools:
         assert_eq!(u.query(), Some("jql=project%3DABC"));
     }
 
-    // --- base_url with a path prefix (e.g. Atlassian gateway) ---------------
+    // --- Base URL with a path prefix ---
 
     const GATEWAY: &str = "https://api.atlassian.com/ex/jira/CLOUDID";
 
     #[test]
     fn lock_url_preserves_base_path_prefix_for_a_leading_slash_path() {
-        // The regression: a leading-slash path must NOT discard /ex/jira/CLOUDID.
         let u = lock_url(GATEWAY, "/rest/api/3/myself").unwrap();
         assert_eq!(
             u.as_str(),
@@ -421,7 +343,6 @@ tools:
 
     #[test]
     fn lock_url_handles_a_base_that_already_ends_in_slash() {
-        // No double slash, prefix still preserved.
         let u = lock_url("https://api.atlassian.com/ex/jira/CLOUDID/", "/rest/x").unwrap();
         assert_eq!(
             u.as_str(),
@@ -438,7 +359,6 @@ tools:
 
     #[test]
     fn lock_url_still_rejects_cross_host_even_with_a_base_path_prefix() {
-        // The normalization must not weaken the origin check for prefixed bases.
         assert!(matches!(
             lock_url(GATEWAY, "https://evil.com/steal").unwrap_err(),
             HostLockError::HostMismatch { .. }
@@ -475,8 +395,7 @@ tools:
 
     #[test]
     fn lock_url_rejects_userinfo_confusion() {
-        // A classic trick: "https://trusted.example.com@evil.com/..." — the real
-        // host is evil.com. The url crate parses this correctly; we must reject.
+        // The real host here is evil.com; the prefix is userinfo.
         let err = lock_url(
             "https://trusted.example.com",
             "https://trusted.example.com@evil.com/steal",
@@ -487,12 +406,11 @@ tools:
 
     #[test]
     fn lock_url_allows_explicit_default_port_match() {
-        // https://h:443 is the same origin as https://h.
         let u = lock_url("https://h.example.com", "https://h.example.com:443/x").unwrap();
         assert_eq!(u.host_str(), Some("h.example.com"));
     }
 
-    // --- canonical_base_url (URL-binding) ----------------------------------
+    // --- URL-binding ---
 
     #[test]
     fn canonical_base_url_is_stable_and_includes_the_path_prefix() {
@@ -504,8 +422,6 @@ tools:
 
     #[test]
     fn canonical_base_url_normalizes_cosmetic_differences_to_the_same_string() {
-        // Trailing slash, explicit default port, and host case must not matter —
-        // these are all the *same* destination and must not trigger a re-prompt.
         let a = canonical_base_url("https://Dafni.Atlassian.net").unwrap();
         let b = canonical_base_url("https://dafni.atlassian.net/").unwrap();
         let c = canonical_base_url("https://dafni.atlassian.net:443").unwrap();
@@ -515,7 +431,7 @@ tools:
 
     #[test]
     fn canonical_base_url_distinguishes_same_host_different_tenant_path() {
-        // The attack origin-only binding would miss: same host, different tenant.
+        // Origin-only binding would miss this.
         let good = canonical_base_url("https://api.atlassian.com/ex/jira/GOOD").unwrap();
         let evil = canonical_base_url("https://api.atlassian.com/ex/jira/EVIL").unwrap();
         assert_ne!(good, evil);
@@ -531,8 +447,6 @@ tools:
 
     #[test]
     fn canonical_base_url_drops_query_and_fragment() {
-        // A base_url shouldn't carry these, but if it does they don't change the
-        // destination a credential reaches, so they must not affect the binding.
         assert_eq!(
             canonical_base_url("https://h.example.com/base?x=1#frag").unwrap(),
             canonical_base_url("https://h.example.com/base").unwrap()

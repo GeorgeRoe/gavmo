@@ -1,26 +1,13 @@
-//! Host-side resource usage for a running VM, read from `/proc` on the
-//! host (not the guest — this is "how much of the host machine is this
-//! qemu process using", the same thing `top`/`htop` would show for its
-//! pid). Linux-only, consistent with the rest of this crate's KVM/`/proc`
-//! assumptions (see `qemu.rs`'s `#[cfg(target_os = "linux")]` KVM gating).
+//! Host-side resource usage of a VM's qemu process, read from the host's
+//! `/proc` (what `top` shows for its pid). Linux-only.
 //!
-//! Parsing is kept as small, pure functions (`parse_*`) so they're
-//! unit-testable against fixture strings without a real `/proc` or a real
-//! qemu process — matching this crate's existing testing convention (see
-//! `plan.md` §8: pure functions in the sidecar, real boots only on real
-//! hardware).
+//! Parsing lives in pure `parse_*` functions, tested against fixture strings.
 
 use std::io;
 use std::path::Path;
 
-/// One point-in-time reading of a process's cumulative CPU time plus the
-/// host's cumulative CPU time, used in pairs (see [`cpu_percent_per_core`])
-/// to compute a CPU percentage over the interval between two samples.
-/// Deliberately **not** interpreted as "CPU time in seconds" on its own —
-/// `proc_jiffies`/`total_jiffies` are in whatever units the kernel's
-/// `/proc` scheduler-tick counters use (conventionally 100/s, but never
-/// actually divided by that rate here — see [`cpu_percent_per_core`]'s doc
-/// comment for why that constant is never needed).
+/// One reading of a process's and the host's cumulative CPU time. CPU
+/// percent needs two samples; see [`cpu_percent_per_core`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcSample {
     /// This process's own (utime + stime), in kernel scheduler-tick units.
@@ -33,11 +20,8 @@ pub struct ProcSample {
     pub rss_bytes: u64,
 }
 
-/// Reads one [`ProcSample`] for `pid` from `/proc`. Returns an error if the
-/// process doesn't exist (including "exited between the caller looking it
-/// up and this call") or `/proc` is unparseable — callers on a localhost
-/// control panel are expected to treat either as "no stats this tick"
-/// rather than a hard failure (see `registry::AppState::vm_stats`).
+/// Reads one [`ProcSample`] for `pid` from `/proc`. Errors if the process
+/// is gone or `/proc` is unparseable; treat as "no stats this tick".
 pub fn sample(pid: u32) -> io::Result<ProcSample> {
     let proc_jiffies = parse_pid_stat_jiffies(&std::fs::read_to_string(format!(
         "/proc/{pid}/stat"
@@ -55,21 +39,11 @@ pub fn sample(pid: u32) -> io::Result<ProcSample> {
     })
 }
 
-/// Top-style CPU percentage over the interval between `prev` and `cur`
-/// (both sampled for the same pid, `prev` taken first): `0` means idle,
-/// `100` means one core fully busy, up to `ncpu * 100` if every core is
-/// saturated by this one process.
+/// Top-style CPU percentage between two samples of the same pid: `100`
+/// means one core fully busy, up to `ncpu * 100`.
 ///
-/// Computed as `(Δproc_jiffies / Δtotal_jiffies) * ncpu * 100` — note this
-/// never needs the kernel's actual tick rate (`sysconf(_SC_CLK_TCK)`,
-/// conventionally but not guaranteed to be 100): both deltas are in the
-/// same unknown-but-shared tick unit, which cancels out in the ratio.
-/// `ncpu` is read fresh from `cur` (it can't meaningfully change between
-/// two samples a fraction of a second apart on a running host).
-///
-/// Returns `0.0` for a zero or negative `total_jiffies` delta (clock
-/// anomaly, or `prev`/`cur` passed in the wrong order) rather than
-/// dividing by zero or going negative.
+/// Both deltas share the kernel's tick unit, so the tick rate cancels out.
+/// Returns `0.0` if `total_jiffies` didn't advance.
 pub fn cpu_percent_per_core(prev: ProcSample, cur: ProcSample) -> f32 {
     let total_delta = cur.total_jiffies.saturating_sub(prev.total_jiffies);
     if total_delta == 0 {
@@ -79,16 +53,10 @@ pub fn cpu_percent_per_core(prev: ProcSample, cur: ProcSample) -> f32 {
     (proc_delta as f64 / total_delta as f64 * cur.ncpu as f64 * 100.0) as f32
 }
 
-/// Parses `utime` (field 14) + `stime` (field 15) from the contents of
-/// `/proc/<pid>/stat`, in scheduler-tick units. Field indices per
-/// `proc_pid_stat(5)`.
+/// Parses `utime` (field 14) + `stime` (field 15) from `/proc/<pid>/stat`.
 ///
-/// Can't naively `split_whitespace()` the whole line: field 2 (`comm`, the
-/// executable name in parens) can itself contain spaces or even
-/// parentheses, e.g. `(qemu-system-x86_64)`. Instead, split off everything
-/// after the **last** `)` — `comm` is the only field that can contain `)`,
-/// so this is the robust way real tools (e.g. `procps`) parse this file —
-/// and index from there, 0-based, where index 0 is field 3 (`state`).
+/// `comm` (field 2) can contain spaces and `)`, so fields are split after
+/// the last `)`.
 fn parse_pid_stat_jiffies(contents: &str) -> io::Result<u64> {
     let after_comm = contents
         .rsplit_once(')')
@@ -112,9 +80,8 @@ fn parse_pid_stat_jiffies(contents: &str) -> io::Result<u64> {
     Ok(utime + stime)
 }
 
-/// Parses the aggregate `cpu` line (sum of all cores, same tick units as
-/// [`parse_pid_stat_jiffies`]) plus a count of `cpuN` lines (number of
-/// host CPUs) from the contents of `/proc/stat`.
+/// Parses the aggregate `cpu` line total and the number of `cpuN` lines
+/// from `/proc/stat`.
 fn parse_stat_total_and_ncpu(contents: &str) -> io::Result<(u64, u32)> {
     let mut total = None;
     let mut ncpu = 0u32;
@@ -136,8 +103,7 @@ fn parse_stat_total_and_ncpu(contents: &str) -> io::Result<(u64, u32)> {
     Ok((total, ncpu))
 }
 
-/// Parses `VmRSS` (in kB, per `proc_pid_status(5)`) from the contents of
-/// `/proc/<pid>/status`, converting to bytes.
+/// Parses `VmRSS` (kB) from `/proc/<pid>/status`, in bytes.
 fn parse_vmrss_bytes(contents: &str) -> io::Result<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
@@ -158,9 +124,8 @@ fn invalid_data(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// Size in bytes of a file (e.g. the VM's overlay disk), or `0` if it
-/// doesn't exist yet (a workspace that's never been booted). Any other
-/// error (permissions, etc.) is propagated.
+/// Size in bytes of a file (e.g. the overlay disk), or `0` if it doesn't
+/// exist yet. Other errors are propagated.
 pub fn file_size_or_zero(path: &Path) -> io::Result<u64> {
     match std::fs::metadata(path) {
         Ok(meta) => Ok(meta.len()),
@@ -173,14 +138,9 @@ pub fn file_size_or_zero(path: &Path) -> io::Result<u64> {
 mod tests {
     use super::*;
 
-    /// A real-shaped `/proc/<pid>/stat` line (comm has no spaces here, the
-    /// simple case).
     #[test]
     fn parse_pid_stat_jiffies_simple_comm() {
-        // state=S ppid=1 ... utime=1234 stime=56 (fields after ')': state
-        // is index 0, utime is index 11, stime is index 12). The fields
-        // vector below *includes* state at index 0, matching exactly what
-        // `parse_pid_stat_jiffies` indexes into after splitting on `)`.
+        // Fields after ')': state is index 0, utime 11, stime 12.
         let fields: Vec<String> = (0..52usize)
             .map(|i| match i {
                 0 => "S".to_string(),
@@ -193,9 +153,8 @@ mod tests {
         assert_eq!(parse_pid_stat_jiffies(&line).unwrap(), 1234 + 56);
     }
 
-    /// `comm` can itself contain spaces and parentheses (an adversarial but
-    /// real possibility per `proc_pid_stat(5)`) — parsing must split on the
-    /// *last* `)`, not the first.
+    /// `comm` can contain spaces and parentheses, so parsing must split on
+    /// the last `)`.
     #[test]
     fn parse_pid_stat_jiffies_comm_with_parens_and_spaces() {
         let fields: Vec<String> = (0..52usize)
@@ -216,7 +175,6 @@ mod tests {
         assert!(parse_pid_stat_jiffies("no parens here").is_err());
     }
 
-    /// A realistically-shaped 4-core `/proc/stat` snippet.
     #[test]
     fn parse_stat_total_and_ncpu_counts_cores_and_sums_aggregate() {
         let contents = "\
@@ -253,9 +211,8 @@ VmSize:   123456 kB
         assert!(parse_vmrss_bytes("VmPeak: 123 kB\n").is_err());
     }
 
-    /// The core of the CPU-percent math: a process that used 50 of the
-    /// 200-jiffy total delta across 4 cores should read as 100% (one core
-    /// fully busy) — `(50/200) * 4 * 100`.
+    /// 50 of a 200-jiffy total delta on 4 cores is one core fully busy:
+    /// `(50/200) * 4 * 100 = 100`.
     #[test]
     fn cpu_percent_per_core_computes_top_style_percentage() {
         let prev = ProcSample {

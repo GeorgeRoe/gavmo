@@ -10,9 +10,7 @@
   --warn: #f0b429;
   --err: #f05252;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  /* Square corners everywhere, deliberately - every `border-radius` in this
-   * file is pinned to this one variable (or set to `0` directly) so the
-   * whole UI stays consistently square with one place to change it. */
+  /* Shared corner radius; the UI is deliberately square. */
   --radius: 0;
 }
 
@@ -34,12 +32,8 @@ main {
   padding: 2rem 1.25rem 4rem;
 }
 
-/* --- Floating layout ---------------------------------------------------
- * No containing panel: the title/toolbar and every card sit directly on
- * `body`'s own background. Still square/flat (`--radius: 0` throughout,
- * no shadows) - "floating" here just means nothing draws a surrounding
- * frame or shares borders between elements; each piece stands on its own
- * with real gaps around it. */
+/* Layout */
+/* No containing frame: the toolbar and cards sit directly on the page. */
 .topbar {
   display: flex;
   align-items: center;
@@ -73,7 +67,7 @@ a {
   align-items: center;
 }
 
-/* --- Buttons --------------------------------------------------------- */
+/* Buttons */
 
 button {
   background: var(--panel);
@@ -122,8 +116,7 @@ button.danger:hover:not(:disabled) {
   white-space: nowrap;
 }
 
-/* --- Status badge - mono/uppercase/tracked, aihero's small-stat-label
- * treatment, reused here for live VM status. ------------------------- */
+/* Status badge */
 
 .badge {
   font-family: var(--mono);
@@ -154,12 +147,8 @@ button.danger:hover:not(:disabled) {
   margin: 0.5rem 0;
 }
 
-/* --- Workspace grid -----------------------------------------------------
- * Floating cards: each is its own standalone square box (full border, not
- * a shared/collapsed hairline), with a real `gap` between them instead of
- * edges touching. Still flat - no shadow, no radius - "floating" here
- * just means every card stands on its own against `body`'s background
- * rather than tiling edge-to-edge inside a frame. */
+/* Workspace grid */
+/* Each card is a standalone bordered box with a gap, not a shared hairline. */
 .ws-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -215,10 +204,8 @@ button.danger:hover:not(:disabled) {
   border-top: 1px solid var(--border);
 }
 
-/* --- Folder browser -----------------------------------------------------
- * Lives inside a `Modal`'s `.modal-body`, which already supplies the
- * panel's padding/border - no separate bordered box needed on top of
- * that. */
+/* Folder browser */
+/* No own border: `.modal-body` already supplies the panel. */
 .browser {
   display: flex;
   flex-direction: column;
@@ -275,7 +262,7 @@ button.danger:hover:not(:disabled) {
   background: var(--border);
 }
 
-/* --- M2 build-log viewer ------------------------------------------------ */
+/* Build log viewer */
 
 .build-log-panel {
   background: var(--bg);
@@ -285,22 +272,9 @@ button.danger:hover:not(:disabled) {
   margin-top: 0.75rem;
 }
 
-/* --- Modal: backdrop + panel ---------------------------------------------
- * A dimmed backdrop plus a centered, standalone square panel - same flat
- * aesthetic as everything else (`--radius: 0`, a plain 1px border, no
- * shadow).
- *
- * Two different open/close motions share this one panel style:
- *  - The workspace detail modal has a real card to morph from, so its
- *    motion is the browser's native View Transition - the card itself
- *    grows into this exact box (see `app.rs`'s `vt_name`/
- *    `start_view_transition` and the `::view-transition-*` rules below).
- *    No CSS mount animation is applied to it directly - the morph *is*
- *    the animation.
- *  - The "add workspace" folder picker has no card to morph from, so it
- *    keeps a plain CSS mount animation instead (`.modal--plain`, using the
- *    `modal-glide` keyframe below) - a stylized open, not a pixel-exact
- *    grow from anything. */
+/* Modal */
+/* The workspace modal animates via the native View Transition morph from its
+ * card; the folder picker has no card, so it uses `.modal--plain` instead. */
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -383,11 +357,8 @@ button.danger:hover:not(:disabled) {
     animation: none;
   }
 
-  /* Belt-and-suspenders for the native morph itself: `start_view_transition`
-   * doesn't check `prefers-reduced-motion` in JS, so this is what actually
-   * disables the card<->modal grow/shrink animation for users who've asked
-   * for reduced motion - the DOM update still happens (instantly), just
-   * without the transition's own generated animation. */
+  /* The JS doesn't check reduced motion, so this is what disables the
+   * card <-> modal morph; the DOM still updates instantly. */
   ::view-transition-group(*),
   ::view-transition-old(*),
   ::view-transition-new(*) {
@@ -405,14 +376,8 @@ button.danger:hover:not(:disabled) {
   word-break: break-word;
 }
 
-/* --- Live boot console ---------------------------------------------------
- * Shown in a booting workspace's modal while systemd/the kernel boots - see
- * `app.rs`'s `WorkspaceModal` (`read_console_log` poll) and
- * `registry::sanitize_console` (which strips the raw serial capture's ANSI
- * escapes down to this plain text). A near-black background (rather than
- * `.build-log-panel`'s neutral `--bg`) gives it a distinct "live terminal"
- * feel from the static build-log viewer, even though both are plain
- * monochrome text. */
+/* Boot console */
+/* Near-black, unlike the build log's `--bg`, to read as a live terminal. */
 .console-panel {
   background: #0b0d10;
   border: 1px solid var(--border);
@@ -433,11 +398,7 @@ button.danger:hover:not(:disabled) {
   word-break: break-word;
 }
 
-/* --- Live host-side stats -------------------------------------------------
- * Shown in a running workspace's modal - see `app.rs`'s `WorkspaceModal`
- * (`poll_vm_stats` poll) and `registry::AppState::vm_stats`. Same bordered-
- * box language as `.build-log-panel`/`.console-panel`, but a row-based
- * layout (label / bar / value) rather than a block of monospace text. */
+/* VM stats */
 .stats-panel {
   display: flex;
   flex-direction: column;
@@ -456,8 +417,7 @@ button.danger:hover:not(:disabled) {
   gap: 0.6rem;
 }
 
-/* Rows with no bar (uptime/disk/port) - just a label/value pair, still
- * aligned to the same label column as the bar rows above them. */
+/* Bar-less rows (uptime/disk/port) keep the same label column. */
 .stat-row--plain {
   grid-template-columns: 4.5rem auto;
 }
@@ -488,10 +448,7 @@ button.danger:hover:not(:disabled) {
   background: var(--accent);
 }
 
-/* --- Tools panel (V1.5) -------------------------------------------------
- * Lives at the bottom of the workspace detail modal. Same flat, square,
- * bordered-box language as `.build-log-panel`/`.stats-panel`; each requested
- * tool is its own sub-box with an inline credential form. */
+/* Tools panel */
 .tools-panel {
   margin-top: 0.75rem;
   padding-top: 0.75rem;

@@ -5,13 +5,9 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-# serde_yaml 0.9 is in maintenance-only mode upstream but is still the de-facto
-# YAML<->serde bridge and has no known issues for our simple schema. If it ever
-# needs replacing, `serde_yaml_ng` is a drop-in fork — the swap is confined to
-# this crate's `parse_*` functions.
+# Maintenance-only upstream but fine for our schema; `serde_yaml_ng` is a
+# drop-in fork if it ever needs replacing.
 serde_yaml = "0.9"
 thiserror = "2"
-# Used only for the host-lock URL math (`lock_url`) — robust, spec-compliant
-# parsing is exactly what makes the "reject any other host" guarantee trustworthy
-# rather than hand-rolled string prefixing an attacker could sidestep.
+# Spec-compliant parsing for host-lock checks; string prefixing is bypassable.
 url = "2"

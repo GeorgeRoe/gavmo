@@ -1,32 +1,16 @@
-//! Resolving a workspace's enabled tool integrations from its `gavmo.yaml` and
-//! the host secret store (see `gavmo-tools-config-plan.md`).
+//! Policy layer between a workspace's untrusted `gavmo.yaml`, the host secret
+//! store, and the MCP gateway's tool interface.
 //!
-//! This module is the daemon's *policy* layer between the untrusted repo config
-//! (`toolspec::GavmoConfig`), the secret store (`secrets::SecretStore`), and the
-//! transport-neutral tool interface the gateway consumes (`mcp::ToolDescriptor`
-//! / `mcp::ToolOutcome`).
-//!
-//! ## What "enabled" means
-//!
-//! A tool is advertised to the agent only when **both** the repo requests it
-//! (declared inline under `gavmo.yaml`'s `tools:` map) **and** the user has
-//! configured its secret on the host (stored under the workspace's secret key).
-//!
-//! Advertising only configured tools means the agent never sees a tool it can't
-//! actually use for lack of credentials.
-//!
-//! [`forward`] performs the real HTTP call: it host-locks the URL (via
-//! [`toolspec::lock_url`]), injects the configured credential, forwards any
-//! method, and returns a size-capped response.
+//! A tool is advertised only when the repo requests it and the user has
+//! stored its credential. Each credential is bound to the destination URL it
+//! was approved for, and [`forward`] host-locks every request to that origin.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use toolspec::{AuthScheme, GavmoConfig, ToolDef};
 
-/// Hard cap on how much of a tool response is returned to the agent. A read-only
-/// API can still return large payloads (big JQL result sets, long issue
-/// histories); capping keeps a single tool call from flooding the model's
-/// context. Chosen generous enough for normal reads, small enough to bound cost.
+/// Cap on a tool response returned to the agent, so one call cannot flood
+/// the model's context.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Shape of a stored Basic-auth credential (e.g. Jira Cloud: `email` as
@@ -37,49 +21,37 @@ struct BasicCredential {
     password: String,
 }
 
-/// Shape of a stored single-token credential (Bearer / custom header). Stored as
-/// `{"token": "…"}`, but [`token_from_secret`] also accepts a bare string for
-/// robustness.
+/// Shape of a stored single-token credential (Bearer / custom header):
+/// `{"token": "..."}`.
 #[derive(Debug, Deserialize)]
 struct TokenCredential {
     token: String,
 }
 
-/// The envelope actually written to the secret store: the credential plus the
-/// **canonical `base_url` it was approved for** (URL-binding — see
-/// `gavmo-tools-config-plan.md` §5). Binding the destination *into the stored
-/// value* means a credential is only ever released to the exact URL the user saw
-/// and approved; a repo quietly changing `base_url` afterward fails closed.
-///
-/// `credential` holds the raw inner JSON (`{"username","password"}` or
-/// `{"token"}`) as a string, so the existing [`BasicCredential`]/[`TokenCredential`]
-/// parsing is unchanged once the envelope is peeled off.
+/// Envelope written to the secret store: the credential plus the canonical
+/// `base_url` it was approved for. If the repo's `base_url` changes, the
+/// credential is not released (fails closed).
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredSecret {
-    /// The canonical base_url (see [`toolspec::canonical_base_url`]) this
-    /// credential was approved for.
+    /// Canonical base URL (see [`toolspec::canonical_base_url`]).
     bound_url: String,
-    /// The inner credential JSON, exactly as the forwarder's credential structs
-    /// expect it.
+    /// Inner credential JSON.
     credential: String,
 }
 
-/// Result of peeling the stored envelope: the credential JSON plus the URL it was
-/// bound to (`None` for a legacy/plain value with no envelope).
+/// A stored secret with its envelope removed.
 pub struct ParsedSecret {
-    /// The canonical URL the credential was approved for, or `None` if the stored
-    /// value predates URL-binding (a bare credential with no envelope).
+    /// The URL the credential was approved for; `None` if the stored value
+    /// has no envelope.
     pub bound_url: Option<String>,
     /// The inner credential JSON to hand to [`apply_auth`].
     pub credential: String,
 }
 
-/// Wraps a credential JSON with the canonical URL it's approved for, producing
-/// the string actually stored in the vault. Saving a secret *is* the user's
-/// approval of `canonical_url` (the control panel shows the destination first).
+/// Wraps a credential with the URL it is approved for. Saving a secret is the
+/// user's approval of `canonical_url` (the control panel shows it first).
 pub fn wrap_stored_secret(canonical_url: &str, credential_json: &str) -> String {
-    // Infallible shape (two strings) — `to_string` can't realistically fail, but
-    // fall back to the bare credential rather than panicking if it somehow does.
+    // Cannot realistically fail; the bare fallback is treated as unbound.
     serde_json::to_string(&StoredSecret {
         bound_url: canonical_url.to_string(),
         credential: credential_json.to_string(),
@@ -87,11 +59,8 @@ pub fn wrap_stored_secret(canonical_url: &str, credential_json: &str) -> String 
     .unwrap_or_else(|_| credential_json.to_string())
 }
 
-/// Peels the stored envelope. A value written by [`wrap_stored_secret`] yields
-/// its `bound_url` + inner credential; any *other* shape (a bare credential from
-/// before URL-binding, or hand-written store contents) is treated as **unbound**
-/// — `bound_url: None` — so the release-time check forces a re-approval rather
-/// than trusting an unbound value.
+/// Removes the stored envelope. Any other shape is treated as unbound
+/// (`bound_url: None`), which forces re-approval before release.
 pub fn parse_stored_secret(raw: &str) -> ParsedSecret {
     match serde_json::from_str::<StoredSecret>(raw) {
         Ok(env) => ParsedSecret {
@@ -105,25 +74,20 @@ pub fn parse_stored_secret(raw: &str) -> ParsedSecret {
     }
 }
 
-/// A tool's credential state, as the control panel and boot-time resolution both
-/// see it. The URL-binding tri-state (see `gavmo-tools-config-plan.md` §5).
+/// A tool's credential state with respect to URL binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingState {
-    /// No credential stored — the user hasn't configured this tool.
+    /// No credential stored.
     NotConfigured,
-    /// A credential is stored and bound to the tool's *current* `base_url`.
+    /// Credential stored and bound to the tool's current `base_url`.
     Configured,
-    /// A credential is stored but bound to a *different* destination than the
-    /// tool now declares (the repo changed `base_url`, or the value predates
-    /// URL-binding). Carries the URL it *was* approved for so the UI can show
-    /// "was X, now Y"; `None` means an unbound/legacy value.
+    /// Credential bound to a different destination than the tool now declares.
+    /// `bound_url` lets the UI show "was X, now Y"; `None` means unbound.
     DestinationChanged { bound_url: Option<String> },
 }
 
-/// Classifies a tool's binding state from its *current* `base_url` and the raw
-/// stored secret value (`None` if nothing is stored). Pure — the single source of
-/// truth shared by boot-time resolution (which enables only `Configured` tools)
-/// and the control-panel listing (which surfaces `DestinationChanged`).
+/// Classifies a tool's binding state from its current `base_url` and the raw
+/// stored value. Shared by boot-time resolution and the control panel.
 pub fn classify_binding(current_base_url: &str, stored_value: Option<&str>) -> BindingState {
     let Some(raw) = stored_value else {
         return BindingState::NotConfigured;
@@ -137,25 +101,19 @@ pub fn classify_binding(current_base_url: &str, stored_value: Option<&str>) -> B
     }
 }
 
-/// A tool the daemon has decided to expose for a workspace: its id, the full
-/// definition (base_url, auth, etc.), and the *key* under which its credential
-/// lives in the secret store (resolved to a value lazily, at call time).
+/// A tool exposed for a workspace. The credential is looked up by
+/// `secret_key` lazily, at call time.
 #[derive(Debug, Clone)]
 pub struct ResolvedIntegration {
-    /// Stable id; also the name the agent calls the tool by.
+    /// Stable id; also the tool name the agent calls.
     pub id: String,
-    /// The integration's definition (kind, base_url, auth scheme, secret ref…).
     pub def: ToolDef,
     /// The composed [`secrets::secret_key`] for this integration's credential.
     pub secret_key: String,
 }
 
-/// A tool a repo *requests*, paired with its resolved secret-store key, but
-/// **without** consulting the secret store — purely structural. Whether its
-/// credential is actually configured is a separate, store-touching question the
-/// caller answers (via [`crate::registry::AppState`]'s batched, `spawn_blocking`
-/// presence check), deliberately kept out of this pure layer so no keyring call
-/// ever happens on an async worker thread.
+/// A tool a repo requests, with its secret key but without touching the
+/// store, so no blocking keyring call happens on an async worker thread.
 #[derive(Debug, Clone)]
 pub struct CandidateTool {
     pub id: String,
@@ -175,10 +133,7 @@ impl CandidateTool {
     }
 }
 
-/// A [`CandidateTool`] plus whether its credential is currently configured. The
-/// control panel's view (unlike [`ResolvedIntegration`], which is only the
-/// configured/enabled subset the gateway actually exposes). Produced by the pure
-/// [`requested_tools`] for unit testing.
+/// A [`CandidateTool`] plus whether its credential is configured.
 #[derive(Debug, Clone)]
 pub struct RequestedTool {
     pub id: String,
@@ -190,8 +145,7 @@ pub struct RequestedTool {
 }
 
 impl RequestedTool {
-    /// Narrows to the gateway-facing [`ResolvedIntegration`] (dropping the
-    /// control-panel-only `configured` field).
+    /// Narrows to the gateway-facing [`ResolvedIntegration`].
     pub fn into_resolved(self) -> ResolvedIntegration {
         ResolvedIntegration {
             id: self.id,
@@ -201,10 +155,7 @@ impl RequestedTool {
     }
 }
 
-/// Pure, **store-free** enumeration of every tool a repo requests (the inline
-/// `tools:` map), each with its resolved secret key. The single source of truth
-/// for the structure of a workspace's tools; configured-or-not is decided
-/// separately by the caller so no keyring access happens here.
+/// Every tool the repo requests, with its secret key. Store-free.
 pub fn candidate_tools(workspace_id: &str, config: &GavmoConfig) -> Vec<CandidateTool> {
     config
         .tools
@@ -217,10 +168,7 @@ pub fn candidate_tools(workspace_id: &str, config: &GavmoConfig) -> Vec<Candidat
         .collect()
 }
 
-/// Pure enumeration of requested tools, each tagged with whether its secret is
-/// configured per the `has_secret` predicate. Unit-testable without a live
-/// keystore; the daemon's real resolution path uses [`candidate_tools`] + a
-/// batched async presence check instead (see [`crate::registry::AppState`]).
+/// Requested tools tagged as configured per `has_secret`.
 pub fn requested_tools(
     workspace_id: &str,
     config: &GavmoConfig,
@@ -237,9 +185,7 @@ pub fn requested_tools(
         .collect()
 }
 
-/// The *enabled* subset of [`requested_tools`]: only tools whose credential is
-/// configured, narrowed to the gateway-facing [`ResolvedIntegration`]. This is
-/// what the gateway actually advertises/dispatches.
+/// The enabled (configured) subset of [`requested_tools`].
 pub fn select_integrations(
     workspace_id: &str,
     config: &GavmoConfig,
@@ -252,10 +198,8 @@ pub fn select_integrations(
         .collect()
 }
 
-/// Reads and parses a workspace's `gavmo.yaml`. A missing file is normal (the
-/// repo requests nothing) and yields an empty config; a *present but invalid*
-/// file is logged and also treated as empty, so a malformed repo config can
-/// never crash a boot — it just enables no tools.
+/// Reads a workspace's `gavmo.yaml`. Missing or invalid files yield an empty
+/// config, so a malformed repo config never breaks a boot.
 pub async fn read_config(workspace_path: &str) -> GavmoConfig {
     let path = std::path::Path::new(workspace_path).join("gavmo.yaml");
     match tokio::fs::read_to_string(&path).await {
@@ -266,24 +210,18 @@ pub async fn read_config(workspace_path: &str) -> GavmoConfig {
                 GavmoConfig::default()
             }
         },
-        // Missing file (or unreadable) -> no requested tools.
         Err(_) => GavmoConfig::default(),
     }
 }
 
-/// Resolves a workspace's requested tools structurally by enumerating
-/// [`candidate_tools`]. **Touches no secret store** — the caller decides which
-/// candidates are configured via a batched, `spawn_blocking` presence check (see
-/// [`crate::registry::AppState`]). Keeping the keyring out of this async fn is
-/// what prevents a blocking D-Bus call from landing on a tokio worker thread.
+/// Resolves requested tools without touching the secret store; the caller
+/// checks presence off the async runtime (keyring calls block on D-Bus).
 pub fn resolve_candidates(workspace_id: &str, config: &GavmoConfig) -> Vec<CandidateTool> {
     candidate_tools(workspace_id, config)
 }
 
-/// Builds the gateway tool descriptor for an integration: one generic
-/// host-locked HTTP forwarder named after the integration id. The agent supplies
-/// `method` + `path` (+ optional `body`); the host prepends `base_url`,
-/// host-locks the result, and (from V1.4) attaches the credential.
+/// Builds the gateway descriptor: a host-locked HTTP forwarder named after
+/// the integration id, taking `method`, `path` and optional `body`.
 pub fn integration_tool_descriptor(integration: &ResolvedIntegration) -> mcp::ToolDescriptor {
     let base = &integration.def.base_url;
     let summary = integration
@@ -337,18 +275,10 @@ pub fn integration_tool_descriptor(integration: &ResolvedIntegration) -> mcp::To
     }
 }
 
-/// Forwards an agent-requested HTTP call to an integration's host, with the
-/// configured credential attached (V1.4).
+/// Forwards an agent-requested HTTP call with the credential attached.
 ///
-/// Order of checks is deliberate — the cheap, local rejections happen before any
-/// network I/O: argument validation, **host-lock** (the credential never leaves
-/// the integration's own origin), method parsing, credential presence, and
-/// **URL-binding** (the credential is only released to the exact destination it
-/// was approved for — see [`check_binding`]). Only then is the request built and
-/// sent via the shared `client`. The response is returned with its status line
-/// and a size-capped body; a non-2xx status comes back as a tool-level error (the
-/// agent still sees the body) so a failed read is visibly distinct from a
-/// successful one.
+/// All rejections (args, host-lock, method, credential, URL binding) happen
+/// before network I/O. Non-2xx responses are returned as tool errors.
 pub async fn forward(
     integration: &ResolvedIntegration,
     secret_value: Option<String>,
@@ -361,7 +291,7 @@ pub async fn forward(
     };
     let body = args.get("body").and_then(Value::as_str).map(str::to_string);
 
-    // Host-lock: refuse to send anywhere but the integration's own origin.
+    // Never send the credential anywhere but the integration's own origin.
     let url = match toolspec::lock_url(&integration.def.base_url, path) {
         Ok(url) => url,
         Err(e) => return mcp::ToolOutcome::Error(format!("request blocked by host-lock: {e}")),
@@ -379,11 +309,8 @@ pub async fn forward(
         ));
     };
 
-    // URL-binding: release the credential only to the destination it was approved
-    // for. This is the hard security boundary — the UI's warning is just UX; a
-    // repo that changed `base_url` after a credential was saved (or a value with
-    // no binding at all) fails closed *here*, regardless of what any VM was told
-    // at boot.
+    // The hard security boundary (the UI warning is only UX): release the
+    // credential only to the destination it was approved for.
     let parsed = parse_stored_secret(&secret_value);
     if let Err(message) = check_binding(&integration.def.base_url, parsed.bound_url.as_deref()) {
         return mcp::ToolOutcome::Error(message);
@@ -422,17 +349,9 @@ pub async fn forward(
     }
 }
 
-/// Checks that a stored credential's bound URL still matches the integration's
-/// *current* `base_url` (URL-binding enforcement). `Ok(())` to release; `Err` with
-/// an agent-visible message to refuse.
-///
-/// Fails closed on three cases: an unbound value (`bound_url == None` — a legacy
-/// credential from before URL-binding, or a tampered store entry), a current
-/// `base_url` that no longer canonicalizes (shouldn't happen for a validated
-/// config, but refuse rather than guess), and a genuine mismatch (the repo
-/// changed where the token would go). The message names both the approved and the
-/// current destination so the agent — and, surfaced via the UI, the user —
-/// can see exactly what changed.
+/// Checks that a credential's bound URL matches the integration's current
+/// `base_url`. Fails closed on unbound values, uncanonicalizable URLs and
+/// mismatches; the error names both destinations.
 pub fn check_binding(current_base_url: &str, bound_url: Option<&str>) -> Result<(), String> {
     let current = toolspec::canonical_base_url(current_base_url).map_err(|e| {
         format!("integration base_url could not be canonicalized for binding check: {e}")
@@ -451,9 +370,8 @@ pub fn check_binding(current_base_url: &str, bound_url: Option<&str>) -> Result<
     }
 }
 
-/// Attaches the configured credential to a request per its auth scheme. Returns
-/// `Err` with an agent-visible message if the stored secret isn't the shape the
-/// scheme expects (e.g. Basic auth without a `username`/`password` object).
+/// Attaches the credential per its auth scheme. Errs if the secret is not
+/// the shape the scheme expects.
 fn apply_auth(
     request: reqwest::RequestBuilder,
     scheme: AuthScheme,
@@ -470,8 +388,7 @@ fn apply_auth(
         }
         AuthScheme::Bearer => Ok(request.bearer_auth(token_from_secret(secret_value))),
         AuthScheme::Header => {
-            // `header_name` presence is validated at parse time (see
-            // `ToolDef::validate`), but guard defensively rather than unwrap.
+            // Validated at parse time; guard rather than unwrap.
             let name =
                 header_name.ok_or_else(|| "header auth is missing its header_name".to_string())?;
             Ok(request.header(name, token_from_secret(secret_value)))
@@ -479,9 +396,7 @@ fn apply_auth(
     }
 }
 
-/// Extracts a single token from a stored secret, accepting either the canonical
-/// `{"token":"…"}` JSON or a bare token string (robustness against either shape
-/// the UI might write).
+/// Extracts a token from `{"token":"..."}` JSON or a bare token string.
 fn token_from_secret(secret_value: &str) -> String {
     match serde_json::from_str::<TokenCredential>(secret_value) {
         Ok(cred) => cred.token,
@@ -489,8 +404,7 @@ fn token_from_secret(secret_value: &str) -> String {
     }
 }
 
-/// Truncates a response body to [`MAX_RESPONSE_BYTES`] on a UTF-8 char boundary,
-/// appending a visible truncation notice. Returns the text unchanged if small.
+/// Truncates to [`MAX_RESPONSE_BYTES`] on a char boundary, with a notice.
 fn cap_response(text: &str) -> String {
     if text.len() <= MAX_RESPONSE_BYTES {
         return text.to_string();
@@ -523,7 +437,7 @@ tools:
         toolspec::parse_config(JIRA_CONFIG).unwrap()
     }
 
-    /// Helper: a MemoryStore with the jira secret already configured for `/ws`.
+    /// A MemoryStore with the jira secret configured for `workspace_id`.
     fn store_with_secret(workspace_id: &str) -> MemoryStore {
         let store = MemoryStore::new();
         let key = secrets::secret_key(workspace_id, "jira-cred");
@@ -625,13 +539,7 @@ tools:
         serde_json::from_value(json).unwrap()
     }
 
-    // --- forward() pre-network rejections (no server needed) ----------------
-    //
-    // These exercise the branches that must return *before* any HTTP I/O. The
-    // actual on-the-wire send (success path, auth header on the real request,
-    // response capping) is covered by `apply_auth`/`cap_response` unit tests
-    // below plus the hardware gate — same split as P4.0 (see
-    // `crates/mcp/plan.md` testing strategy).
+    // --- forward() pre-network rejections ---
 
     #[tokio::test]
     async fn forward_blocks_a_cross_host_path_before_sending() {
@@ -684,7 +592,7 @@ tools:
         }
     }
 
-    // --- URL-binding --------------------------------------------------------
+    // --- URL binding ---
 
     /// A properly-bound Basic credential for the jira integration's own base_url.
     fn bound_jira_secret() -> String {
@@ -702,7 +610,7 @@ tools:
 
     #[test]
     fn parse_stored_secret_treats_a_bare_credential_as_unbound() {
-        // A legacy value (pre-URL-binding) has no envelope -> unbound.
+        // No envelope -> unbound.
         let parsed = parse_stored_secret(r#"{"username":"a","password":"b"}"#);
         assert!(parsed.bound_url.is_none());
         assert_eq!(parsed.credential, r#"{"username":"a","password":"b"}"#);
@@ -754,7 +662,7 @@ tools:
     async fn forward_rejects_an_unbound_legacy_credential() {
         let outcome = forward(
             &jira_integration(),
-            // A bare credential with no envelope (pre-binding).
+            // Bare credential, no envelope.
             Some(r#"{"username":"a@b.c","password":"t"}"#.to_string()),
             &args(serde_json::json!({"method": "GET", "path": "/rest/api/3/myself"})),
             &reqwest::Client::new(),
@@ -801,9 +709,7 @@ tools:
 
     #[test]
     fn a_bound_secret_for_the_integration_passes_its_own_binding_check() {
-        // The credential `set_tool_secret` writes (bound to the integration's own
-        // canonical base_url) must clear `check_binding` against that same tool —
-        // the no-false-reject guarantee, hermetically (no network).
+        // A credential bound to the tool's own base_url must never be rejected.
         let integration = jira_integration();
         let parsed = parse_stored_secret(&bound_jira_secret());
         assert!(
@@ -812,7 +718,7 @@ tools:
         );
     }
 
-    // --- auth injection (build the request and inspect it, no network) ------
+    // --- Auth injection ---
 
     fn built_request(
         scheme: AuthScheme,
@@ -885,11 +791,9 @@ tools:
 
     #[test]
     fn cap_response_truncation_never_splits_a_multibyte_char() {
-        // A body of multibyte chars whose byte length exceeds the cap; the cut
-        // must land on a char boundary (no panic, valid UTF-8 out).
+        // Slicing off a char boundary would panic.
         let big = "é".repeat(MAX_RESPONSE_BYTES); // 2 bytes each
         let capped = cap_response(&big);
         assert!(capped.contains("truncated"));
-        // If this didn't panic and produced a String, UTF-8 is intact.
     }
 }

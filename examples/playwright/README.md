@@ -29,13 +29,6 @@ Two files, both copied/merged into your repo root:
    is simply new, not an override of anything managed).
 3. Reboot the VM so `gavmo-rebuild` picks up the new `gavmo.nix`.
 
-See the comments at the top of [`gavmo.nix`](./gavmo.nix) for exactly how it
-works, including why version-matching works differently here than a plain
-Playwright CLI install would (short version: `@playwright/mcp` never pins a
-stable `playwright-core` release, so the recipe points it at the Nix
-Chromium binary directly via `PLAYWRIGHT_MCP_EXECUTABLE_PATH` instead of
-trying to match versions).
-
 ## Where it actually runs
 
 opencode itself runs *inside* the GAVMO VM (the `gavmo-opencode` service). A
@@ -44,6 +37,29 @@ so the Playwright MCP server **and** the Chromium it drives run entirely
 inside the VM, as the same unprivileged `agent` user, under the same systemd
 sandbox as everything else the agent does. Nothing new is exposed on the
 host, and no extra port is opened.
+
+## How it works
+
+- **Browsers come from Nix** (`pkgs.playwright-driver.browsers`), prebuilt
+  and patched for NixOS. A plain `npx playwright install` downloads
+  unpatched binaries that fail to exec on NixOS (missing dynamic linker
+  paths).
+- **Version matching.** `@playwright/mcp` always tracks an alpha/nightly
+  `playwright-core`, so no npm release of it will ever match the stable
+  `pkgs.playwright-driver.version`. Instead of matching versions, the recipe
+  sets `PLAYWRIGHT_MCP_EXECUTABLE_PATH` to the exact Nix-built Chromium
+  binary, so Playwright launches it directly rather than looking it up by
+  revision. `@playwright/mcp` is still pinned in `gavmo.nix`, purely so a boot
+  doesn't silently pick up a new release; bump it independently of nixpkgs.
+- **The MCP server is installed with `npm` at boot** into
+  `/home/agent/.npm-global` and put on `PATH` with a wrapper, following the
+  main README's "Installing tools from outside Nix" pattern.
+- **`--no-sandbox` and `--headless`** (in `opencode.json`). Chromium's own
+  sandbox can't initialize under GAVMO's default systemd sandbox for
+  `gavmo-opencode` (`NoNewPrivileges`, `RestrictNamespaces`, an empty
+  `CapabilityBoundingSet`). Disabling Chromium's sandbox instead of loosening
+  the agent's keeps the agent isolated, and the VM itself is the real security
+  boundary. The VM has no display, hence `--headless`.
 
 ## Using it
 
@@ -55,7 +71,7 @@ the browser tools directly rather than writing a script, e.g.:
 > take a snapshot of the result. Don't write any Playwright scripts to disk.
 
 (The dev server has to keep running while the browser tools drive it, which
-is exactly what `gproc` is for — see the main README's "Long-lived background
+is exactly what `gproc` is for - see the main README's "Long-lived background
 processes". Running `npm run dev` directly through the shell tool would block
 until it times out and is killed, so the page would never be up to navigate
 to. The agent can check it came up with `gproc logs web` before navigating.)
@@ -75,22 +91,18 @@ the same as for any other mutating action.
 
 ## Caveats
 
-- **Chromium only.** Firefox/WebKit are deliberately excluded (see
-  `gavmo.nix`'s header comment) to avoid pulling in their much larger
-  dependency closures. Both can be added back if needed.
-- **`--no-sandbox` is required.** Chromium's own internal sandbox can't
-  initialize under GAVMO's default systemd sandbox for `gavmo-opencode`. The
-  VM itself is the real security boundary here, so this costs nothing in
-  practice.
+- **Chromium only.** Firefox and WebKit are excluded because WebKit in
+  particular pulls in a GStreamer/GTK stack of multiple GiB. To add them, drop
+  the `.override { withFirefox = false; withWebkit = false; }` in
+  `gavmo.nix`, pass `--browser firefox`/`webkit` in `opencode.json`, and
+  expect a much larger download.
 - **The MCP install runs at every boot** as a `preStart` step of
-  `gavmo-opencode` itself (idempotently - a fast version check once already
-  installed) and needs working network. It deliberately can't fail
-  `gavmo-opencode`'s own startup (see `gavmo.nix`'s header comment): if the
-  install fails, the agent still starts, just without a working MCP server
-  until the next boot.
-- **Disk headroom.** Even Chromium-only, the browser bundle plus `nodejs`
-  and your project's own `node_modules` is a meaningful chunk of disk - see
-  `crates/vm/src/disk.rs` for the guest's overlay disk size.
+  `gavmo-opencode` (idempotently - a fast version check once already
+  installed) and needs working network. It can't fail `gavmo-opencode`'s own
+  startup: if the install fails, the agent still starts, just without a
+  working MCP server until the next boot.
+- **Disk headroom.** Even Chromium-only, the browser bundle is a few hundred
+  MB on top of `nodejs` and your project's own `node_modules`.
 
 ## Troubleshooting
 
@@ -104,32 +116,21 @@ actually working).
    ls -l /home/agent/.npm-global/bin/
    playwright-mcp --version
    ```
-   If you copied this recipe before the fixes below, you may hit one of
-   these two now-resolved failure modes (re-copy `gavmo.nix` and reboot if
-   so - and see `gavmo.nix`'s header/inline comments for the full story on
-   each):
-   - **Earlier versions used a separate `playwright-mcp-install.service`.**
-     GAVMO applies `gavmo.nix` via an in-guest `nixos-rebuild test`
-     *mid-boot*, and `gavmo-opencode`'s start job is already enqueued in the
-     *initial* boot transaction before that merged generation (where a
-     separate unit would first exist) loads - so a brand-new standalone
-     unit never gets pulled into the running transaction, regardless of its
-     `wantedBy` target. It would sit `enabled` yet permanently
-     `inactive (dead)` (confirmed via `systemctl status
-     playwright-mcp-install --no-pager`, and `-- No entries --` from
-     `journalctl -u playwright-mcp-install -b`). Fixed by moving the install
-     into `gavmo-opencode`'s own `preStart` instead, which *does* run every
-     boot.
-   - **An even earlier version didn't skip Playwright's own postinstall
-     download/validation during install.** `@playwright/mcp` depends on the
-     `playwright` npm package, whose postinstall script tries to download
-     browsers and validate the host OS by default, which can hang or fail
-     the whole `npm install -g` on a slow/restricted network or on NixOS
-     (unrecognized host).
-   - To confirm things are working *right now* without a reboot: run the
-     `npm install -g @playwright/mcp@<version>` command from `gavmo.nix`'s
-     `preStart` by hand (same env vars), then restart/toggle the MCP in
-     opencode - the binary persists on the overlay disk either way.
+   If it's missing:
+   - Make sure your `gavmo.nix` installs from
+     `systemd.services.gavmo-opencode.preStart`. An install in a separate
+     systemd unit (e.g. `playwright-mcp-install.service`) never runs: it
+     shows `enabled` but `inactive (dead)` in `systemctl status`, with
+     `-- No entries --` from `journalctl -u <unit> -b`.
+   - Make sure `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` and
+     `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS` are set. Without them the
+     `playwright` package's postinstall tries to download browsers and
+     validate the host OS, which can hang or fail the whole
+     `npm install -g`.
+   - To fix things without a reboot, run the `npm install -g
+     @playwright/mcp@<version>` command from `gavmo.nix`'s `preStart` by hand
+     (same env vars), then restart/toggle the MCP in opencode - the binary
+     persists on the overlay disk either way.
 
 2. **If the binary exists but opencode still shows it red**, check what
    opencode itself logged (needs the root console - the agent user can't

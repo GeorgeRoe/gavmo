@@ -1,7 +1,6 @@
-//! GAVMO daemon entry point (ssr-only). Boots an axum server that serves the
-//! hydrated Leptos control panel and its `#[server]` functions, injecting the
-//! shared [`AppState`] into every server-function call. See
-//! `crates/gavmo/plan.md` §§6–7.
+//! GAVMO daemon entry point (ssr-only). Serves the Leptos control panel and
+//! its `#[server]` functions with the shared `AppState` as context, plus the
+//! MCP tool gateway on a separate port.
 
 #[cfg(feature = "ssr")]
 #[tokio::main]
@@ -20,7 +19,7 @@ async fn main() {
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, handle_server_fns_with_context, LeptosRoutes};
 
-    // --- configuration (CLI arg / env var; see plan §2) ---------------------
+    // --- Configuration (CLI arg / env var) ---
     let base_image = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("GAVMO_BASE_IMAGE").ok())
@@ -51,16 +50,9 @@ async fn main() {
 
     warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);
 
-    // --- control-panel session auth ------------------------------------------
-    // See `crates/gavmo/src/auth.rs`'s module doc for why this exists: QEMU's
-    // user-mode networking means a workspace's guest VM can reach this
-    // daemon's loopback listener via `10.0.2.2` exactly as easily as the
-    // host's own browser can, so binding to `127.0.0.1` alone is not a
-    // boundary against the guest — every `#[server]` function (host
-    // filesystem browsing, workspace reset/remove, stored-credential
-    // probing, etc.) was reachable from inside any workspace with no auth at
-    // all. `ui_token` is this boundary's secret: host-only, persisted so a
-    // browser's session cookie survives a daemon restart.
+    // --- Control-panel session auth ---
+    // Guests reach host loopback via 10.0.2.2, so 127.0.0.1 is no boundary;
+    // the persisted token keeps guests out of `#[server]` functions.
     let ui_token = match auth::load_or_create_token() {
         Ok(t) => Arc::new(t),
         Err(e) => {
@@ -69,13 +61,12 @@ async fn main() {
         }
     };
 
-    // --- leptos / axum wiring ----------------------------------------------
+    // --- Leptos / axum wiring ---
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
     let leptos_options = conf.leptos_options;
     let routes = generate_route_list(App);
 
-    // Server functions get the AppState injected as Leptos context.
     let server_fn_route = {
         let state = app_state.clone();
         move |req: Request<Body>| {
@@ -105,26 +96,17 @@ async fn main() {
         )
         .fallback(leptos_axum::file_and_error_handler(shell))
         .with_state(leptos_options)
-        // `/login` merged in before the auth layer below, same as every
-        // other route — it stays reachable with no cookie purely because
-        // `auth::is_public_path` allowlists it by path, not because of
-        // merge/layer ordering. One source of truth for "what's public"
-        // rather than two (see `auth.rs`'s doc comment on `require_session`).
+        // `/login` sits behind the auth layer too; it stays reachable only
+        // because `auth::is_public_path` allowlists it, not via layer order.
         .merge(auth::login_router(ui_token.clone()))
         .layer(axum::middleware::from_fn_with_state(
             ui_token.clone(),
             auth::require_session,
         ));
 
-    // --- MCP gateway (brief Phase 4 — see `crates/mcp/plan.md`) -------------
-    // A dedicated loopback listener, deliberately separate from the UI's
-    // `addr` above: keeps the (currently unauthenticated) control-panel API
-    // and the (always bearer-token-authenticated) tool gateway on different
-    // ports, so the UI port can later be restricted from guest access
-    // without touching MCP reachability. The guest reaches this at
-    // `http://10.0.2.2:<mcp::GAVMO_MCP_PORT>/mcp` (QEMU user-mode
-    // networking's host address) via the managed `mcp.gavmo-tools` entry in
-    // `nix/base/configuration.nix`'s `opencode.json`.
+    // --- MCP gateway ---
+    // Separate port from the UI: guests must reach the bearer-authenticated
+    // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
     let mcp_router = Router::new().nest_service("/mcp", mcp::service(app_state.clone()));
     let mcp_addr = (std::net::Ipv4Addr::LOCALHOST, mcp::GAVMO_MCP_PORT);
     let mcp_listener = tokio::net::TcpListener::bind(mcp_addr).await.unwrap();
@@ -138,15 +120,9 @@ async fn main() {
             .unwrap();
     });
 
-    // --- the login URL: the one thing a user actually needs ------------------
-    // `localhost` (not `127.0.0.1`) deliberately: GAVMO's primary deployment
-    // target is a WSL2 Ubuntu shell (see `crates/gavmo/plan.md`'s auth
-    // section) — `localhost` is what Windows' WSL2 localhost-forwarding
-    // resolves from the host browser's side, and it works identically for a
-    // native Linux desktop too. This URL (not a bare "open your browser"
-    // instruction) is the **primary, reliable** way a user authenticates —
-    // `try_open_browser` below is only a convenience layered on top of it,
-    // never a requirement.
+    // --- Login URL ---
+    // `localhost`, not `127.0.0.1`: WSL2 localhost-forwarding resolves it from
+    // the Windows browser. Printing it is the reliable path; opening is a bonus.
     let login_url = format!("http://localhost:{}/login?token={}", addr.port(), ui_token);
     log!(
         "\n\
@@ -164,12 +140,8 @@ async fn main() {
         .unwrap();
 }
 
-/// Warns (non-fatally) if any of `binaries` can't be found on `$PATH`. The
-/// `vm` crate spawns `qemu-img`/`qemu-system-x86_64` by bare name; if
-/// they're missing, `open_workspace` fails per-workspace with a "failed to
-/// spawn" error surfaced in the UI — this check just makes the likely cause
-/// obvious in the daemon's own startup log instead of only showing up on
-/// the first Open click.
+/// Warns (non-fatally) if any of `binaries` is missing from `$PATH`, so a
+/// missing qemu shows up in the startup log rather than on the first Open.
 #[cfg(feature = "ssr")]
 fn warn_if_missing_from_path(binaries: &[&str]) {
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -190,18 +162,8 @@ fn warn_if_missing_from_path(binaries: &[&str]) {
     }
 }
 
-/// Best-effort: launches the host's default browser at `url`. Tries
-/// `wslview` first — the WSL-specific opener that hands off to the *Windows*
-/// default browser, GAVMO's primary deployment target (see
-/// `crates/gavmo/plan.md`'s auth section) — then falls back to `xdg-open`
-/// for a native Linux desktop.
-///
-/// Failure here is never fatal and never even logged: the URL printed just
-/// above this call is the **reliable, primary** way a user reaches the
-/// control panel (same model as Jupyter's printed token URL) — this is
-/// purely a convenience layered on top of it, so a headless host or a
-/// missing opener binary silently just means the user copies the URL by
-/// hand instead, exactly as if this function didn't exist.
+/// Best-effort browser launch: `wslview` (opens the Windows browser from
+/// WSL), then `xdg-open`. Failures are silent; the printed URL suffices.
 #[cfg(feature = "ssr")]
 fn try_open_browser(url: &str) {
     for opener in ["wslview", "xdg-open"] {

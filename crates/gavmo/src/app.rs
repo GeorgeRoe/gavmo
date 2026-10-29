@@ -1,7 +1,6 @@
-//! Leptos app: shared view types, the whole server-function "API", and the
-//! control-panel UI. Compiled for both `ssr` and `hydrate`; the `#[server]`
-//! function bodies only compile on the server (`ssr`), where they touch the
-//! registry and `vm` crate directly. See `crates/gavmo/plan.md` §§7–8.
+//! Leptos app: shared view types, the server-function API, and the
+//! control-panel UI. Compiled for both `ssr` and `hydrate`; `#[server]`
+//! bodies only compile on the server, where they use the registry directly.
 
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
@@ -12,7 +11,7 @@ use leptos_router::{
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Shared view types (serialized across the server-function boundary).
+// Shared view types (serialized across the server-function boundary)
 // ---------------------------------------------------------------------------
 
 /// A known workspace plus its current VM status.
@@ -23,9 +22,8 @@ pub struct WorkspaceInfo {
     pub status: WorkspaceStatus,
 }
 
-/// Browser-facing mirror of `vm::VmStatus`, plus the M2 `BuildFailed` case
-/// (`vm::Error::RebuildFailed`) that `vm::VmStatus` itself doesn't have —
-/// see `registry::VmSlot::BuildFailed`.
+/// Browser-facing mirror of `vm::VmStatus`, plus a `BuildFailed` case
+/// (from `vm::Error::RebuildFailed`) that `vm::VmStatus` doesn't have.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceStatus {
     Stopped,
@@ -36,62 +34,33 @@ pub enum WorkspaceStatus {
     Failed {
         reason: String,
     },
-    /// The repo's `gavmo.nix` failed to build (detected within seconds via
-    /// the guest's failure marker, not a full boot-health timeout — see
-    /// `nix/base/configuration.nix`'s `gavmo-rebuild` service). `log` is the
-    /// failed run's log filename, fetchable via [`read_build_log`].
+    /// The repo's `gavmo.nix` failed to build (detected via the guest's
+    /// failure marker, not a boot timeout). `log` is the failed run's log
+    /// filename, fetchable via [`read_build_log`].
     BuildFailed {
         log: String,
     },
 }
 
-/// Host-side resource usage for a `Running` workspace's VM, shown in the
-/// detail modal's live stats panel (see `registry::AppState::vm_stats`).
-/// `None` from the server function means "nothing to show right now" (not
-/// `Running`, or the qemu process just exited) rather than an error.
+/// Resource usage for a `Running` workspace's VM, shown in the detail modal's
+/// stats panel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VmStats {
     /// Top-style CPU usage: `0` idle, `100` per fully-busy core, up to
     /// `vcpus * 100` if every core is saturated.
     pub cpu_percent: f32,
-    /// Configured guest vCPU count — the denominator `cpu_percent` is
-    /// scaled against.
+    /// Configured guest vCPU count (the scale for `cpu_percent`).
     pub vcpus: u32,
-    /// The guest's own reported memory usage, in bytes: `total - available`
-    /// (`available` meaning the guest kernel's own `MemAvailable` — already
-    /// counts reclaimable page cache as free, not "used").
-    ///
-    /// Deliberately **not** qemu's host-side process RSS. An earlier version
-    /// of this stat used RSS, and it was actively misleading once the
-    /// `/workspace` share moved to virtiofs (see `crates/vm/plan.md`):
-    /// virtiofs backs guest RAM with a shared `memfd`, so every page the
-    /// guest touches — including purely reclaimable page cache from reading
-    /// through a large `node_modules`/`.git` tree — stays resident in
-    /// qemu's RSS with nothing to reclaim it. In practice this pinned the
-    /// bar at ~100% during ordinary, non-memory-constrained work (a real
-    /// case: an `npm test` run that left the guest with ~3 GB still
-    /// genuinely available, confirmed via `free -m` inside the guest, while
-    /// the old RSS-based bar showed full). These fields instead come from
-    /// the guest's own virtio-balloon driver (`vm::guest_memory`), which
-    /// reports what the guest kernel itself considers used/available — the
-    /// same number `free -m` inside the guest would show.
-    ///
-    /// `None` (both fields together) means the guest's balloon driver
-    /// hasn't reported yet — e.g. moments after boot — not that usage is
-    /// zero. The UI should show a placeholder (e.g. "—"), never a 0%/100%
-    /// bar, in that case.
+    /// Guest-reported used memory in bytes (`total - MemAvailable`, via the
+    /// virtio-balloon driver). Not qemu's RSS: with virtiofs the shared memfd
+    /// keeps reclaimable page cache resident, so RSS reads near 100%.
+    /// `None` until the balloon driver first reports; show a placeholder.
     pub mem_used_bytes: Option<u64>,
-    /// The guest's total RAM as it reports it, in bytes — shown alongside
-    /// `mem_used_bytes` for context. See that field's doc comment for why
-    /// this is guest-reported rather than `VmConfig::memory_mib` restated;
-    /// in practice the two should be very close, but this is what the
-    /// guest itself sees.
+    /// Guest-reported total RAM in bytes; `None` together with `mem_used_bytes`.
     pub mem_total_bytes: Option<u64>,
-    /// How long the qemu process has existed, in seconds (from spawn, not
-    /// from when it first became healthy — see `vm::RunningVm::uptime`).
+    /// Seconds since the qemu process was spawned (not since it became healthy).
     pub uptime_secs: u64,
-    /// Size of the persistent overlay disk (`.gavmo/vm/disk.qcow2`), in
-    /// bytes.
+    /// Size of the persistent overlay disk (`.gavmo/vm/disk.qcow2`), in bytes.
     pub disk_bytes: u64,
     /// The host port `opencode web` is forwarded to.
     pub host_port: u16,
@@ -114,41 +83,36 @@ pub struct DirEntry {
     pub path: String,
 }
 
-/// A tool a workspace's `gavmo.yaml` requests, for the control panel's Tools
-/// panel. `auth` is a plain string — not the `ssr`-only `toolspec` enum — so
-/// this type is usable in the wasm/hydrate build too.
+/// A tool requested by a workspace's `gavmo.yaml`, for the Tools panel.
+/// `auth` is a plain string (not the `ssr`-only `toolspec` enum) so this type
+/// also builds for hydrate.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolConfig {
     /// Tool id (also the name the agent calls it by).
     pub id: String,
     /// Human-facing description from the config (or a generated fallback).
     pub description: String,
-    /// The integration's base URL (shown so the user can verify where their
-    /// credential will be sent).
+    /// The integration's base URL, shown so the user can verify where their
+    /// credential will be sent.
     pub base_url: String,
-    /// `"basic"`, `"bearer"`, or `"header"` — drives which secret fields the
-    /// configure form shows.
+    /// `"basic"`, `"bearer"`, or `"header"`; selects the configure form's fields.
     pub auth: String,
     /// The secret reference name declared in the config.
     pub secret_name: String,
     /// Optional setup help from the config.
     pub instructions: Option<String>,
-    /// Whether a credential is currently stored for this tool *and* bound to the
-    /// current `base_url` (i.e. usable). False when nothing is stored, or when a
-    /// stored credential's destination no longer matches (see `url_changed`).
+    /// A credential is stored *and* bound to the current `base_url` (usable).
     pub configured: bool,
-    /// True when a credential *is* stored but was approved for a different
-    /// destination than the tool now declares (URL-binding mismatch). The tool is
-    /// disabled until re-confirmed; the UI shows a warning with `bound_url`.
+    /// A credential is stored but was approved for a different URL; the tool
+    /// stays disabled until the user re-confirms it.
     pub url_changed: bool,
-    /// The destination the stored credential was originally approved for, shown in
-    /// the mismatch warning ("was X, now Y"). `Some` only when `url_changed` and
-    /// the stored value carried a binding; `None` for an unbound/legacy value.
+    /// The URL the stored credential was approved for, shown in the mismatch
+    /// warning. `None` if the stored value carries no binding.
     pub bound_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Server functions (the entire API surface).
+// Server functions (the entire API surface)
 // ---------------------------------------------------------------------------
 
 #[server]
@@ -163,11 +127,9 @@ pub async fn poll_status(id: String) -> Result<WorkspaceStatus, ServerFnError> {
     Ok(state.status(&id).await)
 }
 
-/// Fetches the full `nixos-rebuild` output for a failed M2 build, for the
-/// "View build log" action on a [`WorkspaceStatus::BuildFailed`] row. `log`
-/// must be exactly the filename that status reported — the server validates
-/// it strictly (see `registry::is_safe_rebuild_log_filename`) before
-/// touching the filesystem.
+/// Fetches the full `nixos-rebuild` output for a
+/// [`WorkspaceStatus::BuildFailed`] workspace. `log` must be the filename that
+/// status reported; the server validates it strictly before reading.
 #[server]
 pub async fn read_build_log(id: String, log: String) -> Result<String, ServerFnError> {
     let state = app_state()?;
@@ -177,13 +139,9 @@ pub async fn read_build_log(id: String, log: String) -> Result<String, ServerFnE
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Fetches the guest's boot console (kernel + systemd output), sanitized
-/// for display — see `registry::AppState::read_console_log`. Polled by the
-/// modal's console panel while a workspace is `Booting`; unlike
-/// `read_build_log`, there's no client-controlled filename here (the
-/// console log always lives at a fixed path under the workspace's state
-/// dir), so no separate validation is needed beyond `id` itself already
-/// being a registry-known workspace path.
+/// Fetches the guest's boot console (kernel + systemd output), sanitized for
+/// display. The log lives at a fixed path, so there is no client-controlled
+/// filename to validate.
 #[server]
 pub async fn read_console_log(id: String) -> Result<String, ServerFnError> {
     let state = app_state()?;
@@ -193,13 +151,9 @@ pub async fn read_console_log(id: String) -> Result<String, ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Fetches host-side resource usage (CPU/memory/uptime/disk) for a
-/// workspace's VM — see `registry::AppState::vm_stats`. Polled by the
-/// modal's stats panel while a workspace is `Running`, mirroring
-/// `read_console_log`'s polling pattern for the `Booting` boot console.
-/// `Ok(None)` is the normal "nothing to show right now" case (not
-/// `Running`, or the process just exited) — distinct from `Err`, which
-/// means the request itself failed.
+/// Fetches resource usage for a workspace's VM. `Ok(None)` means nothing to
+/// show right now (not `Running`, or qemu just exited); `Err` means the
+/// request failed.
 #[server]
 pub async fn poll_vm_stats(id: String) -> Result<Option<VmStats>, ServerFnError> {
     let state = app_state()?;
@@ -215,12 +169,9 @@ pub async fn add_workspace(path: String) -> Result<(), ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Kicks off booting the workspace's VM (or is a no-op if it's already
-/// booting/running). Returns immediately — the client is expected to
-/// observe the boot's progress via the live-polled workspace list, which
-/// transitions `idle -> booting… -> running`/`failed: ...`. See
-/// `crates/gavmo/plan.md` §9 — a synchronous `open` that blocked for the
-/// whole boot made the UI look unresponsive for minutes with no feedback.
+/// Starts booting the workspace's VM (no-op if already booting/running) and
+/// returns immediately; the client follows progress via the polled list so
+/// the UI never blocks for the whole boot.
 #[server]
 pub async fn open_workspace(id: String) -> Result<(), ServerFnError> {
     let state = app_state()?;
@@ -233,13 +184,9 @@ pub async fn stop_workspace(id: String) -> Result<(), ServerFnError> {
     state.stop_workspace(&id).await.map_err(ServerFnError::new)
 }
 
-/// Stops (if needed) and wipes a workspace's entire VM state — the general
-/// recovery action for a wedged workspace, including "the base image was
-/// rebuilt but this workspace's overlay is still on the old one" (see
-/// `registry::AppState::reset_workspace`'s doc comment). **Destructive** —
-/// the client is expected to have already gotten explicit user confirmation
-/// before calling this (see `WorkspaceRow`'s inline confirm step); this
-/// function itself does not re-confirm.
+/// Stops (if needed) and wipes a workspace's VM state, e.g. to recover from
+/// an overlay built on a stale base image. **Destructive**: the client must
+/// confirm with the user first; this function does not.
 #[server]
 pub async fn reset_workspace(id: String) -> Result<(), ServerFnError> {
     let state = app_state()?;
@@ -249,14 +196,9 @@ pub async fn reset_workspace(id: String) -> Result<(), ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Stops (if needed) and forgets a workspace — drops it from the registry
-/// so it no longer appears in the control panel. **Non-destructive**,
-/// unlike [`reset_workspace`]: nothing under `.gavmo/vm` is deleted (see
-/// `registry::AppState::remove_workspace`'s doc comment), so re-adding the
-/// same path later finds its old overlay/session history again. The client
-/// is expected to have already gotten explicit user confirmation before
-/// calling this (see `WorkspaceRow`'s inline confirm step), same as
-/// [`reset_workspace`].
+/// Stops (if needed) and drops a workspace from the registry. Nothing under
+/// `.gavmo/vm` is deleted, so re-adding the path restores its state. The
+/// client must confirm with the user first.
 #[server]
 pub async fn remove_workspace(id: String) -> Result<(), ServerFnError> {
     let state = app_state()?;
@@ -303,9 +245,8 @@ pub async fn browse_dir(path: Option<String>) -> Result<DirListing, ServerFnErro
     })
 }
 
-/// Lists the tools a workspace's `gavmo.yaml` requests, with each one's
-/// configured status — for the modal's Tools panel. Computed live (reads the
-/// config), so it reflects config/secret changes without a restart.
+/// Lists the tools a workspace's `gavmo.yaml` requests, with their configured
+/// status. Read live, so config/secret changes show without a restart.
 #[server]
 pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, ServerFnError> {
     let state = app_state()?;
@@ -314,7 +255,7 @@ pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, ServerFnEr
 
 /// Stores (or replaces) a tool's credential on the host. `username` is only used
 /// for Basic auth; Bearer/Header pass just `token`. The credential never leaves
-/// the host — see `registry::AppState::set_tool_secret`.
+/// the host.
 #[server]
 pub async fn set_tool_secret(
     id: String,
@@ -351,8 +292,7 @@ pub async fn test_tool(id: String, tool_id: String) -> Result<String, ServerFnEr
         .map_err(ServerFnError::new)
 }
 
-/// Fetches the injected [`registry::AppState`] from Leptos context. Only
-/// compiled on the server.
+/// Fetches the injected [`registry::AppState`] from Leptos context.
 #[cfg(feature = "ssr")]
 fn app_state() -> Result<crate::registry::AppState, ServerFnError> {
     use_context::<crate::registry::AppState>()
@@ -360,7 +300,7 @@ fn app_state() -> Result<crate::registry::AppState, ServerFnError> {
 }
 
 // ---------------------------------------------------------------------------
-// UI.
+// UI
 // ---------------------------------------------------------------------------
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -399,30 +339,22 @@ pub fn App() -> impl IntoView {
 }
 
 // ---------------------------------------------------------------------------
-// Card <-> modal morph: the View Transitions API.
+// Card <-> modal morph (View Transitions API)
 // ---------------------------------------------------------------------------
 
-/// A stable, CSS-ident-safe `view-transition-name` derived from a
-/// workspace's id. Ids are absolute filesystem paths (see
-/// `WorkspaceInfo::id`), which aren't valid CSS idents on their own - this
-/// hashes the id into a short, always-valid name instead.
+/// A stable `view-transition-name` for a workspace. Ids are filesystem paths,
+/// which aren't valid CSS idents, so the id is hashed.
 fn vt_name(id: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
-    // The `ws-vt-` prefix guarantees a valid CSS identifier (must not
-    // start with a digit) regardless of the hash's own leading hex digit.
+    // Prefixed because a CSS ident must not start with a digit.
     format!("ws-vt-{:x}", hasher.finish())
 }
 
-/// Extracts the DOM element a click event's listener is attached to
-/// (`current_target`, not `target` - correct even if the click actually
-/// landed on, and bubbled up from, a child element). Always `None` under
-/// `ssr`: there's no click event loop in server-side rendering to begin
-/// with, so this is dead code there, never actually invoked - it's written
-/// this way (one shared signature, `hydrate`-gated body) purely so
-/// `WorkspaceCard`'s `on:click` handler - itself shared, compiled-for-both-
-/// targets view code - doesn't need its own `#[cfg]` split.
+/// The element a click listener is attached to (`current_target`, so clicks
+/// on children still resolve to the card). Always `None` under `ssr`; the
+/// shared signature spares callers a `#[cfg]` split.
 fn click_target(ev: &web_sys::MouseEvent) -> Option<web_sys::HtmlElement> {
     #[cfg(feature = "hydrate")]
     {
@@ -436,10 +368,9 @@ fn click_target(ev: &web_sys::MouseEvent) -> Option<web_sys::HtmlElement> {
     }
 }
 
-/// Directly sets or clears (bypassing Leptos's reactive `style:` system -
-/// see [`start_view_transition`]'s doc comment for why) a card's inline
-/// `view-transition-name`; `name: None` clears it back to the default
-/// (`auto`). A no-op under `ssr`, for the same reason as [`click_target`].
+/// Sets or clears (`None`) a card's inline `view-transition-name` directly,
+/// bypassing reactive `style:` so it applies synchronously inside the
+/// transition callback. No-op under `ssr`.
 fn set_card_vt_name(el: &web_sys::HtmlElement, name: Option<&str>) {
     #[cfg(feature = "hydrate")]
     {
@@ -459,10 +390,8 @@ fn set_card_vt_name(el: &web_sys::HtmlElement, name: Option<&str>) {
     }
 }
 
-/// Scrolls an element to the bottom of its content (`scroll_top =
-/// scroll_height`) — used to keep the live boot-console panel pinned to
-/// the newest output as it streams in, same way a real terminal would. A
-/// no-op under `ssr`, for the same reason as [`click_target`].
+/// Scrolls an element to the bottom, keeping the live console pinned to the
+/// newest output like a terminal. No-op under `ssr`.
 fn scroll_to_bottom(el: &web_sys::HtmlPreElement) {
     #[cfg(feature = "hydrate")]
     {
@@ -474,40 +403,17 @@ fn scroll_to_bottom(el: &web_sys::HtmlPreElement) {
     }
 }
 
-/// Runs `update` - a Leptos signal write - wrapped in a View Transition
-/// when the browser supports `document.startViewTransition`, so whatever
-/// DOM change it causes (here: a card turning into the detail modal, or
-/// back) morphs instead of popping instantly; `on_finished` runs once the
-/// *entire* animated transition has completed (not just the DOM update
-/// itself - see below). Falls back to just calling both directly, in
-/// order, when the API isn't available - an **instant** open/close on
-/// older browsers, not an error.
+/// Runs `update` (a signal write) inside `document.startViewTransition` so
+/// the card <-> modal change morphs; without the API, both closures just run
+/// in order (instant open/close). Looked up via `Reflect`, as
+/// `leptos_router` does, to avoid `web_sys_unstable_apis`.
 ///
-/// Looked up dynamically via `js_sys::Reflect` rather than a typed web-sys
-/// binding - the exact approach `leptos_router` itself uses for its own
-/// route transitions (see its private `view_transition` module) - which
-/// avoids needing `--cfg=web_sys_unstable_apis` at all.
+/// Signal writes patch the DOM on a later tick, so the callback awaits
+/// `tick()` before resolving; otherwise the browser would snapshot the old DOM.
 ///
-/// The one thing genuinely specific to *this* call site, rather than just
-/// copied from the router: Leptos signal writes don't patch the DOM
-/// synchronously - a `RenderEffect` re-run is scheduled on the reactive
-/// executor and only actually runs on a later "tick" (see
-/// `reactive_graph::effect::render_effect`). `startViewTransition`'s own
-/// callback is expected to return a thenable that it awaits *before*
-/// snapshotting the "new" state, so this runs `update()` (the signal
-/// write) and then awaits `leptos::task::tick()` to give the executor a
-/// turn to actually run the resulting render effect - mounting/unmounting
-/// the modal - before the promise resolves and the browser captures the
-/// after-snapshot.
-///
-/// `on_finished` exists for exactly one reason: the *closing* morph needs
-/// to hand a card's `view-transition-name` back to it for the post-close
-/// snapshot (see `WorkspaceCard`/`set_card_vt_name`), but that name must
-/// then be released again - otherwise it would linger on that card and get
-/// incorrectly swept into some later, unrelated transition for a
-/// *different* card. `.finished` (unlike the callback's own promise) only
-/// resolves once the whole animation has actually played out, which is the
-/// right moment to release it.
+/// `on_finished` runs once the whole animation has played (`.finished`), so
+/// the closing morph can release the card's name without leaking it into a
+/// later transition.
 #[cfg(feature = "hydrate")]
 fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOnce() + 'static) {
     use js_sys::Reflect;
@@ -519,7 +425,6 @@ fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOn
         .and_then(|f| f.dyn_into::<js_sys::Function>());
 
     let Ok(svt) = svt else {
-        // Not supported in this browser - just apply both directly.
         update();
         on_finished();
         return;
@@ -544,18 +449,12 @@ fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOn
                         on_finished();
                     });
                 }
-                // Shouldn't happen (every real `ViewTransition` has a
-                // `finished` property) - fail safe by running the
-                // cleanup immediately rather than leaking it forever.
+                // No `finished` promise: clean up now rather than leak the name.
                 None => on_finished(),
             }
         }
-        // `svt` was just confirmed callable above; a call failing here
-        // would mean the document became inactive between the two calls -
-        // vanishingly unlikely for a click handler in a localhost control
-        // panel. `update` is already consumed inside `cb`, uncalled, in
-        // this case; not worth a recovery path for it, but `on_finished`
-        // is still ours to run so its cleanup isn't silently lost.
+        // Practically unreachable; `update` is lost inside `cb`, but still run
+        // the cleanup.
         Err(_) => on_finished(),
     }
 }
@@ -568,8 +467,7 @@ fn start_view_transition(update: impl FnOnce(), on_finished: impl FnOnce()) {
 
 #[component]
 fn HomePage() -> impl IntoView {
-    // Bumped to force a re-fetch of the workspace list (after an action, and
-    // on a live polling interval — see the Effect below).
+    // Bumped to re-fetch the workspace list (after actions and on a timer).
     let refresh = RwSignal::new(0u32);
     let reload = move || refresh.update(|n| *n += 1);
 
@@ -578,49 +476,13 @@ fn HomePage() -> impl IntoView {
         |_| async move { list_workspaces().await },
     );
 
-    // The stable list every `WorkspaceCard` is keyed and diffed against
-    // (see `<For>` below) - deliberately **not** read from
-    // `workspaces_resource` directly. A `Resource` read inside
-    // `<Transition>`/`Suspend` (the old approach) re-resolves to a brand
-    // new value on every poll, and `<For>` has no way to tell "this is
-    // conceptually the same list, just one field updated" from "this is a
-    // wholesale replacement" unless the *signal* itself is stable across
-    // updates - which a fresh `Suspend` future is not. Copying the
-    // resolved value into this plain `RwSignal` on each resolution (via
-    // the `Effect` below) gives `<For>` one persistent signal to diff,
-    // which is what lets it update an item in place instead of
-    // unmounting/remounting the whole card - the fix for the collapse-
-    // after-one-poll class of bugs the old `OpenBuildLog` (now deleted)
-    // had to work around for just the build-log viewer specifically; this
-    // generalizes that fix to every piece of a card's local state (expand,
-    // confirm toggles, the build-log viewer, busy/error) all at once.
-    //
-    // This only pays off, though, if `<For>` itself isn't sitting inside a
-    // closure that *also* reads `workspaces` - such a closure would re-run
-    // (and rebuild its whole subtree, tearing `<For>` down) on every single
-    // poll, since signal updates don't dedupe by value. See the `<Show>`
-    // below, whose memoized `when` is what actually keeps `<For>` mounted
-    // across polls - not just this stable signal on its own.
-    //
-    // Tradeoff accepted: `Effect`s only run client-side, so (unlike the
-    // old `<Transition>`-based version) this list no longer participates
-    // in SSR streaming - the server-rendered HTML always shows "Loading…"
-    // and the real list appears once hydration runs this effect for the
-    // first time. Fine for a localhost-only control panel with no SEO/
-    // first-paint concerns; not a tradeoff worth making in a public app.
+    // A persistent signal for `<For>` to diff, so polls update cards in place
+    // and keep their local state, instead of remounting them as a resolved
+    // `Resource` would. Filled client-side only, so SSR always shows "Loading...".
     let workspaces = RwSignal::new(Vec::<WorkspaceInfo>::new());
     let fetch_error = RwSignal::new(None::<String>);
-    // Tracks "has the resource resolved at least once" as a plain signal,
-    // rather than reading `workspaces_resource` directly in the view below
-    // to distinguish "still loading" from "loaded but genuinely empty".
-    // Leptos warns (correctly) about reading a resource outside
-    // `Suspense`/`Transition`/an effect - doing so risks a hydration
-    // mismatch if the server happens to resolve it before sending HTML
-    // while the client's first hydration pass hasn't yet. Since `Effect`s
-    // only run client-side, both the server's initial render *and* the
-    // client's first hydration pass start from `loaded = false` and agree
-    // on "Loading…" - this is actually more hydration-correct than reading
-    // the resource directly would have been, not just quieter.
+    // Set by the client-side effect, so server and first hydration pass both
+    // start at `false` (reading the resource directly risks a mismatch).
     let loaded = RwSignal::new(false);
     Effect::new(move |_| {
         if let Some(result) = workspaces_resource.get() {
@@ -630,18 +492,13 @@ fn HomePage() -> impl IntoView {
                     workspaces.set(list);
                     fetch_error.set(None);
                 }
-                // Deliberately leave `workspaces` as whatever it last was
-                // on a transient fetch error, rather than clearing it to
-                // empty - a single flaky poll shouldn't blank the whole
-                // grid when we already have a perfectly good last-known
-                // list to keep showing.
+                // Keep the last-known list so one flaky poll doesn't blank the grid.
                 Err(e) => fetch_error.set(Some(e.to_string())),
             }
         }
     });
 
-    // Live polling: re-fetch every 3s on the client. `set_interval` touches
-    // `window`, so it must run only in the browser — Effects run client-side.
+    // Poll every 3s. In an Effect because `set_interval` needs `window`.
     Effect::new(move |_| {
         set_interval(
             move || refresh.update(|n| *n += 1),
@@ -652,20 +509,11 @@ fn HomePage() -> impl IntoView {
     let show_browser = RwSignal::new(false);
     let on_changed = Callback::new(move |()| reload());
 
-    // The currently open workspace's id, if any - drives the single detail
-    // modal below. At most one workspace is ever "open" at a time (opening
-    // a card replaces whatever was previously selected), unlike the old
-    // per-card inline `expanded` state, which let any number of cards be
-    // expanded simultaneously.
+    // The id of the workspace shown in the detail modal, if any.
     let selected = RwSignal::new(None::<String>);
 
-    // The DOM element of whichever `WorkspaceCard` is currently open (set
-    // directly by its `on:click`, alongside the matching
-    // `view-transition-name` it stamps onto that same element - see
-    // `click_target`/`set_card_vt_name`). Stashed here so the *closing*
-    // morph, triggered from inside the modal rather than the card, can
-    // still get back to the exact element it needs to hand the name back
-    // to. `None` whenever no workspace is selected.
+    // The open card's element, so the closing morph (started from the modal)
+    // can hand the `view-transition-name` back to it.
     let open_card_el = StoredValue::new(None::<web_sys::HtmlElement>);
 
     view! {
@@ -677,22 +525,7 @@ fn HomePage() -> impl IntoView {
         </header>
 
         <Show
-            // `<Show>` memoizes this boolean (leptos's `show.rs`
-            // wraps `when` in an `ArcMemo`), so the `<div class="ws-
-            // grid"><For/></div>` subtree below is only torn down
-            // and rebuilt when the list flips empty<->non-empty -
-            // *not* on every 3s poll that leaves it non-empty. That
-            // stability is what actually keeps `<For>` (and every
-            // card's local state) alive across polls - the stable
-            // `workspaces` signal above is necessary for `<For>` to
-            // diff correctly, but isn't sufficient on its own if
-            // something reading `workspaces` wraps `<For>` itself.
-            // The previous `{move || if workspaces.get().is_empty()
-            // {...} else {<For/>}}` did exactly that: its own
-            // condition read `workspaces`, so it re-ran (and
-            // remounted the whole grid) on every poll, and right
-            // after any in-card action too (via `on_changed` ->
-            // `reload()`).
+            // Memoized: the grid only remounts on empty<->non-empty, not per poll.
             when=move || !workspaces.with(Vec::is_empty)
             fallback=move || view! {
                 <p class="empty">
@@ -706,11 +539,7 @@ fn HomePage() -> impl IntoView {
         >
             <div class="ws-grid">
                 <For
-                    // Braced (not bare `move || ...`): the
-                    // turbofish in `::<Vec<_>>()` contains
-                    // `<`/`>`, which the view! macro's
-                    // RSX-style attribute parser otherwise
-                    // misreads as tag syntax.
+                    // Braced so view! doesn't parse the turbofish as tags.
                     each={move || workspaces.get().into_iter().map(|w| w.id).collect::<Vec<_>>()}
                     key=|id| id.clone()
                     let:id
@@ -723,13 +552,8 @@ fn HomePage() -> impl IntoView {
             <p class="error">"Failed to refresh workspaces: " {e}</p>
         })}
 
-        // The detail modal - mounted only while a workspace is selected.
-        // Captured with `get_untracked()` inside the (otherwise static,
-        // non-reactive) closure below: `selected` only ever transitions
-        // `None <-> Some(id)` (never `Some(a) -> Some(b)` directly, since
-        // the backdrop blocks clicks on other cards while open), so the id
-        // is stable for the modal's whole mounted lifetime and doesn't need
-        // to react to further changes in `selected` itself.
+        // Untracked: `selected` only goes None <-> Some (the backdrop blocks
+        // other cards), so the id is fixed while the modal is mounted.
         <Show when=move || selected.get().is_some() fallback=|| ()>
             {move || {
                 let id = selected.get_untracked().expect("selected is Some");
@@ -740,26 +564,17 @@ fn HomePage() -> impl IntoView {
                         workspaces
                         on_changed
                         on_close=Callback::new(move |()| {
-                            // Captured *locally*, once, right as closing
-                            // starts - rather than re-reading
-                            // `open_card_el` later from inside the
-                            // closures below - so a fast reopen (of a
-                            // *different* card) racing this same close's
-                            // own async cleanup can never stomp on each
-                            // other: `open_card_el` is immediately cleared
-                            // here, freeing a new `WorkspaceCard` click to
-                            // overwrite it safely, while this close's own
-                            // two closures keep working with the one
-                            // element they captured up front.
+                            // Captured once and cleared immediately, so a fast
+                            // reopen of another card can't race this close's
+                            // async cleanup.
                             let el = open_card_el.get_value();
                             open_card_el.set_value(None);
                             let el_for_cleanup = el.clone();
                             let name = name.clone();
                             start_view_transition(
                                 move || {
-                                    // New (post-close) snapshot: hand the
-                                    // name back to the card so the modal
-                                    // can morph back into it.
+                                    // Hand the name back so the modal morphs
+                                    // into the card.
                                     if let Some(el) = &el {
                                         set_card_vt_name(el, Some(&name));
                                     }
@@ -767,11 +582,8 @@ fn HomePage() -> impl IntoView {
                                 },
                                 move || {
                                     let el = el_for_cleanup;
-                                    // The whole close animation is done -
-                                    // release the name again so it doesn't
-                                    // linger on this card and get swept
-                                    // into some later, unrelated
-                                    // transition for a *different* card.
+                                    // Animation done: release the name so it
+                                    // doesn't leak into a later transition.
                                     if let Some(el) = &el {
                                         set_card_vt_name(el, None);
                                     }
@@ -783,7 +595,6 @@ fn HomePage() -> impl IntoView {
             }}
         </Show>
 
-        // The "add workspace" folder picker, in the same modal shell.
         <Show when=move || show_browser.get() fallback=|| ()>
             <Modal on_close=Callback::new(move |()| show_browser.set(false)) title="Add workspace".to_string()>
                 <FolderBrowser on_added=Callback::new(move |()| {
@@ -795,17 +606,9 @@ fn HomePage() -> impl IntoView {
     }
 }
 
-/// A floating modal: a dimmed full-screen backdrop plus a centered square
-/// panel. Clicking the backdrop or the close button, or pressing Escape,
-/// all invoke `on_close`. Used for both the workspace detail view
-/// ([`WorkspaceModal`]) and the "add workspace" folder picker.
-///
-/// `vt_name`, when `Some`, is applied to the panel as its
-/// `view-transition-name` - this is what lets [`WorkspaceModal`] morph out
-/// of (and back into) the card that opened it (see [`start_view_transition`]
-/// and `vt_name`'s own doc comment). The folder picker passes `None`: it
-/// has no corresponding card to morph from, so it just pops in/out with the
-/// browser's default root crossfade like any other DOM change.
+/// A floating modal over a dimmed backdrop; backdrop click, the close button,
+/// and Escape all call `on_close`. `vt_name` lets the panel morph from the
+/// card that opened it; the folder picker passes `None` and has no card.
 #[component]
 fn Modal(
     on_close: Callback<()>,
@@ -813,10 +616,7 @@ fn Modal(
     #[prop(optional_no_strip)] vt_name: Option<String>,
     children: Children,
 ) -> impl IntoView {
-    // Escape-to-close. `window_event_listener` is a no-op on the server
-    // (see its `is_server()` check) and is cleaned up via `on_cleanup` when
-    // this component's owner is disposed - i.e. whenever the `<Show>` above
-    // unmounts it, which is exactly when the listener should stop existing.
+    // Escape-to-close; the listener is removed when the modal unmounts.
     let handle = window_event_listener(leptos::ev::keydown, move |ev| {
         if ev.key() == "Escape" {
             on_close.run(());
@@ -824,12 +624,7 @@ fn Modal(
     });
     on_cleanup(move || handle.remove());
 
-    // Whether this modal has a card to morph from. When `true`, the panel
-    // relies entirely on the native View Transition morph (driven by
-    // `vt_name` below) for its open/close motion; when `false` (the folder
-    // picker), there's no corresponding card, so it keeps the plain CSS
-    // mount animation (`.modal--plain`) instead. Read before `vt_name` is
-    // moved into the `style:` binding just below.
+    // Without a card to morph from, use the plain CSS mount animation.
     let morphing = vt_name.is_some();
 
     view! {
@@ -858,13 +653,8 @@ fn Modal(
     }
 }
 
-/// One workspace's card in the grid: just the compact, always-visible
-/// summary (badge + name + path). Mounted once per `id` by `<For>` in
-/// `HomePage` and never torn down while the id remains in the list (see
-/// `HomePage`'s doc comment on `workspaces`). Clicking it opens
-/// [`WorkspaceModal`] - all of the former inline detail/actions panel now
-/// lives there instead, as a single floating modal shared across every
-/// card rather than per-card state.
+/// One workspace's card in the grid (badge, name, path). Clicking it opens
+/// [`WorkspaceModal`].
 #[component]
 fn WorkspaceCard(
     id: String,
@@ -874,14 +664,8 @@ fn WorkspaceCard(
 ) -> impl IntoView {
     let id = StoredValue::new(id);
 
-    // This card's own reactive slice of the shared `workspaces` list - the
-    // mechanism that lets status/path update live without the card itself
-    // being recreated. Falls back to `Stopped` with this card's own `id` as
-    // a placeholder path in the narrow window between this workspace being
-    // removed from `workspaces` (e.g. via Remove) and `<For>` unmounting
-    // this card in response to that same change - both happen off the same
-    // signal in the same reactive pass, so this is never visible for more
-    // than a frame, if at all.
+    // This card's slice of the list. The fallback only covers the instant
+    // between removal and `<For>` unmounting the card.
     let card_info = Memo::new(move |_| {
         let current_id = id.get_value();
         workspaces
@@ -895,54 +679,27 @@ fn WorkspaceCard(
             })
     });
 
+    // Only the card being opened/closed carries a `view-transition-name`:
+    // named elements get lifted above the backdrop during any transition.
     view! {
         <div
             class="ws-card"
-            // No `view-transition-name` in steady state - only the one
-            // card actually being opened/closed at any given moment ever
-            // carries one (set directly below, bypassing Leptos entirely;
-            // see `start_view_transition`'s doc comment for why). Giving
-            // *every* card a permanent name here instead was the first
-            // version of this - and it was wrong: a `view-transition-name`
-            // pulls an element into its own composited layer for the
-            // *entire* duration of *any* transition happening anywhere on
-            // the page, regardless of whether that element is actually
-            // involved. With every card permanently named, opening one
-            // card lifted *all the others* (and nothing else) above the
-            // backdrop's dimming layer for the whole animation, so they
-            // visibly only caught up to the dimmed look once the real DOM
-            // took back over at the end - the "other cards gray out late"
-            // bug. Scoping the name to just the one involved card - set
-            // right before the transition starts, cleared right after -
-            // keeps every uninvolved card (and the "Add workspace" button)
-            // correctly part of the plain, un-lifted root snapshot, so the
-            // backdrop dims everything in one synchronized pass like any
-            // ordinary DOM change would.
             on:click=move |ev| {
                 let clicked = id.get_value();
                 let name = vt_name(&clicked);
                 let el = click_target(&ev);
                 if let Some(el) = &el {
-                    // Old snapshot: this card must already show the name
-                    // - set synchronously, *before* `start_view_transition`
-                    // (and the browser, inside it) captures it.
                     set_card_vt_name(el, Some(&name));
                 }
                 open_card_el.set_value(el.clone());
                 start_view_transition(
                     move || {
-                        // New snapshot: the modal claims the name now -
-                        // this card must give it up, or the snapshot
-                        // would have two elements sharing one name.
+                        // The modal takes the name; two elements can't share it.
                         if let Some(el) = &el {
                             set_card_vt_name(el, None);
                         }
                         selected.set(Some(clicked));
                     },
-                    // Nothing to release once *opening* finishes - the
-                    // card legitimately stays unnamed for as long as the
-                    // modal remains open; see the `on_close` handler in
-                    // `HomePage` for the matching close-side cleanup.
                     || {},
                 );
             }
@@ -964,11 +721,8 @@ fn WorkspaceCard(
     }
 }
 
-/// The detail/actions view for one workspace, shown as the content of the
-/// floating modal (see `HomePage`'s `selected` signal and `Modal`). Mounted
-/// fresh each time a card is opened, and unmounted when it's closed - all
-/// local state here (`busy`, confirm toggles, the build-log viewer) starts
-/// over on each open, same as the rest of the modal's content would.
+/// The detail/actions view for one workspace, shown in the modal. Mounted on
+/// each open, so its local state starts fresh every time.
 #[component]
 fn WorkspaceModal(
     id: String,
@@ -976,32 +730,12 @@ fn WorkspaceModal(
     on_changed: Callback<()>,
     on_close: Callback<()>,
 ) -> impl IntoView {
-    // A `Copy` handle to this modal's id, even though `String` itself isn't.
-    // Below, several closures end up nested multiple levels deep inside
-    // `<Show>`'s children (which - like any Leptos reactive content - must
-    // stay callable repeatedly, not just once). A *plain* `String` moved
-    // into one `move` closure, then referenced by a `move` closure nested
-    // inside *that*, hits a real borrow-checker wall: the inner `move`
-    // takes ownership away from the outer closure's own captured copy,
-    // leaving nothing for the outer closure's next invocation (`error[E0525]:
-    // ...only implements FnOnce`) - no amount of `.clone()`-before-use
-    // avoids this once there are two or more nesting levels, since each
-    // `move` closure captures by value regardless of what its body actually
-    // needs. `StoredValue` is Leptos's idiomatic answer: it hands out a
-    // `Copy` handle backed by the reactive runtime's own storage, so *any*
-    // number of nested `move` closures can freely capture the handle itself
-    // (trivial, non-destructive, same as copying an integer) and each
-    // independently call `.get_value()` for a fresh owned clone of the real
-    // `String` whenever it actually runs.
+    // A `Copy` handle so nested reactive `move` closures can all capture the
+    // id without becoming `FnOnce`.
     let id = StoredValue::new(id);
 
-    // This modal's own reactive slice of the shared `workspaces` list - the
-    // mechanism that lets status update live while the modal is open,
-    // without the modal itself being recreated. Falls back to `Stopped`
-    // with this modal's own `id` as a placeholder path in the narrow window
-    // between this workspace being removed from `workspaces` (e.g. via
-    // Remove) and `on_changed`/the caller closing the modal in response to
-    // that same change.
+    // This workspace's live slice of the list. The fallback covers the gap
+    // between removal and the modal closing.
     let card_info = Memo::new(move |_| {
         let current_id = id.get_value();
         workspaces
@@ -1018,32 +752,18 @@ fn WorkspaceModal(
     let busy = RwSignal::new(false);
     // Shared across open/stop/reset/remove: whichever of them last failed.
     let action_error = RwSignal::new(None::<String>);
-    // Opening one of these closes the other, so the card never shows two
-    // confirm prompts at once.
+    // Opening one closes the other, so only one confirm prompt shows at a time.
     let confirming_reset = RwSignal::new(false);
     let confirming_remove = RwSignal::new(false);
-    // M2 build-log viewer: `open` gates visibility, `content` is the
-    // fetched text (`None` while loading, same three-state shape the old
-    // `OpenBuildLog` used).
+    // Build-log viewer; `content` is `None` while loading.
     let build_log_open = RwSignal::new(false);
     let build_log_content = RwSignal::new(None::<Result<String, String>>);
 
-    // Live boot console: the guest's serial output (kernel + systemd,
-    // already sanitized server-side — see `registry::sanitize_console`),
-    // polled once a second via `read_console_log` while this workspace is
-    // `Booting`. `console_ref` is the mounted `<pre>` the auto-scroll
-    // `Effect` further down keeps pinned to the bottom, same pairing
-    // `set_card_vt_name` uses for the view-transition morph elsewhere in
-    // this file.
+    // Live boot console, polled every second while `Booting`.
     let console_text = RwSignal::new(String::new());
     let console_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
-    // Holds the running interval's handle (see `fetch_console` below) so
-    // it can be torn down the moment this workspace stops `Booting` —
-    // including when the whole modal unmounts, via the `on_cleanup` this
-    // same handle is registered with. Not holding onto a finished boot's
-    // interval forever is the whole point: with no stop condition, this
-    // would otherwise keep silently polling a workspace long after its
-    // console had anything new to say.
+    // Kept so polling stops once the workspace leaves `Booting` or the modal
+    // unmounts.
     let console_interval = StoredValue::new(None::<IntervalHandle>);
 
     let fetch_console = move || {
@@ -1055,11 +775,8 @@ fn WorkspaceModal(
         });
     };
 
-    // Starts polling the instant this workspace becomes `Booting`, and
-    // stops the moment it settles into anything else — but not before one
-    // last fetch, so the panel ends up showing the actual tail of the log
-    // (e.g. the OpenCode startup line) rather than whatever it last showed
-    // mid-poll a second earlier.
+    // On leaving `Booting`, fetch once more so the panel shows the real tail
+    // of the log.
     Effect::new(move |_| {
         let booting = matches!(card_info.get().status, WorkspaceStatus::Booting);
         let already_polling = console_interval.get_value().is_some();
@@ -1084,11 +801,7 @@ fn WorkspaceModal(
         }
     });
 
-    // Keeps the console panel scrolled to the bottom as new output
-    // arrives, same way a real terminal would — otherwise a user watching
-    // a multi-minute boot would have to keep manually re-scrolling every
-    // second. A no-op under `ssr` (there's no DOM to scroll), same as
-    // `click_target`/`set_card_vt_name` elsewhere in this file.
+    // Keep the console scrolled to the newest output.
     Effect::new(move |_| {
         console_text.track();
         if let Some(el) = console_ref.get() {
@@ -1096,15 +809,8 @@ fn WorkspaceModal(
         }
     });
 
-    // Live host-side resource stats (CPU/memory/uptime/disk) for this
-    // workspace's VM — see `registry::AppState::vm_stats`. Same
-    // start/stop-polling shape as the boot console above, but gated on
-    // `Running` instead of `Booting` (there's nothing meaningful to show
-    // in any other state — `vm_stats` itself returns `None` then too).
-    // Each poll's own request takes ~`CPU_SAMPLE_INTERVAL` to resolve (the
-    // server needs two `/proc` samples a beat apart to compute a CPU
-    // delta - see `registry.rs`), so this polls less frequently than the
-    // boot console's 1s tick to avoid overlapping requests piling up.
+    // VM stats, polled while `Running`. Every 2s rather than 1s because each
+    // request waits between two CPU samples, so faster polls would overlap.
     let vm_stats = RwSignal::new(None::<VmStats>);
     let stats_interval = StoredValue::new(None::<IntervalHandle>);
 
@@ -1141,20 +847,14 @@ fn WorkspaceModal(
         }
     });
 
-    // Every capture below (`id`, `busy`, `action_error`, `on_changed`) is
-    // now `Copy`, which makes these closures themselves `Copy` too - no
-    // `.clone()` dance needed anywhere they're used, including from inside
-    // the nested reactive branches further down (e.g. `reset`/`remove`
-    // referenced from inside `{move || if confirming_reset.get() {...}}`).
+    // All captures are `Copy`, so these handlers are `Copy` and can be used
+    // from nested reactive branches without cloning.
     let open = move |_| {
         let id = id.get_value();
         busy.set(true);
         action_error.set(None);
         leptos::task::spawn_local(async move {
-            // Fire-and-forget: this returns as soon as the boot starts in
-            // the background. The badge picks up the idle -> booting… ->
-            // running/failed transition via the live poll; the "Open UI"
-            // link appears once running.
+            // Returns once the boot starts; the live poll shows its progress.
             if let Err(e) = open_workspace(id).await {
                 leptos::logging::error!("open failed: {e}");
                 action_error.set(Some(e.to_string()));
@@ -1169,10 +869,7 @@ fn WorkspaceModal(
         busy.set(true);
         action_error.set(None);
         leptos::task::spawn_local(async move {
-            // Can legitimately take a little while if it races a boot
-            // that's just about to succeed - see
-            // `registry::AppState::stop_workspace`'s doc comment for why
-            // that's an accepted, bounded tradeoff of the R1 fix.
+            // May take a moment if it races a boot that's about to finish.
             if let Err(e) = stop_workspace(id).await {
                 leptos::logging::error!("stop failed: {e}");
                 action_error.set(Some(e.to_string()));
@@ -1212,19 +909,20 @@ fn WorkspaceModal(
         });
     };
 
-    // The modal's title - the path's last segment, same as the card's
-    // name. Computed once (untracked) since the modal is mounted fresh per
-    // open; a workspace's path/name doesn't change while it's open.
+    // Untracked: the modal is mounted per open and the path can't change
+    // while it's open.
     let title = {
         let path = card_info.get_untracked().path;
         path.rsplit('/').next().unwrap_or(&path).to_string()
     };
 
-    // Same name the clicked `WorkspaceCard` just handed off (see its
-    // `style:view-transition-name`) - claiming it here is what makes the
-    // browser morph that card into this modal, and back again on close.
+    // The name the clicked card just released; claiming it morphs the card
+    // into this modal.
     let vt_name = Some(vt_name(&id.get_value()));
 
+    // Start/Stop is one toggle because each status maps to exactly one valid
+    // action (Stop also cancels a boot). Reset is disabled while `Booting`:
+    // a destructive action is reserved for a settled state.
     view! {
         <Modal on_close title vt_name>
             <div class="ws-modal-head">
@@ -1240,11 +938,6 @@ fn WorkspaceModal(
                             <button>"Open UI"</button>
                         </a>
                     })}
-                    // M2: if the last boot attempt failed because the
-                    // repo's `gavmo.nix` didn't build, offer an
-                    // on-demand viewer for the full `nixos-rebuild` log
-                    // (`vm::Error::RebuildFailed` /
-                    // `AppState::read_build_log`).
                     {move || matches!(card_info.get().status, WorkspaceStatus::BuildFailed { .. }).then(|| view! {
                         <button on:click=move |_| {
                             if build_log_open.get_untracked() {
@@ -1255,7 +948,7 @@ fn WorkspaceModal(
                                 return;
                             };
                             build_log_open.set(true);
-                            build_log_content.set(None); // "Loading…" until the fetch below resolves
+                            build_log_content.set(None);
                             let id = id.get_value();
                             leptos::task::spawn_local(async move {
                                 let result = read_build_log(id, log).await.map_err(|e| e.to_string());
@@ -1265,22 +958,6 @@ fn WorkspaceModal(
                             {move || if build_log_open.get() { "Hide build log" } else { "View build log" }}
                         </button>
                     })}
-                    // U3: a single Start/Stop toggle rather than two
-                    // separate buttons - the live status always maps to
-                    // exactly one valid action, so there's no need for
-                    // per-status disabling the way the old two-button
-                    // version needed (disabled states followed the live
-                    // poll, not just `busy` - previously both stayed
-                    // clickable for the ~3s between a fire-and-forget
-                    // action returning and the next poll picking up the
-                    // real status, which was exactly how a user could
-                    // reach Reset while still `Booting` and hit the R1
-                    // race that was paired with fixing). "Stop" while
-                    // Booting/Running (lets an in-progress boot be
-                    // cancelled, same as the old standalone Stop did);
-                    // "Start" otherwise - idle, or retrying after
-                    // Failed/BuildFailed. Disabled only while this
-                    // card's own `busy` action is in flight.
                     <button
                         on:click=move |ev| {
                             if matches!(
@@ -1321,12 +998,6 @@ fn WorkspaceModal(
                     } else {
                         view! {
                             <button
-                                // U3: disabled while `Booting` too - R1
-                                // makes resetting mid-boot safe/race-
-                                // free, but it's still a destructive
-                                // action better reserved for a settled
-                                // state; Stop (or just waiting) is the
-                                // better tool for an in-progress boot.
                                 on:click=move |_| {
                                     confirming_remove.set(false);
                                     confirming_reset.set(true);
@@ -1369,26 +1040,13 @@ fn WorkspaceModal(
                     }}
                 </div>
                 {move || matches!(card_info.get().status, WorkspaceStatus::Booting).then(|| view! {
-                    // U5: a static hint rather than an elapsed-time
-                    // counter - a live timer would need its own
-                    // tick-driven signal here; not worth the added
-                    // complexity for a first pass.
                     <p class="hint">
                         "First boot can take a few minutes - longer if "
                         <code>"gavmo.nix"</code>
                         " needs to fetch or build new packages."
                     </p>
                 })}
-                // Live boot console: visible for as long as there's
-                // something to show — from the moment this workspace
-                // starts `Booting` (even before the first poll resolves,
-                // via the placeholder text below) through to the tail end
-                // of the log fetched right as it settles into
-                // `Running`/`Failed`/`BuildFailed` (see the `Effect` above
-                // that drives `console_text`). Kept visible after boot
-                // finishes rather than disappearing the instant status
-                // flips, so the log doesn't vanish out from under a user
-                // still reading it.
+                // Stays visible after boot so the log doesn't vanish mid-read.
                 {move || {
                     let booting = matches!(card_info.get().status, WorkspaceStatus::Booting);
                     let has_content = !console_text.get().is_empty();
@@ -1407,12 +1065,6 @@ fn WorkspaceModal(
                         </div>
                     })
                 }}
-                // Live host-side resource stats: visible only while
-                // `Running` *and* a poll has actually resolved at least
-                // once (`vm_stats` starts `None` and the first poll takes
-                // a beat - see `fetch_stats`/`CPU_SAMPLE_INTERVAL` - so
-                // there'd otherwise be an empty flash right as the modal
-                // for a running workspace opens).
                 {move || vm_stats.get().map(|s| view! {
                     <div class="stats-panel">
                         <div class="stat-row">
@@ -1433,11 +1085,7 @@ fn WorkspaceModal(
                         </div>
                         <div class="stat-row">
                             <span class="stat-label">"Memory"</span>
-                            // Guest-reported (virtio-balloon), not qemu's host-side
-                            // RSS - see `VmStats::mem_used_bytes`'s doc comment for
-                            // why. `None` means the guest's balloon driver hasn't
-                            // reported yet (e.g. moments after boot) - show a plain
-                            // placeholder rather than a misleading 0%/full bar.
+                            // Placeholder until the balloon driver reports.
                             {match (s.mem_used_bytes, s.mem_total_bytes) {
                                 (Some(used), Some(total)) => view! {
                                     <div class="stat-bar">
@@ -1493,10 +1141,8 @@ fn WorkspaceModal(
     }
 }
 
-/// The modal's Tools panel: lists the tools this workspace's `gavmo.yaml`
-/// requests and lets the user configure each one's credential on the host. Loads
-/// live (so it reflects config/secret changes), reloading itself after any
-/// change so the configured/enabled status stays accurate.
+/// The modal's Tools panel: lists the workspace's requested tools and lets
+/// the user set each one's credential. Reloads after any change.
 #[component]
 fn WorkspaceTools(id: String) -> impl IntoView {
     let id = StoredValue::new(id);
@@ -1520,8 +1166,7 @@ fn WorkspaceTools(id: String) -> impl IntoView {
         });
     };
 
-    // One-shot initial load (the closure reads no reactive state, so the
-    // effect runs exactly once after mount).
+    // Reads no reactive state, so this runs once after mount.
     Effect::new(move |_| reload());
 
     let on_changed = Callback::new(move |()| reload());
@@ -1558,10 +1203,8 @@ fn WorkspaceTools(id: String) -> impl IntoView {
     }
 }
 
-/// One tool's row in the Tools panel: its details, configured/enabled status,
-/// and a form to set (or clear/test) its credential. Holds its own form state;
-/// after a successful change it fires `on_changed` so the parent reloads (which
-/// recreates this row with fresh status).
+/// One tool's row: details, status, and a form to set, clear, or test its
+/// credential. Fires `on_changed` after a change so the parent reloads.
 #[component]
 fn ToolRow(
     tool: ToolConfig,
@@ -1721,23 +1364,18 @@ fn ToolRow(
 
 fn status_view(status: &WorkspaceStatus) -> (&'static str, String, Option<String>) {
     match status {
-        // `WorkspaceStatus::Stopped` covers both "never booted" and
-        // "cleanly stopped" (see `vm::VmStatus::Stopped`) — "idle" avoids
-        // implying the workspace was previously running.
+        // Covers "never booted" too, so "idle" rather than "stopped".
         WorkspaceStatus::Stopped => ("idle", "idle".into(), None),
         WorkspaceStatus::Booting => ("booting", "booting…".into(), None),
         WorkspaceStatus::Running { url } => ("running", "running".into(), Some(url.clone())),
         WorkspaceStatus::Failed { reason } => ("failed", format!("failed: {reason}"), None),
-        // Reuses the "failed" badge color - it's a real failure to the
-        // user, just a more specific/actionable one (see `WorkspaceRow`'s
-        // "View build log" button for the specific part).
+        // Same badge color as "failed"; the modal offers the build log.
         WorkspaceStatus::BuildFailed { .. } => ("failed", "gavmo.nix build failed".into(), None),
     }
 }
 
-/// Formats a byte count the way a human skimming a stats panel wants:
-/// whole-number KiB, one decimal for MiB/GiB. Binary (1024-based) units,
-/// matching how RSS/overlay-disk sizes are actually measured.
+/// Formats a byte count with binary units: whole KiB, one decimal for MiB,
+/// two for GiB.
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -1755,10 +1393,8 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Formats a duration in seconds as a compact, human-readable uptime
-/// (`"45s"`, `"3m 12s"`, `"2h 05m"`, `"1d 03h"`) — always the two most
-/// significant units, never more, so it stays short in a compact stats
-/// panel.
+/// Formats seconds as a compact uptime using at most the two most
+/// significant units (`"45s"`, `"3m 12s"`, `"2h 05m"`, `"1d 03h"`).
 fn format_uptime(total_secs: u64) -> String {
     let days = total_secs / 86_400;
     let hours = (total_secs % 86_400) / 3600;
@@ -1796,14 +1432,8 @@ fn FolderBrowser(on_added: Callback<()>) -> impl IntoView {
         }
     };
 
-    // U4: a manual path entry, since the click-through list below hides
-    // dotfiles/dirs (`browse_dir`'s own filtering — see `app.rs`) and has
-    // no way to type an exact destination. `browse_dir` already
-    // canonicalizes and reports a clear error for anything invalid, so
-    // jumping straight to a typed path reuses the exact same `listing`
-    // resource/error path as clicking through would. Captures only `Copy`
-    // signals, so the closure itself is `Copy` - reused as-is from both
-    // `on:click` and `on:keydown` below without needing `.clone()`.
+    // Manual path entry, since the list hides dotdirs. `browse_dir` validates
+    // the path, so a typed path reuses the same listing/error handling.
     let path_input = RwSignal::new(String::new());
     let go_to_typed_path = move || {
         let typed = path_input.get_untracked();
@@ -1876,7 +1506,7 @@ mod format_tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2048), "2 KiB");
-        assert_eq!(format_bytes(1_572_864), "1.5 MiB"); // 1.5 MiB
+        assert_eq!(format_bytes(1_572_864), "1.5 MiB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GiB");
     }
 

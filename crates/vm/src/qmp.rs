@@ -1,14 +1,9 @@
-//! A minimal QMP (QEMU Machine Protocol) client used for VM lifecycle
-//! control (status checks, graceful shutdown, force quit).
+//! A minimal QMP (QEMU Machine Protocol) client for VM lifecycle control
+//! and guest memory stats.
 //!
-//! This deliberately uses the `qapi` crate's **synchronous** API
-//! (`qapi::Qmp` over a plain `std::os::unix::net::UnixStream`) rather than
-//! its async/tokio integration. Our usage is low-frequency — a handful of
-//! calls per VM lifecycle, not a long-lived streaming connection — so each
-//! call opens a fresh short-lived connection on a blocking thread via
-//! `spawn_blocking`. This avoids a hard-to-name generic type that the
-//! async API would otherwise force into this module's public surface (see
-//! `plan.md`'s QMP section for the reasoning).
+//! Uses `qapi`'s synchronous API with a fresh connection per call on
+//! `spawn_blocking`: calls are infrequent, and the async API would leak a
+//! hard-to-name generic type into this module's surface.
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -36,24 +31,14 @@ pub async fn quit(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// QOM path of the `virtio-balloon-pci` device `qemu.rs` always adds. QEMU
-/// places a `-device`'s QOM object under `/machine/peripheral/<id>`, so this
-/// is derived from the same [`crate::qemu::BALLOON_DEVICE_ID`] constant that
-/// names the device on the qemu command line — one source of truth instead
-/// of the id and this path drifting apart.
+/// QOM path of the balloon device; QEMU places `-device id=X` objects under
+/// `/machine/peripheral/X`.
 fn balloon_qom_path() -> String {
     format!("/machine/peripheral/{}", crate::qemu::BALLOON_DEVICE_ID)
 }
 
-/// Sets how often (in seconds) the guest's virtio-balloon driver reports
-/// memory stats back to qemu, by writing the balloon device's
-/// `guest-stats-polling-interval` QOM property. Called once at the end of
-/// [`crate::handle::RunningVm::boot`].
-///
-/// Best-effort by design: a VM this fails for (or that's never called this
-/// at all) still boots and runs completely normally — it just never gets
-/// [`guest_memory`] readings, and the control panel shows "—" for memory
-/// instead of a number. Never treat a failure here as fatal to boot.
+/// Sets how often (in seconds) the guest's balloon driver reports memory
+/// stats to qemu. Until this is set, [`guest_memory`] never has readings.
 pub async fn set_balloon_stats_interval(socket_path: &Path, interval_secs: u32) -> Result<()> {
     execute(
         socket_path,
@@ -67,30 +52,21 @@ pub async fn set_balloon_stats_interval(socket_path: &Path, interval_secs: u32) 
     Ok(())
 }
 
-/// A guest's self-reported memory usage, from its virtio-balloon driver —
-/// deliberately distinct from qemu's host-side process RSS (see
-/// `app::VmStats`'s doc comment for why RSS was the wrong number to show).
+/// A guest's self-reported memory usage from its balloon driver. Distinct
+/// from qemu's host RSS, which reflects pages touched, not guest usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestMemory {
     /// Total guest RAM, in bytes, as reported by the guest kernel.
     pub total_bytes: u64,
-    /// Memory the guest kernel considers available for new allocations
-    /// without swapping — i.e. `MemAvailable` from the guest's own
-    /// `/proc/meminfo`, which already counts reclaimable page cache as
-    /// free. `total_bytes - available_bytes` is therefore a "real pressure"
-    /// used figure, not inflated by cache the guest could drop instantly.
+    /// The guest's `MemAvailable`, which counts reclaimable page cache as
+    /// free, so `total_bytes - available_bytes` isn't inflated by cache.
     pub available_bytes: u64,
 }
 
-/// Reads the guest's current memory stats via its virtio-balloon driver
-/// (see [`set_balloon_stats_interval`] for how the guest is told to start
-/// reporting).
+/// Reads the guest's current memory stats via its balloon driver.
 ///
-/// Returns `Ok(None)` — not an error — if the driver hasn't reported yet:
-/// the QOM property's `last-update` is `0` until the guest's first
-/// stats round-trip after boot. Callers should treat `None` the same as
-/// `vm::stats::sample`'s errors elsewhere in this crate: "no stats this
-/// tick", not a hard failure.
+/// Returns `Ok(None)` if the guest hasn't reported yet (`last-update` is 0
+/// until its first report after boot); treat it as "no stats this tick".
 pub async fn guest_memory(socket_path: &Path) -> Result<Option<GuestMemory>> {
     let value = execute(
         socket_path,
@@ -104,15 +80,9 @@ pub async fn guest_memory(socket_path: &Path) -> Result<Option<GuestMemory>> {
     Ok(parse_guest_stats(&value))
 }
 
-/// Pure parse of the JSON value `qom-get .../guest-stats` returns — split
-/// out from the QMP round-trip above so it's unit-testable in the sidecar
-/// against a literal JSON fixture, with no real qemu/socket needed (same
-/// "pure fn split from IO" convention as
-/// `share::build_virtiofsd_args`/`disk::build_overlay_args` elsewhere in
-/// this crate).
+/// Pure parse of the `qom-get .../guest-stats` value, for unit testing.
 ///
-/// Expected shape (QEMU's virtio-balloon `guest-stats` QOM property, stable
-/// API since QEMU 2.9's balloon memory-stats support):
+/// Expected shape:
 /// ```json
 /// {
 ///   "last-update": 1700000000,
@@ -124,10 +94,7 @@ pub async fn guest_memory(socket_path: &Path) -> Result<Option<GuestMemory>> {
 ///   }
 /// }
 /// ```
-/// Any deviation from this (missing fields, `last-update` still `0`) is
-/// treated as "not ready yet" via `None`, never a panic — defensive against
-/// a QEMU version that renamed/omitted a field, same posture as the rest of
-/// this crate's `/proc`-parsing in `stats.rs`.
+/// Missing fields or `last-update` of 0 yield `None`, never a panic.
 fn parse_guest_stats(value: &serde_json::Value) -> Option<GuestMemory> {
     let last_update = value.get("last-update")?.as_u64()?;
     if last_update == 0 {
@@ -166,9 +133,8 @@ where
         source,
     })?;
 
-    // `&UnixStream` implements `Read + Write + Clone` (references are
-    // trivially `Copy`/`Clone`), which is what `Qmp::from_stream` requires
-    // — matching the crate's own documented usage pattern exactly.
+    // `Qmp::from_stream` needs `Read + Write + Clone`, which `&UnixStream`
+    // provides.
     let mut qmp = qapi::Qmp::from_stream(&stream);
 
     qmp.handshake()

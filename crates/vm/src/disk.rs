@@ -4,17 +4,9 @@ use tokio::process::Command;
 
 use crate::error::{Error, Result};
 
-/// Virtual size given to every overlay disk, regardless of the backing
-/// image's own size. `nix/base/flake.nix` builds the base qcow with no
-/// explicit `diskSize`, so `nixos-generators` auto-sizes it to roughly the
-/// base closure plus ~512 MiB of headroom - nowhere near enough once a
-/// repo's own `gavmo.nix` pulls in anything substantial (e.g.
-/// `examples/playwright/gavmo.nix`'s Chromium bundle). `qemu-img create -b`
-/// happily creates an overlay *larger* than its backing file, and qcow2 is
-/// sparse - this costs no real host disk space until the guest actually
-/// writes that far - so there's no real downside to being generous here.
-/// `boot.growPartition` + `fileSystems."/".autoResize` in `nix/base/disk.nix`
-/// grow the guest's ext4 root to fill it on boot.
+/// Virtual size of every overlay disk. The base image is auto-sized with
+/// little headroom, too small once `gavmo.nix` adds real packages; qcow2 is
+/// sparse so this costs nothing until written, and the guest grows its root fs.
 const OVERLAY_DISK_SIZE: &str = "32G";
 
 /// Builds the `qemu-img create` argument list for a copy-on-write overlay
@@ -37,9 +29,8 @@ pub fn build_overlay_args(base_image: &Path, overlay_path: &Path) -> Vec<String>
 /// Ensures the per-workspace overlay disk exists, creating it backed by
 /// `base_image` if missing. The base image is never modified.
 ///
-/// If the overlay already exists (a previous boot), it is left untouched so
-/// that `/nix` and OpenCode session state persist across restarts — this is
-/// the MVP's cache-reuse story, with no shared/committed cache needed.
+/// An existing overlay is left untouched so `/nix` and OpenCode session
+/// state persist across restarts.
 pub async fn ensure_overlay(base_image: &Path, overlay_path: &Path) -> Result<()> {
     if overlay_path.exists() {
         return Ok(());

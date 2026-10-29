@@ -1,32 +1,12 @@
-//! Session auth for the daemon's control-panel listener (`127.0.0.1:3000`).
+//! Session auth for the control-panel listener.
 //!
-//! **Why this exists:** QEMU's user-mode networking means a workspace's
-//! guest VM can reach this daemon's loopback listener via `10.0.2.2` exactly
-//! as easily as the host's own browser can (see `crates/mcp/plan.md` §3/§6,
-//! which flagged this as a known, then-unfixed exposure). Binding to
-//! `127.0.0.1` is therefore **not** a boundary against the guest — every
-//! `#[server]` function in `app.rs` (host filesystem browsing, workspace
-//! reset/remove, stored-credential probing, etc.) was reachable from inside
-//! any one workspace, with no auth at all. A malicious or prompt-injected
-//! agent — which runs with wide-open root inside its VM by design (see the
-//! top-level README and `nix/base/configuration.nix`'s permission policy) —
-//! could use this to control every other workspace and read arbitrary host
-//! files.
+//! Guest VMs reach host loopback via QEMU's `10.0.2.2`, so binding to
+//! `127.0.0.1` does not stop an in-VM agent from calling `#[server]`
+//! functions. Every non-public route therefore requires a session cookie
+//! matching a host-only token that no guest share can read.
 //!
-//! **The fix:** gate every route except the login page and static assets
-//! behind a session cookie that must match a host-only secret
-//! ([`load_or_create_token`]) — the same bearer-token posture `crates/mcp`
-//! already uses for its own gateway, just cookie-based here since the
-//! consumer is a browser rather than an MCP client. The secret is never
-//! written anywhere a guest's 9p shares can reach and never echoed into any
-//! served page — the login flow only ever *compares* against it.
-//!
-//! **Delivery (the "completely automatic" requirement):** the daemon prints
-//! `http://localhost:3000/login?token=<token>` to its own stdout at startup
-//! (see `main.rs`) — the same channel a user already watches to run `gavmo`
-//! in the first place. Visiting that URL once sets a long-lived cookie, so a
-//! given browser profile never needs the token again, including across
-//! daemon restarts (the token itself is persisted, not regenerated per run).
+//! The daemon prints a `/login?token=...` URL at startup; visiting it once
+//! sets a long-lived cookie. The token is persisted across restarts.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,32 +20,20 @@ use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 
-/// The cookie every guarded route checks for. `HttpOnly` (set in
-/// [`login_handler`]) so it's inaccessible to any JS running on the page —
-/// not that this page runs attacker JS, but there's no reason to make it
-/// readable either.
+/// Session cookie name checked by every guarded route.
 pub const SESSION_COOKIE_NAME: &str = "gavmo_session";
 
-/// The one route reachable with no session at all — otherwise nobody could
-/// ever obtain one. See [`is_public_path`].
+/// The one guarded-app route reachable without a session.
 pub const LOGIN_PATH: &str = "/login";
 
-/// One year, in seconds — the session cookie's `Max-Age`. Long enough that a
-/// user effectively never has to re-authenticate in the same browser
-/// profile. The real revocation lever is the daemon-side token file itself
-/// (delete `ui_token` and restart to invalidate every outstanding cookie at
-/// once), not a short cookie lifetime.
+/// One year. Revocation is done by deleting `ui_token` and restarting, not
+/// by a short cookie lifetime.
 const SESSION_COOKIE_MAX_AGE_SECS: u64 = 365 * 24 * 60 * 60;
 
-// ---------------------------------------------------------------------------
-// Token: minted once, persisted host-only, never guest-visible.
-// ---------------------------------------------------------------------------
+// --- Token ---
 
-/// `~/.local/share/gavmo/ui_token` (or platform equivalent). Deliberately
-/// **outside** every 9p share a VM ever mounts (compare `VmConfig`'s share
-/// list in `crates/vm/src/config.rs`) — this file is the one thing that
-/// authorizes calling any `#[server]` function, so a guest must never be
-/// able to read it the way it *can* read, say, the MCP token share.
+/// `<data_dir>/gavmo/ui_token`. Must stay outside every 9p share a VM
+/// mounts, since it authorizes all `#[server]` calls.
 fn token_path() -> io::Result<PathBuf> {
     let dir = dirs::data_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
@@ -74,35 +42,21 @@ fn token_path() -> io::Result<PathBuf> {
     Ok(dir.join("ui_token"))
 }
 
-/// Loads the persisted session token, minting and persisting a fresh one on
-/// first run. Persisting (rather than regenerating every boot) is what lets
-/// a browser that already holds the session cookie from a previous run stay
-/// authenticated across a daemon restart, rather than needing the printed
-/// URL again every time.
+/// Loads the persisted session token, minting one on first run. Persisting
+/// keeps existing browser sessions valid across daemon restarts.
 pub fn load_or_create_token() -> io::Result<String> {
     load_or_create_token_at(&token_path()?)
 }
 
-/// The testable half of [`load_or_create_token`] — takes an explicit path
-/// rather than resolving `token_path()` itself, so this can be exercised
-/// against a scratch directory without touching the real app-data dir (same
-/// split as `registry.rs`'s `resolve_host_port_in` taking an explicit
-/// `&mut Registry` rather than loading one itself).
+/// [`load_or_create_token`] with an explicit path, for tests.
 fn load_or_create_token_at(path: &Path) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(existing) if !existing.trim().is_empty() => Ok(existing.trim().to_string()),
         _ => {
-            // Two concatenated UUIDv4s (~244 bits) rather than one: `uuid`
-            // is already a dependency (see the MCP token minting in
-            // `registry.rs`), so this avoids pulling in a dedicated CSPRNG
-            // crate purely for a few extra bits that aren't the limiting
-            // factor here — the real security boundary is "the guest never
-            // sees this file at all", not token length.
+            // Two UUIDv4s (~244 random bits) avoids a dedicated CSPRNG dep.
             let token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
             std::fs::write(path, &token)?;
-            // Best-effort, same posture as the MCP token's `set_permissions`
-            // in `registry.rs`: owner-only permissions are cheap insurance
-            // against another local user on a shared host reading it.
+            // Owner-only, against other local users on a shared host.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -113,16 +67,10 @@ fn load_or_create_token_at(path: &Path) -> io::Result<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure helpers (cookie parsing, constant-time compare, the public-path
-// allowlist) — exhaustively unit-tested without any real HTTP transport.
-// ---------------------------------------------------------------------------
+// --- Helpers ---
 
-/// Extracts the value of cookie `name` from a request's `Cookie` header(s).
-/// Handles the normal single-header `; `-separated multi-pair format, and
-/// also checks every `Cookie` header if more than one is present (some
-/// proxies/clients split them) — `None` if the named cookie isn't present in
-/// any of them, or a header value isn't valid UTF-8.
+/// Extracts cookie `name` from the request, checking every `Cookie` header
+/// since some clients split them. Non-UTF-8 headers are skipped.
 fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     for header in headers.get_all(header::COOKIE) {
         let Ok(value) = header.to_str() else { continue };
@@ -138,11 +86,7 @@ fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-/// Constant-time string comparison — belt-and-suspenders against a timing
-/// side-channel on the session-cookie check below. The threat model here
-/// (a single-user localhost daemon) makes exploiting a timing difference
-/// impractical in the first place, but the check costs nothing and mirrors
-/// the posture security-sensitive comparisons conventionally take.
+/// Constant-time comparison so token checks leak no timing information.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -155,30 +99,21 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Paths reachable with **no** session cookie. Deliberately narrow:
-/// [`LOGIN_PATH`] itself (otherwise nobody could ever authenticate), the
-/// static WASM/CSS bundle under `/pkg/` (`site-pkg-dir` in `Cargo.toml`),
-/// and `/favicon.ico`. None of these carry any capability or secret — just
-/// inert bytes — so gating them would only add friction (the login
-/// fallback page can't even render its own styling without `/pkg/`) without
-/// protecting anything.
+/// Paths reachable without a session: the login page and inert static
+/// assets (`/pkg/` bundle, favicon). This is the single public allowlist.
 fn is_public_path(path: &str) -> bool {
     path == LOGIN_PATH || path.starts_with("/pkg/") || path == "/favicon.ico"
 }
 
-// ---------------------------------------------------------------------------
-// The /login route.
-// ---------------------------------------------------------------------------
+// --- Login route ---
 
 #[derive(Deserialize)]
 struct LoginQuery {
     token: Option<String>,
 }
 
-/// Shown when `/login` is visited with no (or the wrong) token — i.e. *not*
-/// via the URL the daemon itself printed at startup. Deliberately never
-/// echoes the real token back into the page, and doesn't distinguish
-/// "missing" from "wrong" (nothing useful to a legitimate user either way).
+/// Shown for a missing or wrong token. Never echoes the token and does not
+/// distinguish the two cases.
 const LOGIN_FALLBACK_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>GAVMO</title></head>
@@ -190,11 +125,8 @@ const LOGIN_FALLBACK_HTML: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
-/// `GET /login?token=...` — the only way to obtain the session cookie every
-/// other guarded route requires (see [`require_session`]). A correct token
-/// sets a long-lived `HttpOnly` cookie and redirects to `/`, so the token
-/// itself never lingers in the visible address bar past this one request.
-/// Anything else (no token, wrong token) gets [`LOGIN_FALLBACK_HTML`].
+/// `GET /login?token=...`: a correct token sets the session cookie and
+/// redirects to `/` so the token leaves the address bar.
 async fn login_handler(
     State(expected): State<Arc<String>>,
     Query(query): Query<LoginQuery>,
@@ -214,33 +146,18 @@ async fn login_handler(
     }
 }
 
-/// The `/login` route as a standalone, already-stated sub-router — merge
-/// this into the main app (see `main.rs`). Kept separate from
-/// [`require_session`]'s path-allowlist approach so this handler is the
-/// *only* place the real token is ever compared against user input.
+/// The `/login` route as a stateful sub-router to merge into the app.
 pub fn login_router(token: Arc<String>) -> Router {
     Router::new()
         .route(LOGIN_PATH, get(login_handler))
         .with_state(token)
 }
 
-// ---------------------------------------------------------------------------
-// The auth gate itself.
-// ---------------------------------------------------------------------------
+// --- Auth gate ---
 
-/// The auth gate. Apply as a layer over the *entire* app router (see
-/// `main.rs`) — every request not covered by [`is_public_path`] must carry a
-/// `gavmo_session` cookie matching the host-only `ui_token`
-/// ([`load_or_create_token`]).
-///
-/// `/api/*` (the actual `#[server]` function surface — filesystem browsing,
-/// workspace reset/remove, stored-credential probing, etc.) gets a bare
-/// `401` on failure: there's no useful "redirect to login" UX for a
-/// `#[server]` function's own `fetch` call, and a bare 401 reveals nothing
-/// beyond "not authenticated". Page routes instead redirect to
-/// [`LOGIN_PATH`], so a human landing on the bare control-panel URL with no
-/// cookie gets pointed at the fallback page telling them to run `gavmo`
-/// again, rather than a cryptic 401.
+/// Middleware for the whole app router: non-public requests need a valid
+/// session cookie. `/api/*` gets a bare 401 (it is called via `fetch`);
+/// page routes redirect to [`LOGIN_PATH`].
 pub async fn require_session(
     State(expected): State<Arc<String>>,
     req: Request,
@@ -272,11 +189,7 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
-    /// A unique scratch dir under the OS temp dir, named with the test's own
-    /// identity (PID + a monotonic counter) so concurrent `cargo test`
-    /// threads can't collide. Mirrors `registry.rs`'s own `unique_temp_dir`
-    /// test helper (not shared across modules — small enough not to be
-    /// worth a shared test-utils module).
+    /// Scratch dir unique per PID + counter so parallel tests don't collide.
     fn unique_temp_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -284,7 +197,7 @@ mod tests {
         std::env::temp_dir().join(format!("gavmo-auth-test-{tag}-{}-{n}", std::process::id()))
     }
 
-    // --- cookie_value ------------------------------------------------------
+    // --- cookie_value ---
 
     #[test]
     fn cookie_value_extracts_named_cookie_among_several() {
@@ -325,7 +238,7 @@ mod tests {
         assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), None);
     }
 
-    // --- constant_time_eq ---------------------------------------------------
+    // --- constant_time_eq ---
 
     #[test]
     fn constant_time_eq_matches_equal_strings() {
@@ -347,7 +260,7 @@ mod tests {
         assert!(constant_time_eq("", ""));
     }
 
-    // --- is_public_path ------------------------------------------------------
+    // --- is_public_path ---
 
     #[test]
     fn is_public_path_allows_login_and_static_assets() {
@@ -365,7 +278,7 @@ mod tests {
         assert!(!is_public_path("/pkg")); // no trailing slash: not a real route anyway
     }
 
-    // --- load_or_create_token_at ---------------------------------------------
+    // --- load_or_create_token_at ---
 
     #[test]
     fn load_or_create_token_at_mints_and_persists_a_token_on_first_call() {
@@ -409,13 +322,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- require_session / login_router, end to end over a real router -----
+    // --- require_session / login_router ---
 
-    /// Builds a minimal stand-in for `main.rs`'s real app router — just
-    /// enough surface (one `/api/*`-shaped route, one page route, the real
-    /// `/login` route) to exercise [`require_session`]'s actual routing
-    /// behavior via `tower::ServiceExt::oneshot`, without needing the real
-    /// Leptos routes or `AppState`.
+    /// Minimal stand-in for the real app router: one API route, one page
+    /// route, and the real `/login`.
     fn test_router(token: Arc<String>) -> Router {
         Router::new()
             .route("/api/test", get(|| async { "ok" }))
@@ -511,8 +421,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The fallback page, not a redirect/401 — `/login` itself must
-        // never be gated, or nobody could ever authenticate.
+        // Fallback page, not a redirect or 401.
         assert_eq!(res.status(), StatusCode::OK);
     }
 

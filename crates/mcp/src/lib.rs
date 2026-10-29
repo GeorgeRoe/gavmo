@@ -1,18 +1,9 @@
-//! GAVMO's host-side MCP tool gateway (brief Phase 4 — see
-//! `gavmo-chatgpt-plan.md` §11 and `crates/mcp/plan.md`).
+//! GAVMO's host-side MCP tool gateway: an MCP server over Streamable HTTP
+//! with every call gated by a per-workspace bearer token.
 //!
-//! This crate is pure mechanism, same spirit as `vm`: it knows how to run an
-//! MCP server over Streamable HTTP and gate every call behind a per-workspace
-//! bearer token, but it has no idea what a "workspace" or a "secret" actually
-//! is — that's the daemon's job (`crates/gavmo`), injected via the
-//! [`TokenAuthority`] trait so this crate doesn't depend on `gavmo` (mirrors
-//! how `vm` doesn't know about workspace registries either).
-//!
-//! P4.0 (the current milestone — see `plan.md`) ships exactly one tool,
-//! `gavmo_ping`, whose only job is proving the transport end-to-end: guest
-//! reachability, bearer-token auth, and OpenCode's remote-MCP wiring. Real
-//! tools (Jira, etc.) land in later sub-milestones behind the same
-//! `TokenAuthority`-resolved [`WorkspaceScope`].
+//! Pure mechanism: workspaces, secrets and tools belong to the daemon, which
+//! plugs in via [`TokenAuthority`] and [`ToolExecutor`] so this crate never
+//! depends on `gavmo`.
 
 use std::sync::Arc;
 
@@ -25,49 +16,29 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 
-/// The host port the gateway listens on, constant across every workspace
-/// (only the bearer token varies per-workspace — see `plan.md`'s "always-on,
-/// empty-by-default" design point). Baked into `nix/base/configuration.nix`'s
-/// managed `mcp.gavmo-tools` entry as `http://10.0.2.2:<this>/mcp` — `10.0.2.2`
-/// is QEMU user-mode networking's host address (see `vm::qemu`). There is no
-/// automatic sharing between this Rust constant and the Nix literal; a change
-/// here must be mirrored there by hand (same story as
-/// `vm::GUEST_OPENCODE_PORT`).
+/// Host port the gateway listens on; the same for every workspace (only the
+/// token differs). Hardcoded as `http://10.0.2.2:7071/mcp` in
+/// `nix/base/configuration.nix` - keep the two in sync by hand.
 pub const GAVMO_MCP_PORT: u16 = 7071;
 
-/// What a validated bearer token authorizes. Deliberately minimal for P4.0 —
-/// just enough to prove the pipeline (the `gavmo_ping` tool only echoes
-/// `workspace_id` back). Later sub-milestones (P4.1+) will extend this with
-/// the workspace's enabled/authorized tool set, computed by the daemon from
-/// `gavmo.toml` + its secret store.
+/// What a validated bearer token authorizes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceScope {
     pub workspace_id: String,
 }
 
-/// Resolves a bearer token to the workspace it authorizes. Implemented by the
-/// daemon's `AppState` (`crates/gavmo/src/registry.rs`) — this crate only
-/// consumes the trait, so it has no dependency on `gavmo` and no opinion on
-/// how tokens are minted, stored, or expired.
-///
-/// Synchronous by design: resolution is expected to be a cheap in-memory
-/// lookup (a `HashMap` guarded by a `std::sync::Mutex`, not an async one) —
-/// see the implementation note in `crates/gavmo/src/registry.rs`.
+/// Resolves a bearer token to the workspace it authorizes. Token minting and
+/// expiry are the implementor's concern. Synchronous because resolution is
+/// expected to be a cheap in-memory lookup.
 pub trait TokenAuthority: Send + Sync + 'static {
-    /// Returns `Some` only for a currently-valid token. An unknown, stale
-    /// (e.g. belonging to a since-stopped VM), or malformed token must
-    /// return `None` — callers treat that identically to "no token at all".
+    /// `Some` only for a currently-valid token; unknown, stale or malformed
+    /// tokens return `None`, treated the same as no token at all.
     fn resolve(&self, token: &str) -> Option<WorkspaceScope>;
 }
 
 /// Extracts the bearer token from an `Authorization` header value, if the
-/// header is present, valid UTF-8, and shaped `Bearer <token>`.
-///
-/// Pure and independent of any rmcp/HTTP-server machinery (just
-/// `http::HeaderMap`) so it's exhaustively unit-testable without standing up
-/// a real request/response or `RequestContext` — see `handler::authorize`
-/// for how this plugs into an actual MCP call, which instead needs
-/// hardware-level verification (P4.0's gate — see `plan.md`).
+/// header is present, valid UTF-8, and shaped `Bearer <token>`. Kept free of
+/// rmcp types so it is unit-testable without a live `RequestContext`.
 pub fn bearer_token_from_headers(headers: &http::HeaderMap) -> Option<&str> {
     headers
         .get(http::header::AUTHORIZATION)?
@@ -76,45 +47,31 @@ pub fn bearer_token_from_headers(headers: &http::HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// A transport-neutral description of one tool, as returned by a
-/// [`ToolExecutor`]. Deliberately *not* an `rmcp::model::Tool`: this is the
-/// boundary that keeps the daemon (`crates/gavmo`) — which implements the
-/// executor — free of any `rmcp` dependency. This crate translates it into a
-/// real `Tool` in [`descriptor_to_tool`].
+/// A transport-neutral tool description. Not an `rmcp::model::Tool`, so the
+/// daemon implementing [`ToolExecutor`] needs no `rmcp` dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDescriptor {
     /// The tool name the agent calls (e.g. `"gavmo_ping"`).
     pub name: String,
-    /// Human/agent-facing description (shown in `tools/list`).
+    /// Description shown in `tools/list`.
     pub description: String,
-    /// The tool's JSON-Schema input object (the `{"type":"object",…}` map).
+    /// The tool's JSON-Schema input object.
     pub input_schema: serde_json::Map<String, serde_json::Value>,
 }
 
-/// The result of a tool call, transport-neutral (see [`ToolDescriptor`] for why
-/// this isn't an `rmcp` type). Both variants carry text; this crate maps
-/// `Success` to a successful `CallToolResult` and `Error` to a *tool-level*
-/// error result (not a protocol error — per rmcp's convention, "the tool ran
-/// and failed" is a message the caller should see).
+/// Transport-neutral result of a tool call. `Error` becomes a tool-level error
+/// result the caller sees, not a protocol error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutcome {
     Success(String),
     Error(String),
 }
 
-/// Runs the tools a workspace is authorized for. Implemented by the daemon's
-/// `AppState` (`crates/gavmo`) alongside [`TokenAuthority`]; this crate only
-/// consumes the trait, so credential lookup, HTTP forwarding, etc. never enter
-/// `mcp` (mirrors how [`TokenAuthority`] keeps token storage out of here).
-///
-/// `call_tool` is only ever invoked by this crate for a tool the executor
-/// itself advertised via `list_tools` for the same scope — the handler rejects
-/// unknown names as a protocol error before dispatching (see
-/// [`GavmoMcpHandler::call_tool`]). The returned future is `Send` because it's
-/// awaited inside the transport's `Send` request handler.
+/// Runs the tools a workspace is authorized for, keeping credential lookup and
+/// forwarding out of this crate. `call_tool` is only invoked for names that
+/// `list_tools` advertised for the same scope.
 pub trait ToolExecutor: Send + Sync + 'static {
-    /// The tools available to `scope`, in `tools/list` order. An empty vec is
-    /// valid (a workspace with nothing enabled).
+    /// The tools available to `scope`, in `tools/list` order (may be empty).
     fn list_tools(&self, scope: &WorkspaceScope) -> Vec<ToolDescriptor>;
 
     /// Executes `name` for `scope` with the given JSON arguments.
@@ -126,8 +83,6 @@ pub trait ToolExecutor: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = ToolOutcome> + Send;
 }
 
-/// Translates a transport-neutral [`ToolDescriptor`] into the `rmcp` `Tool` the
-/// Streamable HTTP transport serializes for `tools/list`.
 fn descriptor_to_tool(descriptor: ToolDescriptor) -> Tool {
     Tool::new(
         descriptor.name,
@@ -136,32 +91,16 @@ fn descriptor_to_tool(descriptor: ToolDescriptor) -> Tool {
     )
 }
 
-/// The MCP `ServerHandler`: a fresh instance is constructed per request (see
-/// [`service`] — `StreamableHttpService` runs stateless/per-request, so this
-/// struct holds only a cheap `Clone` of the shared backend, not any
-/// request-scoped state of its own).
-///
-/// The single `backend` is both the [`TokenAuthority`] (who is this caller?) and
-/// the [`ToolExecutor`] (what can they do, and do it) — the daemon's `AppState`
-/// implements both. Keeping it one value means the handler never has to
-/// reconcile two separately-cloned views of daemon state.
-///
-/// Public only because it appears in [`service`]'s return type (the
-/// `StreamableHttpService<GavmoMcpHandler<A>, _>` the caller mounts on their
-/// router) — there's no reason to construct one directly, so its field stays
-/// private.
+/// The MCP `ServerHandler`, constructed fresh per request. One `backend` serves
+/// as both authority and executor so the two never see divergent state.
+/// Public only because it appears in [`service`]'s return type.
 pub struct GavmoMcpHandler<A> {
     backend: A,
 }
 
 impl<A: TokenAuthority + ToolExecutor> GavmoMcpHandler<A> {
-    /// Pulls the raw HTTP request parts the Streamable HTTP transport
-    /// injects into every [`RequestContext`] (see `StreamableHttpService`'s
-    /// own doc comment in the `rmcp` source for this mechanism), extracts a
-    /// bearer token, and resolves it. `None` covers every way a call can be
-    /// unauthorized: no `Authorization` header, wrong scheme, or a token the
-    /// authority doesn't recognize — callers don't need to distinguish
-    /// these cases.
+    /// Resolves the bearer token from the HTTP parts the transport injects into
+    /// every [`RequestContext`]. `None` for any kind of unauthorized call.
     fn authorize(&self, context: &RequestContext<RoleServer>) -> Option<WorkspaceScope> {
         let parts = context.extensions.get::<http::request::Parts>()?;
         let token = bearer_token_from_headers(&parts.headers)?;
@@ -183,12 +122,8 @@ impl<A: TokenAuthority + ToolExecutor> ServerHandler for GavmoMcpHandler<A> {
             )
     }
 
-    /// Unauthenticated/unrecognized tokens see an **empty** tool list, not an
-    /// error — indistinguishable from "this workspace has no tools enabled"
-    /// (see `plan.md`'s "always-on, empty-by-default" design point). This
-    /// also means a client that never sends a bearer token at all (e.g. a
-    /// probe) learns nothing about what tools exist. An authorized caller gets
-    /// exactly what the [`ToolExecutor`] advertises for their scope.
+    /// Unauthorized callers get an empty list rather than an error, so a probe
+    /// can't distinguish "bad token" from "no tools enabled".
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -206,16 +141,8 @@ impl<A: TokenAuthority + ToolExecutor> ServerHandler for GavmoMcpHandler<A> {
         Ok(ListToolsResult::with_all_items(tools))
     }
 
-    /// Dispatches an authorized call to the [`ToolExecutor`]. Error handling
-    /// follows rmcp's convention (see its README's "Error handling" section):
-    /// a protocol error (`Err(McpError)`) means "the server can't route this at
-    /// all" (unauthorized, or an unknown tool name), whereas a tool that *ran*
-    /// and failed comes back as a tool-level [`ToolOutcome::Error`] the caller
-    /// should see rendered.
-    ///
-    /// Unknown tool names are rejected here, *before* the executor runs, by
-    /// checking the name against what the executor advertised for this scope —
-    /// so [`ToolExecutor::call_tool`] only ever sees names it offered.
+    /// Unknown tool names are a protocol error, rejected before the executor
+    /// runs; a tool that ran and failed is a tool-level error result.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -250,35 +177,15 @@ impl<A: TokenAuthority + ToolExecutor> ServerHandler for GavmoMcpHandler<A> {
     }
 }
 
-/// The guest-side address of the host, under QEMU user-mode networking
-/// (`-netdev user,...`) — see `vm::qemu`. This is the `Host` header every
-/// guest-originated request to this gateway carries (`Host: 10.0.2.2:7071`),
-/// which is why it must be added to [`StreamableHttpServerConfig`]'s
-/// `allowed_hosts` below.
+/// The host's address as seen from a QEMU user-net guest, and so the `Host`
+/// header on every guest request to the gateway.
 const QEMU_USER_NET_HOST_ADDR: &str = "10.0.2.2";
 
-/// Builds the MCP gateway as a `tower` service, ready to mount on an axum
-/// router (`Router::nest_service("/mcp", mcp::service(app_state))`) — see
-/// `crates/gavmo/src/main.rs`.
+/// Builds the gateway as a `tower` service to mount at `/mcp`.
 ///
-/// Runs **stateless** (`legacy_session_mode(false)`): there is no
-/// conversation-scoped state to keep per MCP session (every call is
-/// independently authorized by its own bearer token), so there is nothing
-/// for a session to buy here — matching rmcp's own stateless-mode guidance
-/// (see the crate's README "Stateless Streamable HTTP" section) that
-/// server-side state belongs in a `Clone` handle captured by the service
-/// factory, not in a session. `with_json_response(true)` additionally means
-/// a simple request/response tool call (which `gavmo_ping` is) gets a plain
-/// JSON reply instead of an SSE stream.
-///
-/// `with_allowed_hosts` widens rmcp's built-in DNS-rebinding `Host`-header
-/// allowlist (which otherwise defaults to loopback names only —
-/// `localhost`/`127.0.0.1`/`::1`) to also accept
-/// [`QEMU_USER_NET_HOST_ADDR`] — **discovered the hard way** during P4.0's
-/// real-hardware gate: the guest's requests carry `Host: 10.0.2.2:<port>`,
-/// which rmcp rejected with a bare `403 Forbidden` (no auth/tool code ever
-/// ran) until this was added. Loopback names are kept (not replaced) so
-/// host-side testing — e.g. `curl http://127.0.0.1:7071/mcp` — still works.
+/// Stateless with plain JSON responses: each call carries its own token, so
+/// sessions buy nothing. rmcp's default `Host` allowlist is loopback-only and
+/// 403s guest requests, so the QEMU host address is added alongside loopback.
 pub fn service<A>(backend: A) -> StreamableHttpService<GavmoMcpHandler<A>, LocalSessionManager>
 where
     A: TokenAuthority + ToolExecutor + Clone,
@@ -330,9 +237,8 @@ mod tests {
         assert_eq!(bearer_token_from_headers(&headers), None);
     }
 
-    /// Shaped correctly but empty — rejecting an empty token is
-    /// [`TokenAuthority::resolve`]'s job (an empty string just won't be a
-    /// key in any real authority's token map), not this parser's.
+    /// Rejecting an empty token is [`TokenAuthority::resolve`]'s job, not the
+    /// parser's.
     #[test]
     fn empty_token_after_bearer_prefix_is_some_empty_string() {
         let mut headers = HeaderMap::new();
@@ -371,14 +277,8 @@ mod tests {
         );
     }
 
-    /// A fake backend standing in for `gavmo`'s real registry-backed
-    /// `AppState`, implementing both [`TokenAuthority`] and [`ToolExecutor`] so
-    /// the "known token -> workspace" / "unknown token -> nothing" contract (and
-    /// the fact that [`service`] now requires an executor) is exercised without
-    /// pulling in `gavmo` (which would be a circular dev-dependency) or standing
-    /// up a real `RequestContext` (impractical outside a live transport — see
-    /// `plan.md`'s testing strategy for why the auth-gated *handler* methods
-    /// themselves are verified on real hardware instead).
+    /// Stand-in for the daemon's `AppState`; depending on `gavmo` here would be
+    /// a circular dev-dependency.
     #[derive(Clone)]
     struct FakeAuthority(std::collections::HashMap<&'static str, &'static str>);
 
@@ -420,12 +320,8 @@ mod tests {
         assert_eq!(authority.resolve("bad-token"), None);
     }
 
-    /// Regression test for the real-hardware P4.0 finding: rmcp's default
-    /// `allowed_hosts` (loopback names only) rejects every guest-originated
-    /// request with a bare `403 Forbidden` before any auth/tool code runs,
-    /// because the guest's `Host` header is `10.0.2.2:<port>`, not a
-    /// loopback name. `service()` must widen the allowlist to include it
-    /// (while keeping loopback names for host-side testing).
+    /// rmcp's default `allowed_hosts` is loopback-only and 403s every guest
+    /// request (`Host: 10.0.2.2:<port>`) before auth runs.
     #[test]
     fn service_allows_both_loopback_and_the_qemu_guest_host_address() {
         let authority = FakeAuthority(std::collections::HashMap::new());

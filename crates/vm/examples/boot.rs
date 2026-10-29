@@ -1,19 +1,13 @@
-//! Milestone 0 runner: boots the GAVMO base NixOS image (see
-//! `nix/base/`) against a real repository directory and waits for its
-//! dummy health service to answer, proving the `vm` crate end to end
-//! (see `crates/vm/plan.md`).
-//!
-//! This is deliberately a `cargo` example rather than a real binary: it's
-//! a throwaway driver to see the `vm` crate work, not the GAVMO daemon.
+//! Runner that boots the GAVMO base NixOS image against a repository
+//! directory and waits for it to become healthy. A debug driver for the
+//! `vm` crate, not the GAVMO daemon.
 //!
 //! Usage:
 //!   cargo run -p vm --example boot -- \
 //!       <base-image.qcow2> <repo-dir> <gcloud-dir> <host-port>
 //!
-//! Then open http://127.0.0.1:<host-port> in a browser — it should show a
-//! file listing of <repo-dir>, served from inside the VM over virtiofs.
-//! Requires a `virtiofsd` binary on `PATH` (see `share.rs::VirtiofsShare`).
-//! Ctrl-C to request a graceful shutdown.
+//! Then open http://127.0.0.1:<host-port>. Requires `virtiofsd` on `PATH`.
+//! Ctrl-C requests a graceful shutdown.
 
 use std::path::PathBuf;
 
@@ -44,19 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Conventional per-workspace state location from the MVP plan: all
-    // GAVMO state lives under <repo>/.gavmo, gitignored.
+    // All GAVMO state lives under <repo>/.gavmo, gitignored.
     let state_dir = repo_dir.join(".gavmo").join("vm");
     let workspace_id = repo_dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".to_string());
 
-    // The real daemon keeps this *outside* the repo (see
-    // `crates/gavmo/src/registry.rs::mcp_dir_for`) so the MCP capability
-    // token never lands in the user's repo. This throwaway example has no
-    // daemon app-data dir to put it in, so it just reuses `.gavmo` for
-    // simplicity — fine for a manual debug run, not a pattern to copy.
+    // The daemon keeps this outside the repo so the MCP token never lands
+    // in it; this debug runner has no app-data dir, so don't copy this.
     let mcp_dir = repo_dir.join(".gavmo").join("mcp");
     std::fs::create_dir_all(&mcp_dir)?;
 
