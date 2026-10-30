@@ -41,6 +41,10 @@ use crate::vm_handle::{Launcher, QemuLauncher};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
+/// Overlay disk size for new workspaces, in GiB. The base image is auto-sized
+/// with little headroom, too small once `gavmo.nix` adds real packages;
+/// qcow2 is sparse, so this costs nothing until written.
+pub(super) const DEFAULT_DISK_GIB: u32 = 32;
 /// Default guest vCPU count.
 const DEFAULT_VCPUS: u32 = 4;
 

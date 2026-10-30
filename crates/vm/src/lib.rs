@@ -18,6 +18,7 @@ mod share;
 pub mod stats;
 
 pub use config::{GUEST_OPENCODE_PORT, VmConfig};
+pub use disk::overlay_virtual_size;
 pub use error::{Error, Result};
 pub use fsutil::create_private_dir_all;
 pub use handle::{RunningVm, VmFailure, VmStatus};

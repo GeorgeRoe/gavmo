@@ -10,9 +10,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use vm::{Error as VmError, VmConfig, VmStatus};
 
-use super::AppState;
 use super::store::save_registry;
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
+use super::{AppState, DEFAULT_DISK_GIB};
 use crate::integrations::ResolvedIntegration;
 use crate::types::WorkspaceStatus;
 use crate::vm_handle::{VmHandle, VmInfo};
@@ -561,6 +561,7 @@ impl AppState {
             base_image: self.inner.base_image.clone(),
             gcloud_dir: self.inner.gcloud_dir.clone(),
             mcp_dir,
+            disk_size_gib: DEFAULT_DISK_GIB,
             memory_mib: self.inner.memory_mib,
             vcpus: self.inner.vcpus,
             host_port,

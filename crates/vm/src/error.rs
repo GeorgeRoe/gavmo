@@ -73,7 +73,10 @@ pub enum Error {
     },
 
     #[error("qemu-img failed (exit status {status}): {stderr}")]
-    DiskCreateFailed { status: ExitStatus, stderr: String },
+    QemuImg { status: ExitStatus, stderr: String },
+
+    #[error("qemu-img info returned no virtual-size")]
+    QemuImgOutput,
 
     #[error("failed to connect to QMP socket {path}: {source}")]
     QmpConnect {

@@ -59,6 +59,11 @@ pub struct VmConfig {
     /// of the user's repo.
     pub mcp_dir: PathBuf,
 
+    /// Virtual size of the overlay disk, in GiB. A new overlay is created at
+    /// this size and an existing smaller one is grown to it on boot; a larger
+    /// one is never shrunk.
+    pub disk_size_gib: u32,
+
     /// Guest memory, in MiB.
     pub memory_mib: u32,
 

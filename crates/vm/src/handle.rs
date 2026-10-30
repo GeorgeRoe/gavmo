@@ -71,7 +71,7 @@ impl RunningVm {
         // Owner-only, so other local users can't read the disk or reach the
         // sockets. (`ensure_overlay` does the same for `state_dir`.)
         create_private_dir_all(&cfg.runtime_dir)?;
-        ensure_overlay(&cfg.base_image, &cfg.disk_path()).await?;
+        ensure_overlay(&cfg.base_image, &cfg.disk_path(), cfg.disk_size_gib).await?;
 
         // Clear a stale rebuild-failure marker so a previous boot's result
         // isn't mistaken for this one's. NotFound is the common case; any
@@ -358,6 +358,7 @@ mod tests {
             base_image: tmp.path().join("missing-base.qcow2"),
             gcloud_dir: tmp.path().join("gcloud"),
             mcp_dir: tmp.path().join("mcp"),
+            disk_size_gib: 1,
             memory_mib: 256,
             vcpus: 1,
             host_port: 1,

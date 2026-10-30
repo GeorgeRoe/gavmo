@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_image,
         gcloud_dir,
         mcp_dir,
+        disk_size_gib: 32,
         memory_mib: 4096,
         vcpus: 4,
         host_port,

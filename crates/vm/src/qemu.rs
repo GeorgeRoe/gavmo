@@ -320,6 +320,7 @@ mod tests {
             base_image: PathBuf::from("/var/lib/gavmo/base.qcow2"),
             gcloud_dir: PathBuf::from("/home/user/.config/gcloud"),
             mcp_dir: PathBuf::from("/var/lib/gavmo/mcp/test-workspace"),
+            disk_size_gib: 32,
             memory_mib: 4096,
             vcpus: 4,
             host_port: 45123,
