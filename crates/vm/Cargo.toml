@@ -14,6 +14,8 @@ thiserror.workspace = true
 # Direct dep: `qapi_spec::Any` (QOM property values, e.g. balloon stats)
 # is `serde_json::Value`.
 serde_json.workspace = true
+# O_NOFOLLOW / O_NONBLOCK for reading the guest-written rebuild marker.
+libc = "0.2"
 tracing.workspace = true
 
 [dev-dependencies]

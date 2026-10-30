@@ -60,7 +60,7 @@ pub struct VmStats {
     pub mem_total_bytes: Option<u64>,
     /// Seconds since the qemu process was spawned (not since it became healthy).
     pub uptime_secs: u64,
-    /// Size of the persistent overlay disk (`.gavmo/vm/disk.qcow2`), in bytes.
+    /// Size of the persistent overlay disk (`~/.local/share/gavmo/vms/<hash>/disk.qcow2`), in bytes.
     pub disk_bytes: u64,
     /// The host port `opencode web` is forwarded to.
     pub host_port: u16,
@@ -202,8 +202,8 @@ pub async fn reset_workspace(id: String) -> Result<(), ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
-/// Stops (if needed) and drops a workspace from the registry. Nothing under
-/// `.gavmo/vm` is deleted, so re-adding the path restores its state. The
+/// Stops (if needed) and drops a workspace from the registry. Its VM disk
+/// and `.gavmo/` are kept, so re-adding the path restores its state. The
 /// client must confirm with the user first.
 #[server]
 pub async fn remove_workspace(id: String) -> Result<(), ServerFnError> {

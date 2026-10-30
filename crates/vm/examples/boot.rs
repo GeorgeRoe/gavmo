@@ -38,22 +38,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // All GAVMO state lives under <repo>/.gavmo, gitignored.
-    let state_dir = repo_dir.join(".gavmo").join("vm");
+    // Host-only state must stay outside the (guest-writable) repo; see
+    // `VmConfig`. This debug runner keeps it in a per-port temp dir.
+    let scratch = std::env::temp_dir().join(format!("gavmo-boot-example-{host_port}"));
+    let state_dir = scratch.join("state");
+    let runtime_dir = scratch.join("run");
+    let guest_output_dir = repo_dir.join(".gavmo").join("vm");
     let workspace_id = repo_dir.file_name().map_or_else(
         || "workspace".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
 
-    // The daemon keeps this outside the repo so the MCP token never lands
-    // in it; this debug runner has no app-data dir, so don't copy this.
-    let mcp_dir = repo_dir.join(".gavmo").join("mcp");
+    // Outside the repo, so the MCP token never lands in it.
+    let mcp_dir = scratch.join("mcp");
     std::fs::create_dir_all(&mcp_dir)?;
 
     let cfg = VmConfig {
         workspace_id,
         repo_dir: repo_dir.clone(),
         state_dir,
+        runtime_dir,
+        guest_output_dir,
         base_image,
         gcloud_dir,
         mcp_dir,

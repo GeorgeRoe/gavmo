@@ -23,10 +23,16 @@ Workspaces and VMs:
 
 - Workspace identity is the repo's absolute host path (registry:
   `~/.local/share/gavmo/workspaces.json`; running VMs are in-memory only).
-- Each workspace has a persistent qcow2 overlay, QMP socket and logs in
-  `<repo>/.gavmo/vm/` on a read-only base image built from `nix/base`
-  (`GAVMO_BASE_IMAGE`). The overlay's backing file is pinned at creation, so
-  a rebuilt base image needs "Reset".
+- The repo is shared read-write into the guest, so nothing a host process
+  opens lives in it. Each workspace's persistent qcow2 overlay and console
+  log are in `~/.local/share/gavmo/vms/<sha256 of repo path>/` (owner-only),
+  on a read-only base image built from `nix/base` (`GAVMO_BASE_IMAGE`); its
+  QMP and virtiofsd sockets are in `$XDG_RUNTIME_DIR/gavmo/<id>/` (else
+  `/tmp/gavmo-<uid>/`). qemu is given the base image explicitly rather than
+  trusting the overlay's header. An overlay only fits the base it was created
+  on, so a rebuilt base image needs "Reset". `<repo>/.gavmo/vm/` now holds
+  only guest build output; VM files left there by older versions are unused
+  (the daemon logs a hint) and can be deleted.
 - virtiofs shares: repo -> `/workspace` (rw), gcloud ADC ->
   `/etc/gavmo/gcloud` (ro), MCP token dir -> `/etc/gavmo/mcp` (ro).
   Unprivileged `virtiofsd` maps the host owner to guest `agent` (uid 1000).

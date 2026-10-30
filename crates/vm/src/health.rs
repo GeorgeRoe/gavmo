@@ -34,9 +34,9 @@ pub(crate) async fn wait_for_ready(
             return Ok(());
         }
 
-        if let Ok(contents) = tokio::fs::read_to_string(marker_path).await {
+        if let Some(contents) = read_marker(marker_path).await? {
             return Err(Error::RebuildFailed {
-                log_file: contents.trim().to_string(),
+                log_file: contents.trim().to_owned(),
             });
         }
 
@@ -46,6 +46,50 @@ pub(crate) async fn wait_for_ready(
 
         sleep(POLL_INTERVAL).await;
     }
+}
+
+/// The marker holds one short filename; anything longer is not a marker.
+const MAX_MARKER_BYTES: u64 = 4096;
+
+/// Reads the guest-written failure marker. The guest controls this path, so
+/// it is opened without following symlinks and without blocking (a FIFO
+/// would otherwise hang the boot forever), must be a regular file, and is
+/// read with a size cap. `Ok(None)` while it doesn't exist, or while it is
+/// still empty (the guest may be mid-write).
+async fn read_marker(path: &Path) -> Result<Option<String>> {
+    let owned = path.to_path_buf();
+    let read = tokio::task::spawn_blocking(move || -> std::io::Result<Option<String>> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&owned)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "rebuild marker is not a regular file",
+            ));
+        }
+        let mut text = String::new();
+        file.take(MAX_MARKER_BYTES).read_to_string(&mut text)?;
+        Ok((!text.trim().is_empty()).then_some(text))
+    })
+    .await
+    .map_err(|e| Error::ReadMarker {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(e),
+    })?;
+    read.map_err(|source| Error::ReadMarker {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// A single, non-retrying check of whether something is answering HTTP
@@ -131,5 +175,45 @@ mod tests {
             Err(Error::RebuildFailed { log_file })
                 if log_file == "rebuild-2026-01-01T00-00-00Z.log"
         ));
+    }
+
+    #[tokio::test]
+    async fn read_marker_ignores_missing_and_empty_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("rebuild-failed");
+        assert_eq!(read_marker(&marker).await.unwrap(), None);
+        tokio::fs::write(&marker, "  \n").await.unwrap();
+        assert_eq!(read_marker(&marker).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_marker_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("host-secret");
+        tokio::fs::write(&target, "secret").await.unwrap();
+        let marker = dir.path().join("rebuild-failed");
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        assert!(matches!(
+            read_marker(&marker).await,
+            Err(Error::ReadMarker { .. })
+        ));
+    }
+
+    /// A FIFO would block a plain open forever, hanging the boot.
+    #[tokio::test]
+    async fn read_marker_refuses_a_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("rebuild-failed");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&marker)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let result = timeout(Duration::from_secs(5), read_marker(&marker))
+            .await
+            .expect("must not hang");
+        assert!(matches!(result, Err(Error::ReadMarker { .. })));
     }
 }

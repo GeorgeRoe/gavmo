@@ -1,86 +1,158 @@
+use std::path::Path;
+use std::process::Stdio;
+
 use tokio::process::Child;
 
 use crate::config::{GUEST_OPENCODE_PORT, VmConfig};
 use crate::error::{Error, Result};
+use crate::fsutil::{check_socket_path, remove_if_exists};
 use crate::share::{ShareBackend, ShareSpec};
 
 /// The `id=` of the `virtio-balloon-pci` device. `qmp.rs` derives the
 /// balloon's QOM path (`/machine/peripheral/<id>`) from this.
 pub(crate) const BALLOON_DEVICE_ID: &str = "balloon0";
 
+/// Formats `path` for a qemu `key=value,...` option string: commas are
+/// doubled (qemu's escape), and non-UTF-8 paths are refused rather than
+/// silently mangled.
+pub(crate) fn qemu_opt_path(path: &Path) -> Result<String> {
+    let text = path.to_str().ok_or_else(|| Error::UnsupportedPath {
+        path: path.to_path_buf(),
+        reason: "is not valid UTF-8",
+    })?;
+    Ok(text.replace(',', ",,"))
+}
+
+/// Same check for paths embedded in JSON (`serde_json` does the quoting).
+fn utf8_path(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| Error::UnsupportedPath {
+        path: path.to_path_buf(),
+        reason: "is not valid UTF-8",
+    })
+}
+
+/// The disk as an explicit block graph: the overlay's backing is the
+/// configured base image, named here, so qemu never follows the backing file
+/// recorded in the overlay's header. The base itself is opened read-only
+/// with no backing at all.
+fn disk_args(cfg: &VmConfig) -> Result<Vec<String>> {
+    let nodes = [
+        serde_json::json!({
+            "driver": "file",
+            "node-name": "base-file",
+            "filename": utf8_path(&cfg.base_image)?,
+            "read-only": true,
+        }),
+        serde_json::json!({
+            "driver": "qcow2",
+            "node-name": "base",
+            "file": "base-file",
+            "read-only": true,
+            "backing": null,
+        }),
+        serde_json::json!({
+            "driver": "file",
+            "node-name": "disk-file",
+            "filename": utf8_path(&cfg.disk_path())?,
+        }),
+        serde_json::json!({
+            "driver": "qcow2",
+            "node-name": "disk",
+            "file": "disk-file",
+            "backing": "base",
+        }),
+    ];
+    let mut args = Vec::new();
+    for node in nodes {
+        args.push("-blockdev".to_owned());
+        args.push(node.to_string());
+    }
+    args.push("-device".to_owned());
+    args.push("virtio-blk-pci,drive=disk".to_owned());
+    Ok(args)
+}
+
 /// Builds the full `qemu-system-x86_64` argument list for a VM boot. Pure,
 /// for unit testing without `qemu` or `/dev/kvm`.
 pub(crate) fn build_qemu_args(
     cfg: &VmConfig,
     shares: &[(&dyn ShareBackend, ShareSpec)],
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut args = Vec::new();
 
     // Hosts are Linux-only (virtiofs); the `cfg` just keeps non-Linux
     // development builds compiling.
     #[cfg(target_os = "linux")]
     {
-        args.push("-enable-kvm".to_string());
-        args.push("-cpu".to_string());
-        args.push("host".to_string());
+        args.push("-enable-kvm".to_owned());
+        args.push("-cpu".to_owned());
+        args.push("host".to_owned());
     }
 
-    args.push("-smp".to_string());
+    args.push("-smp".to_owned());
     args.push(cfg.vcpus.to_string());
-    args.push("-m".to_string());
+    args.push("-m".to_owned());
     args.push(cfg.memory_mib.to_string());
 
     // virtiofs needs guest RAM in a shared memory backend so `virtiofsd`
     // can map it; `-numa node,memdev=mem` is how QEMU wires guest RAM to
     // that backend, even for a single-node guest.
     if !shares.is_empty() {
-        args.push("-object".to_string());
+        args.push("-object".to_owned());
         args.push(format!(
             "memory-backend-memfd,id=mem,size={mem}M,share=on",
             mem = cfg.memory_mib,
         ));
-        args.push("-numa".to_string());
-        args.push("node,memdev=mem".to_string());
+        args.push("-numa".to_owned());
+        args.push("node,memdev=mem".to_owned());
     }
 
-    args.push("-drive".to_string());
-    args.push(format!(
-        "file={file},if=virtio,format=qcow2",
-        file = cfg.disk_path().display(),
-    ));
+    args.extend(disk_args(cfg)?);
 
-    args.push("-netdev".to_string());
+    args.push("-netdev".to_owned());
     args.push(format!(
         "user,id=net0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}",
         host_port = cfg.host_port,
         guest_port = GUEST_OPENCODE_PORT,
     ));
-    args.push("-device".to_string());
-    args.push("virtio-net-pci,netdev=net0".to_string());
+    args.push("-device".to_owned());
+    args.push("virtio-net-pci,netdev=net0".to_owned());
 
     // The balloon is never inflated; it exists only so the guest reports
     // its own memory usage over QMP (host RSS doesn't reflect guest usage).
     // `deflate-on-oom=on` is a free safety net.
-    args.push("-device".to_string());
+    args.push("-device".to_owned());
     args.push(format!(
         "virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"
     ));
 
     for (backend, spec) in shares {
-        args.extend(backend.qemu_args(&cfg.state_dir, spec));
+        args.extend(backend.qemu_args(&cfg.runtime_dir, spec)?);
     }
 
-    args.push("-qmp".to_string());
+    // QMP on a unix socket; no human monitor anywhere (in particular not on
+    // the daemon's stdio, where `-nographic` would put it).
+    // `-qmp` rather than `-chardev` + `-mon`: `-mon` is deprecated in recent
+    // qemu and its `monitor-qmp` replacement is missing from older ones.
+    args.push("-qmp".to_owned());
     args.push(format!(
-        "unix:{path},server,nowait",
-        path = cfg.qmp_socket_path().display(),
+        "unix:{},server=on,wait=off",
+        qemu_opt_path(&cfg.qmp_socket_path())?
     ));
+    args.push("-monitor".to_owned());
+    args.push("none".to_owned());
+    args.push("-display".to_owned());
+    args.push("none".to_owned());
 
-    args.push("-nographic".to_string());
-    args.push("-serial".to_string());
-    args.push(format!("file:{}", cfg.console_log_path().display()));
+    args.push("-chardev".to_owned());
+    args.push(format!(
+        "file,id=serial0,path={}",
+        qemu_opt_path(&cfg.console_log_path())?
+    ));
+    args.push("-serial".to_owned());
+    args.push("chardev:serial0".to_owned());
 
-    args
+    Ok(args)
 }
 
 /// Spawns `qemu-system-x86_64`, first starting any share helper processes
@@ -90,24 +162,66 @@ pub(crate) async fn spawn_qemu(
     cfg: &VmConfig,
     shares: &[(&dyn ShareBackend, ShareSpec)],
 ) -> Result<(Child, Vec<Child>)> {
+    // Validate everything before starting any helper, so a bad path doesn't
+    // leave virtiofsd processes behind.
+    let args = build_qemu_args(cfg, shares)?;
+    let qmp_socket = cfg.qmp_socket_path();
+    check_socket_path(&qmp_socket)?;
+    // A stale socket from a crashed run would make qemu's bind fail.
+    remove_if_exists(&qmp_socket)?;
+
     let mut helpers = Vec::new();
     for (backend, spec) in shares {
-        if let Some(child) = backend.start(&cfg.state_dir, spec)? {
+        if let Some(child) = backend.start(&cfg.runtime_dir, spec)? {
             helpers.push(child);
         }
     }
 
-    let args = build_qemu_args(cfg, shares);
+    // qemu connects to each helper's socket at startup and fails outright if
+    // it isn't there yet. On error the helpers are dropped (`kill_on_drop`).
+    for (backend, spec) in shares {
+        if let Some(path) = backend.ready_path(&cfg.runtime_dir, spec) {
+            wait_for_path(&path, &mut helpers).await?;
+        }
+    }
+
     let child = tokio::process::Command::new("qemu-system-x86_64")
         .args(&args)
+        // Nothing may read the daemon's terminal.
+        .stdin(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .map_err(|source| Error::Spawn {
-            program: "qemu-system-x86_64".to_string(),
+            program: "qemu-system-x86_64".to_owned(),
             source,
         })?;
 
     Ok((child, helpers))
+}
+
+/// How long a share helper may take to create its socket.
+const HELPER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for `path` to appear, failing early if any helper exits.
+async fn wait_for_path(path: &Path, helpers: &mut [Child]) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + HELPER_READY_TIMEOUT;
+    loop {
+        if tokio::fs::try_exists(path).await.unwrap_or(false) {
+            return Ok(());
+        }
+        for helper in helpers.iter_mut() {
+            if let Ok(Some(status)) = helper.try_wait() {
+                return Err(Error::HelperExited { status });
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::HelperNotReady {
+                path: path.to_path_buf(),
+                timeout: HELPER_READY_TIMEOUT,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[cfg(test)]
@@ -120,7 +234,9 @@ mod tests {
         VmConfig {
             workspace_id: "test-workspace".to_string(),
             repo_dir: PathBuf::from("/home/user/project"),
-            state_dir: PathBuf::from("/home/user/project/.gavmo/vm"),
+            state_dir: PathBuf::from("/home/user/.local/share/gavmo/vms/abc"),
+            runtime_dir: PathBuf::from("/run/user/1000/gavmo/abc"),
+            guest_output_dir: PathBuf::from("/home/user/project/.gavmo/vm"),
             base_image: PathBuf::from("/var/lib/gavmo/base.qcow2"),
             gcloud_dir: PathBuf::from("/home/user/.config/gcloud"),
             mcp_dir: PathBuf::from("/var/lib/gavmo/mcp/test-workspace"),
@@ -133,7 +249,7 @@ mod tests {
     #[test]
     fn args_include_forwarded_port_and_guest_port() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]);
+        let args = build_qemu_args(&cfg, &[]).unwrap();
 
         assert!(args.contains(&"-netdev".to_string()));
         let netdev = args
@@ -146,16 +262,94 @@ mod tests {
     #[test]
     fn args_reference_the_overlay_disk_and_qmp_socket() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]);
+        let args = build_qemu_args(&cfg, &[]).unwrap();
 
+        assert!(args.windows(2).any(|w| w[0] == "-blockdev"
+            && w[1].contains(r#""filename":"/home/user/.local/share/gavmo/vms/abc/disk.qcow2""#)));
+        assert!(args.windows(2).any(|w| w[0] == "-qmp"
+            && w[1] == "unix:/run/user/1000/gavmo/abc/qmp.sock,server=on,wait=off"));
+        assert!(args.windows(2).any(|w| w[0] == "-chardev"
+            && w[1] == "file,id=serial0,path=/home/user/.local/share/gavmo/vms/abc/console.log"));
+    }
+
+    /// Nothing host processes open may live in the guest-writable repo.
+    #[test]
+    fn no_host_opened_file_is_under_the_repo() {
+        let cfg = test_cfg();
+        let virtiofs = VirtiofsShare;
+        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![(
+            &virtiofs,
+            ShareSpec {
+                host_path: cfg.repo_dir.clone(),
+                mount_tag: "workspace",
+                read_only: false,
+            },
+        )];
+        let args = build_qemu_args(&cfg, &shares).unwrap();
+        assert!(
+            !args.iter().any(|a| a.contains("/home/user/project")),
+            "{args:?}"
+        );
+    }
+
+    /// The overlay's backing is pinned to the configured base image, so a
+    /// tampered qcow2 header can't make qemu open another host file.
+    #[test]
+    fn disk_backing_is_explicit_not_read_from_the_header() {
+        let args = build_qemu_args(&test_cfg(), &[]).unwrap();
+        let nodes: Vec<serde_json::Value> = args
+            .windows(2)
+            .filter(|w| w[0] == "-blockdev")
+            .map(|w| serde_json::from_str(&w[1]).unwrap())
+            .collect();
+        let node = |name: &str| {
+            nodes
+                .iter()
+                .find(|n| n["node-name"] == name)
+                .unwrap_or_else(|| panic!("no node {name}"))
+        };
+        assert_eq!(node("disk")["backing"], "base");
+        assert_eq!(node("base")["backing"], serde_json::Value::Null);
+        assert_eq!(node("base")["read-only"], true);
+        assert_eq!(node("base-file")["filename"], "/var/lib/gavmo/base.qcow2");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-device" && w[1] == "virtio-blk-pci,drive=disk")
+        );
+        assert!(!args.iter().any(|a| a == "-drive"));
+    }
+
+    #[test]
+    fn no_human_monitor_and_no_stdio_display() {
+        let args = build_qemu_args(&test_cfg(), &[]).unwrap();
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-monitor" && w[1] == "none")
+        );
+        assert!(!args.iter().any(|a| a == "-nographic"));
+    }
+
+    #[test]
+    fn option_paths_escape_commas_and_reject_non_utf8() {
+        assert_eq!(
+            qemu_opt_path(Path::new("/a,b/c,,d")).unwrap(),
+            "/a,,b/c,,,,d"
+        );
+        let mut cfg = test_cfg();
+        cfg.state_dir = PathBuf::from("/x,file.locking=off");
+        let args = build_qemu_args(&cfg, &[]).unwrap();
         assert!(
             args.iter()
-                .any(|a| a.contains("/home/user/project/.gavmo/vm/disk.qcow2"))
+                .any(|a| a == "file,id=serial0,path=/x,,file.locking=off/console.log")
         );
-        assert!(
-            args.iter()
-                .any(|a| a == "unix:/home/user/project/.gavmo/vm/qmp.sock,server,nowait")
+
+        cfg.state_dir = PathBuf::from(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/bad\xff"),
         );
+        assert!(matches!(
+            build_qemu_args(&cfg, &[]),
+            Err(Error::UnsupportedPath { .. })
+        ));
     }
 
     /// Mirrors the three shares `RunningVm::boot` assembles.
@@ -190,7 +384,7 @@ mod tests {
             ),
         ];
 
-        let args = build_qemu_args(&cfg, &shares);
+        let args = build_qemu_args(&cfg, &shares).unwrap();
 
         assert!(
             args.iter()
@@ -220,7 +414,7 @@ mod tests {
             },
         )];
 
-        let args = build_qemu_args(&cfg, &shares);
+        let args = build_qemu_args(&cfg, &shares).unwrap();
 
         assert!(
             args.iter()
@@ -233,7 +427,7 @@ mod tests {
     fn args_omit_shared_memory_backend_when_there_are_no_shares() {
         let cfg = test_cfg();
 
-        let args = build_qemu_args(&cfg, &[]);
+        let args = build_qemu_args(&cfg, &[]).unwrap();
 
         assert!(!args.iter().any(|a| a.contains("memory-backend-memfd")));
     }
@@ -242,7 +436,7 @@ mod tests {
     #[test]
     fn kvm_acceleration_is_enabled_on_linux() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]);
+        let args = build_qemu_args(&cfg, &[]).unwrap();
 
         assert!(args.contains(&"-enable-kvm".to_string()));
     }
@@ -251,12 +445,116 @@ mod tests {
     #[test]
     fn args_include_the_balloon_device_for_guest_memory_stats() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]);
+        let args = build_qemu_args(&cfg, &[]).unwrap();
 
         assert!(
             args.iter()
                 .any(|a| a
                     == &format!("virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"))
         );
+    }
+
+    /// Real qemu + virtiofsd: the argument list is accepted, the helpers'
+    /// sockets are awaited, QMP answers, and the overlay header's backing
+    /// file is ignored. Needs qemu, virtiofsd and /dev/kvm, so it is opt-in:
+    /// `cargo test -p vm -- --ignored real_qemu`.
+    #[tokio::test]
+    #[ignore = "needs qemu, virtiofsd and /dev/kvm"]
+    async fn real_qemu_boots_with_explicit_backing_and_ignores_the_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base,with,commas.qcow2");
+        let run = |args: &[&std::ffi::OsStr]| {
+            let status = std::process::Command::new("qemu-img")
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&[
+            "create".as_ref(),
+            "-f".as_ref(),
+            "qcow2".as_ref(),
+            base.as_os_str(),
+            "64M".as_ref(),
+        ]);
+
+        let mut cfg = test_cfg();
+        cfg.repo_dir = tmp.path().join("repo");
+        cfg.state_dir = tmp.path().join("state");
+        cfg.runtime_dir = tmp.path().join("run");
+        cfg.guest_output_dir = cfg.repo_dir.join(".gavmo").join("vm");
+        cfg.gcloud_dir = tmp.path().join("gcloud");
+        cfg.mcp_dir = tmp.path().join("mcp");
+        cfg.base_image = base;
+        cfg.memory_mib = 256;
+        cfg.vcpus = 1;
+        for dir in [&cfg.repo_dir, &cfg.gcloud_dir, &cfg.mcp_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        crate::fsutil::create_private_dir_all(&cfg.runtime_dir).unwrap();
+        crate::fsutil::create_private_dir_all(&cfg.state_dir).unwrap();
+
+        // An overlay whose *header* names a backing file that doesn't exist.
+        // If qemu honoured the header it would fail to open the disk.
+        let missing = tmp.path().join("decoy-does-not-exist.qcow2");
+        run(&[
+            "create".as_ref(),
+            "-f".as_ref(),
+            "qcow2".as_ref(),
+            "-F".as_ref(),
+            "qcow2".as_ref(),
+            "-u".as_ref(),
+            "-b".as_ref(),
+            missing.as_os_str(),
+            cfg.disk_path().as_os_str(),
+            "64M".as_ref(),
+        ]);
+
+        let virtiofs = VirtiofsShare;
+        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
+            (
+                &virtiofs,
+                ShareSpec {
+                    host_path: cfg.repo_dir.clone(),
+                    mount_tag: "workspace",
+                    read_only: false,
+                },
+            ),
+            (
+                &virtiofs,
+                ShareSpec {
+                    host_path: cfg.gcloud_dir.clone(),
+                    mount_tag: "gcloud",
+                    read_only: true,
+                },
+            ),
+        ];
+        let (mut qemu, mut helpers) = spawn_qemu(&cfg, &shares).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(exit) = qemu.try_wait().unwrap() {
+                panic!("qemu exited early: {exit}");
+            }
+            if let Ok(status) = crate::qmp::query_status(&cfg.qmp_socket_path()).await {
+                break status;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "QMP never answered");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        assert!(status.running, "{status:?}");
+        assert!(
+            cfg.console_log_path().exists(),
+            "serial chardev file created"
+        );
+
+        crate::qmp::quit(&cfg.qmp_socket_path()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), qemu.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        for helper in &mut helpers {
+            helper.kill().await.unwrap();
+        }
     }
 }

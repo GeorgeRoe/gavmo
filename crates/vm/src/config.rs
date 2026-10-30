@@ -8,20 +8,40 @@ pub const GUEST_OPENCODE_PORT: u16 = 7080;
 ///
 /// Owned by the daemon; this crate does not allocate ports, resolve the
 /// base image, or decide workspace identity.
+///
+/// # Trust boundaries
+///
+/// The repo is shared **read-write** into the guest, so anything under it is
+/// guest-controlled. Files that host processes open, execute or write -
+/// the disk image (whose header names other files for qemu to open), the
+/// console log (opened by qemu, following symlinks) and the control sockets -
+/// must therefore live outside the repo and outside every other share:
+/// [`Self::state_dir`] and [`Self::runtime_dir`]. Only files the guest is
+/// *meant* to write live in [`Self::guest_output_dir`].
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     /// Stable identifier for the workspace this VM belongs to. Used only
-    /// for logging and error messages; isolation comes from `state_dir`
-    /// and the allocated `host_port`, not from this id.
+    /// for logging and error messages; isolation comes from the directories
+    /// below and the allocated `host_port`, not from this id.
     pub workspace_id: String,
 
     /// Host path to the repository, shared into the guest as `/workspace`.
     pub repo_dir: PathBuf,
 
-    /// Host path to this VM's persistent state (conventionally
-    /// `<repo>/.gavmo/vm`). Holds the disk overlay, the QMP socket, and the
-    /// console log.
+    /// Host-only, persistent per-VM state: the overlay disk and the console
+    /// log. Must not be inside `repo_dir` or any other share (see above).
+    /// Created owner-only (`0700`) if missing.
     pub state_dir: PathBuf,
+
+    /// Host-only, ephemeral per-VM runtime files: the QMP and virtiofsd
+    /// sockets. Kept short (unix socket paths are limited to ~107 bytes) and
+    /// outside every share. Created owner-only (`0700`) if missing.
+    pub runtime_dir: PathBuf,
+
+    /// Guest-written build output, conventionally `<repo>/.gavmo/vm`: the
+    /// `gavmo-rebuild` failure marker and logs. Only ever read by the host,
+    /// and treated as untrusted.
+    pub guest_output_dir: PathBuf,
 
     /// Read-only base NixOS qcow2 image. Never written to; the per-VM
     /// overlay disk is what persists state across restarts.
@@ -34,7 +54,7 @@ pub struct VmConfig {
     /// Host path to this workspace's MCP token dir, holding a `token.env` the
     /// guest loads as `GAVMO_MCP_TOKEN`. Shared read-only at `/etc/gavmo/mcp`.
     /// A dedicated share outside `repo_dir` keeps the capability token out
-    /// of the user's repo (`state_dir` lives under the repo).
+    /// of the user's repo.
     pub mcp_dir: PathBuf,
 
     /// Guest memory, in MiB.
@@ -54,20 +74,21 @@ impl VmConfig {
         self.state_dir.join("disk.qcow2")
     }
 
-    /// Path to the QMP control-channel unix socket.
-    pub fn qmp_socket_path(&self) -> PathBuf {
-        self.state_dir.join("qmp.sock")
-    }
-
     /// Path to the file the guest's serial console is redirected to.
     pub fn console_log_path(&self) -> PathBuf {
         self.state_dir.join("console.log")
     }
 
+    /// Path to the QMP control-channel unix socket.
+    pub fn qmp_socket_path(&self) -> PathBuf {
+        self.runtime_dir.join("qmp.sock")
+    }
+
     /// Path to the `gavmo-rebuild` failure marker, written by the guest (via
     /// the `/workspace` share) only when `gavmo.nix` fails to build. Its
-    /// contents are the filename, under `state_dir`, of the full rebuild log.
+    /// contents are the filename, under `guest_output_dir`, of the full
+    /// rebuild log.
     pub fn rebuild_failed_marker_path(&self) -> PathBuf {
-        self.state_dir.join("rebuild-failed")
+        self.guest_output_dir.join("rebuild-failed")
     }
 }

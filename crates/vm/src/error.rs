@@ -26,6 +26,37 @@ pub enum Error {
         source: io::Error,
     },
 
+    #[error("a VM helper process (virtiofsd) exited during startup: {status}")]
+    HelperExited { status: ExitStatus },
+
+    #[error("{path} did not appear within {timeout:?}; virtiofsd failed to start")]
+    HelperNotReady { path: PathBuf, timeout: Duration },
+
+    #[error("failed to rename {from} to {to}: {source}")]
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("refusing to use {path}: it {reason}")]
+    UnsafeDir { path: PathBuf, reason: &'static str },
+
+    #[error("socket path {path} is longer than the {max}-byte unix socket limit")]
+    SocketPathTooLong { path: PathBuf, max: usize },
+
+    /// A path that can't be passed to qemu safely (qemu options are text).
+    #[error("path {path} cannot be passed to qemu: {reason}")]
+    UnsupportedPath { path: PathBuf, reason: &'static str },
+
+    #[error("failed to read {path}: {source}")]
+    ReadMarker {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("failed to stat {path}: {source}")]
     Stat {
         path: PathBuf,

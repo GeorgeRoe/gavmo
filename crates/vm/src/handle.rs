@@ -6,7 +6,7 @@ use tokio::process::Child;
 use crate::config::VmConfig;
 use crate::disk::ensure_overlay;
 use crate::error::{Error, Result};
-use crate::fsutil::remove_if_exists_async;
+use crate::fsutil::{create_private_dir_all, remove_if_exists_async};
 use crate::health::{probe_once, wait_for_ready};
 use crate::qemu::spawn_qemu;
 use crate::qmp;
@@ -64,6 +64,9 @@ impl RunningVm {
     /// Boots a VM per `cfg` and waits for `opencode web` to answer on the
     /// forwarded host port.
     pub async fn boot(cfg: VmConfig) -> Result<Self> {
+        // Owner-only, so other local users can't read the disk or reach the
+        // sockets. (`ensure_overlay` does the same for `state_dir`.)
+        create_private_dir_all(&cfg.runtime_dir)?;
         ensure_overlay(&cfg.base_image, &cfg.disk_path()).await?;
 
         let virtiofs = VirtiofsShare;

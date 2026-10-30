@@ -78,6 +78,13 @@ struct Inner {
     /// (`~/.local/share/gavmo/mcp`), deliberately outside any repo.
     mcp_base_dir: PathBuf,
 
+    /// Root of every workspace's host-only VM state (`~/.local/share/gavmo/vms`):
+    /// disk and console log, outside the repo the guest can write (see
+    /// [`vm::VmConfig`]). A sibling of `mcp_base_dir`, never inside a share.
+    vms_base_dir: PathBuf,
+    /// Root of every workspace's VM sockets (see [`default_runtime_base`]).
+    runtime_base_dir: PathBuf,
+
     /// Host dirs no workspace may equal, contain, or sit inside (see
     /// [`check_workspace_path`]): the data dir (UI token, vault, other
     /// workspaces' MCP tokens) and the gcloud dir.
@@ -144,6 +151,7 @@ impl AppState {
             gcloud_dir,
             &gavmo_data_dir,
             dirs::home_dir().as_deref(),
+            &default_runtime_base()?,
             secret_store,
         )
     }
@@ -155,10 +163,12 @@ impl AppState {
         gcloud_dir: PathBuf,
         gavmo_data_dir: &Path,
         home_dir: Option<&Path>,
+        runtime_base_dir: &Path,
         secret_store: Arc<dyn SecretStore>,
     ) -> io::Result<Self> {
         std::fs::create_dir_all(gavmo_data_dir)?;
-        let protected_dirs = [gavmo_data_dir, gcloud_dir.as_path()]
+        vm::create_private_dir_all(runtime_base_dir).map_err(io::Error::other)?;
+        let protected_dirs = [gavmo_data_dir, gcloud_dir.as_path(), runtime_base_dir]
             .into_iter()
             .map(canonical_or_self)
             .collect();
@@ -166,6 +176,10 @@ impl AppState {
         let registry_path = gavmo_data_dir.join("workspaces.json");
         let registry = load_registry(&registry_path)?;
         let mcp_base_dir = gavmo_data_dir.join("mcp");
+        let vms_base_dir = gavmo_data_dir.join("vms");
+        for workspace in &registry.workspaces {
+            warn_about_legacy_vm_state(&workspace.path);
+        }
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -177,6 +191,8 @@ impl AppState {
                 memory_mib: DEFAULT_MEMORY_MIB,
                 vcpus: DEFAULT_VCPUS,
                 mcp_base_dir,
+                vms_base_dir,
+                runtime_base_dir: runtime_base_dir.to_path_buf(),
                 protected_dirs,
                 home_dir,
                 mcp_tokens: std::sync::Mutex::new(HashMap::new()),
@@ -239,6 +255,7 @@ impl AppState {
 
         let mut registry = self.inner.registry.lock().await;
         if !registry.workspaces.iter().any(|w| w.path == canonical) {
+            warn_about_legacy_vm_state(&canonical);
             registry.workspaces.push(WorkspaceRecord {
                 path: canonical,
                 host_port: None,
@@ -412,8 +429,8 @@ impl AppState {
     }
 
     /// Stops the VM and drops the workspace from the registry. Non-destructive:
-    /// `.gavmo/vm` is kept, so re-adding the path restores its overlay and
-    /// session history. A no-op for unknown ids.
+    /// its VM state (`~/.local/share/gavmo/vms/<hash>`) and `.gavmo/` in the
+    /// repo are kept, so re-adding the path restores its overlay and sessions. A no-op for unknown ids.
     pub async fn remove_workspace(&self, id: &str) -> Result<(), String> {
         self.stop_workspace(id).await?;
 
@@ -422,12 +439,14 @@ impl AppState {
         save_registry(&self.inner.registry_path, &registry).map_err(|e| e.to_string())
     }
 
-    /// Stops the VM and deletes `<repo>/.gavmo/vm` (overlay, logs, sockets),
-    /// so the next open builds a fresh overlay from the current base image -
-    /// needed after a base-image rebuild, since an overlay's backing file is
-    /// fixed at creation.
+    /// Stops the VM and deletes its host state (overlay disk, console log),
+    /// its sockets, and `<repo>/.gavmo/vm` (rebuild logs), so the next open
+    /// builds a fresh overlay from the current base image - needed after a
+    /// base-image rebuild, since an overlay only makes sense on the exact base
+    /// it was created from.
     ///
-    /// Destructive (session history and `/nix` cache are lost); the caller
+    /// Destructive (the guest's `/nix` cache is lost; opencode sessions in
+    /// `<repo>/.gavmo/opencode` are kept); the caller
     /// must have obtained user confirmation. An in-flight boot is aborted and
     /// awaited first, so qemu can't still be writing the overlay.
     pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
@@ -450,7 +469,13 @@ impl AppState {
             Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
         }
 
-        remove_dir_all_idempotent(&Self::state_dir_for(id)).await
+        // The next open builds a fresh overlay from the current base image.
+        // The guest output dir goes too (stale rebuild logs, and any VM files
+        // left there by GAVMO versions that kept state in the repo);
+        // `remove_dir_all` never follows a symlink planted in its place.
+        remove_dir_all_idempotent(&self.host_state_dir_for(id)).await?;
+        remove_dir_all_idempotent(&self.runtime_dir_for(id)).await?;
+        remove_dir_all_idempotent(&Self::guest_output_dir_for(id)).await
     }
 
     /// Builds the per-VM [`VmConfig`] for a workspace path. `host_port` is
@@ -458,7 +483,6 @@ impl AppState {
     /// not nest under the `running` lock held here.
     fn vm_config(&self, id: &str, mcp_dir: PathBuf, host_port: u16) -> VmConfig {
         let repo_dir = PathBuf::from(id);
-        let state_dir = Self::state_dir_for(id);
         let workspace_id = repo_dir.file_name().map_or_else(
             || "workspace".to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -466,8 +490,10 @@ impl AppState {
 
         VmConfig {
             workspace_id,
+            guest_output_dir: Self::guest_output_dir_for(id),
+            state_dir: self.host_state_dir_for(id),
+            runtime_dir: self.runtime_dir_for(id),
             repo_dir,
-            state_dir,
             base_image: self.inner.base_image.clone(),
             gcloud_dir: self.inner.gcloud_dir.clone(),
             mcp_dir,
@@ -493,16 +519,33 @@ impl AppState {
         Ok(port)
     }
 
-    /// The per-workspace state dir (`<repo>/.gavmo/vm`). Derived from `id`
-    /// because a `BuildFailed` slot outlives its `VmConfig`.
-    fn state_dir_for(id: &str) -> PathBuf {
+    /// Where the guest writes its build output (`<repo>/.gavmo/vm`): rebuild
+    /// logs and the failure marker. Guest-controlled; only ever read with
+    /// [`read_guest_output_file`]. Derived from `id` because a `BuildFailed` slot
+    /// outlives its `VmConfig`.
+    fn guest_output_dir_for(id: &str) -> PathBuf {
         PathBuf::from(id).join(".gavmo").join("vm")
+    }
+
+    /// Host-only persistent VM state (disk, console log):
+    /// `~/.local/share/gavmo/vms/<sha256 of id>`.
+    fn host_state_dir_for(&self, id: &str) -> PathBuf {
+        self.inner.vms_base_dir.join(workspace_hash(id))
+    }
+
+    /// Host-only VM sockets: `<runtime base>/<first 16 hex of sha256 of id>`,
+    /// short enough for the unix socket path limit.
+    fn runtime_dir_for(&self, id: &str) -> PathBuf {
+        let hash = workspace_hash(id);
+        self.inner
+            .runtime_base_dir
+            .join(hash.get(..16).unwrap_or(&hash))
     }
 
     /// This workspace's MCP token share dir, under GAVMO's app-data dir and
     /// outside the repo so the token can't leak into the user's project.
     fn mcp_dir_for(&self, id: &str) -> PathBuf {
-        self.inner.mcp_base_dir.join(mcp_share_dir_name(id))
+        self.inner.mcp_base_dir.join(workspace_hash(id))
     }
 
     /// Mints a fresh MCP token for `id`, writes it to the share as
@@ -795,7 +838,7 @@ impl AppState {
                 "invalid build log filename",
             ));
         }
-        let file = read_state_file(id, log, MAX_BUILD_LOG_BYTES)
+        let file = read_guest_output_file(id, log, MAX_BUILD_LOG_BYTES)
             .await?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "build log not found"))?;
         let mut text = String::from_utf8_lossy(&file.bytes).into_owned();
@@ -813,10 +856,18 @@ impl AppState {
     /// Only the newest [`MAX_CONSOLE_LOG_BYTES`] are returned.
     pub async fn read_console_log(&self, id: &str) -> io::Result<String> {
         self.require_known(id).await.map_err(unknown_workspace_io)?;
-        Ok(read_state_file(id, "console.log", MAX_CONSOLE_LOG_BYTES)
-            .await?
-            .map(|file| sanitize_console(&file.bytes))
-            .unwrap_or_default())
+        // Host-only now, but read the same bounded, no-follow way regardless:
+        // it is still mostly guest-produced text.
+        let path = self.host_state_dir_for(id).join("console.log");
+        Ok(crate::guest_files::read_guest_file(
+            path,
+            Vec::new(),
+            MAX_CONSOLE_LOG_BYTES,
+            crate::guest_files::Keep::Tail,
+        )
+        .await?
+        .map(|file| sanitize_console(&file.bytes))
+        .unwrap_or_default())
     }
 
     /// Resource usage for a `Running` VM: per-core CPU %, guest-reported
@@ -841,7 +892,7 @@ impl AppState {
         };
 
         let disk_bytes =
-            vm::stats::file_size_or_zero(&Self::state_dir_for(id).join("disk.qcow2")).ok()?;
+            vm::stats::file_size_or_zero(&self.host_state_dir_for(id).join("disk.qcow2")).ok()?;
 
         let prev = vm::stats::sample(pid).ok()?;
         tokio::time::sleep(CPU_SAMPLE_INTERVAL).await;
@@ -941,16 +992,69 @@ fn ping_descriptor() -> ToolDescriptor {
     }
 }
 
-/// Deterministic, filesystem-safe directory name for a workspace's MCP token
-/// share: the hex SHA-256 of the workspace path.
+/// Deterministic, filesystem-safe, fixed-length name for a workspace's
+/// per-workspace host dirs (MCP token share, VM state, VM runtime): the hex
+/// SHA-256 of the workspace path.
 ///
 /// SHA-256 rather than the hex-encoded path itself: hex doubles the length, so
 /// any path over 127 bytes exceeded the 255-byte filename limit and that
 /// workspace could never boot. The digest is always 64 chars.
-fn mcp_share_dir_name(id: &str) -> String {
+fn workspace_hash(id: &str) -> String {
     use sha2::Digest as _;
 
     format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
+}
+
+/// Where VM sockets live: `$XDG_RUNTIME_DIR/gavmo` (private to the user,
+/// short, and cleared on reboot, so stale sockets disappear), else
+/// `/tmp/gavmo-<uid>`. Either way it is created `0700`, and an existing dir
+/// is refused unless it is a real directory owned by us
+/// ([`vm::create_private_dir_all`]) - in `/tmp` another user could have
+/// created it first.
+fn default_runtime_base() -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Ok(dir.join("gavmo"));
+    }
+    let uid = std::fs::metadata("/proc/self")?.uid();
+    Ok(std::env::temp_dir().join(format!("gavmo-{uid}")))
+}
+
+/// Logs a one-time hint if a workspace still has VM files from GAVMO versions
+/// that kept them in the repo. They are no longer used (and the disk may have
+/// been modified by the guest, so it is deliberately not migrated). Only
+/// `symlink_metadata` is used: nothing guest-controlled is followed.
+fn warn_about_legacy_vm_state(id: &str) {
+    let legacy = AppState::guest_output_dir_for(id).join("disk.qcow2");
+    if let Ok(meta) = std::fs::symlink_metadata(&legacy)
+        && meta.is_file()
+    {
+        tracing::info!(
+            "old VM disk at {} is no longer used (VM state now lives in \
+             ~/.local/share/gavmo/vms); it is safe to delete and frees {}",
+            legacy.display(),
+            human_bytes(meta.len())
+        );
+    }
+}
+
+/// `1536` -> `"1.5 KiB"`, for log messages.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS.get(unit).unwrap_or(&"B"))
+    }
 }
 
 /// Refuses workspace paths whose read-write mount would hand the guest more
@@ -997,15 +1101,15 @@ const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
 /// Most of a rebuild log shown in the UI (the end, where errors are).
 const MAX_BUILD_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Reads the tail of `<id>/.gavmo/vm/<name>`, which the guest can write
+/// Reads the tail of `<id>/.gavmo/vm/<name>` (guest build output), which the guest can write
 /// (see [`crate::guest_files`]): no symlinks, FIFOs or unbounded reads.
-async fn read_state_file(
+async fn read_guest_output_file(
     id: &str,
     name: &str,
     max_bytes: u64,
 ) -> io::Result<Option<crate::guest_files::GuestFile>> {
     let gavmo_dir = Path::new(id).join(".gavmo");
-    let state_dir = AppState::state_dir_for(id);
+    let state_dir = AppState::guest_output_dir_for(id);
     crate::guest_files::read_guest_file(
         state_dir.join(name),
         vec![gavmo_dir, state_dir],
@@ -1560,6 +1664,7 @@ mod tests {
             PathBuf::from("/nonexistent/gavmo-test-gcloud"),
             data.path(),
             Some(Path::new("/nonexistent/gavmo-test-home")),
+            &data.path().join("run"),
             Arc::new(secrets::MemoryStore::new()),
         )
         .unwrap();
@@ -1608,6 +1713,14 @@ mod tests {
 
         let (_data, state) = test_app_state();
         register(&state, &id).await;
+        let host_state = state.host_state_dir_for(&id);
+        let runtime = state.runtime_dir_for(&id);
+        for dir in [&host_state, &runtime] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+        }
+        tokio::fs::write(host_state.join("disk.qcow2"), b"fake overlay")
+            .await
+            .unwrap();
         state
             .inner
             .running
@@ -1621,6 +1734,8 @@ mod tests {
             .unwrap();
 
         assert!(!state_dir.exists());
+        assert!(!host_state.exists());
+        assert!(!runtime.exists());
         assert!(state.inner.running.lock().await.get(&id).is_none());
     }
 
@@ -1646,9 +1761,12 @@ mod tests {
         let (_tmp, repo_dir) = unique_temp_dir("unknown-repo");
         let state_dir = repo_dir.join(".gavmo").join("vm");
         tokio::fs::create_dir_all(&state_dir).await.unwrap();
-        tokio::fs::write(state_dir.join("console.log"), b"secret console")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            state_dir.join("rebuild-2026-01-01T00-00-00Z.log"),
+            b"secret log",
+        )
+        .await
+        .unwrap();
         tokio::fs::write(
             repo_dir.join("gavmo.yaml"),
             "tools:\n  t:\n    type: http\n    base_url: https://h.example.com\n    auth: bearer\n    secret: s\n",
@@ -1680,7 +1798,13 @@ mod tests {
 
         // The same directory, once registered, is reachable.
         register(&state, &id).await;
-        assert_eq!(state.read_console_log(&id).await.unwrap(), "secret console");
+        assert_eq!(
+            state
+                .read_build_log(&id, "rebuild-2026-01-01T00-00-00Z.log")
+                .await
+                .unwrap(),
+            "secret log"
+        );
         assert_eq!(state.list_tool_configs(&id).await.len(), 1);
     }
 
@@ -1784,10 +1908,16 @@ mod tests {
         let (_data, state) = test_app_state();
         register(&state, &id).await;
 
+        // A console.log planted in the repo is not the console log at all:
+        // qemu writes it to the host-only state dir.
         let state_dir = repo_dir.join(".gavmo").join("vm");
         std::fs::create_dir_all(&state_dir).unwrap();
         std::os::unix::fs::symlink(&secret, state_dir.join("console.log")).unwrap();
-        assert!(state.read_console_log(&id).await.is_err());
+        assert_eq!(state.read_console_log(&id).await.unwrap(), "");
+        let host_state = state.host_state_dir_for(&id);
+        std::fs::create_dir_all(&host_state).unwrap();
+        std::fs::write(host_state.join("console.log"), b"real console").unwrap();
+        assert_eq!(state.read_console_log(&id).await.unwrap(), "real console");
 
         // Whole state dir swapped for a symlink to a host dir.
         std::fs::remove_dir_all(&state_dir).unwrap();
@@ -1806,7 +1936,7 @@ mod tests {
         let id = repo_dir.to_string_lossy().into_owned();
         let (_data, state) = test_app_state();
         register(&state, &id).await;
-        let state_dir = repo_dir.join(".gavmo").join("vm");
+        let state_dir = state.host_state_dir_for(&id);
         std::fs::create_dir_all(&state_dir).unwrap();
         let mut big = vec![b'a'; usize::try_from(MAX_CONSOLE_LOG_BYTES).unwrap() * 2];
         big.extend_from_slice(b"NEWEST");
@@ -1817,23 +1947,82 @@ mod tests {
         assert!(text.len() as u64 <= MAX_CONSOLE_LOG_BYTES);
     }
 
+    /// Everything a host process opens lives outside the guest-writable repo;
+    /// only the guest's own build output stays in it.
+    #[test]
+    fn vm_config_keeps_host_state_out_of_the_repo() {
+        let (data, state) = test_app_state();
+        let id = "/home/u/src/project";
+        let cfg = state.vm_config(id, state.mcp_dir_for(id), 40000);
+        let hash = workspace_hash(id);
+
+        assert_eq!(cfg.state_dir, data.path().join("vms").join(&hash));
+        assert_eq!(
+            cfg.runtime_dir,
+            data.path().join("run").join(hash.get(..16).unwrap())
+        );
+        assert_eq!(cfg.guest_output_dir, Path::new(id).join(".gavmo/vm"));
+        for host_path in [
+            cfg.disk_path(),
+            cfg.console_log_path(),
+            cfg.qmp_socket_path(),
+        ] {
+            assert!(!host_path.starts_with(id), "{}", host_path.display());
+            assert!(
+                !host_path.starts_with(&cfg.mcp_dir),
+                "{}",
+                host_path.display()
+            );
+        }
+        assert!(cfg.rebuild_failed_marker_path().starts_with(id));
+    }
+
+    /// The longest socket name must fit the unix socket limit under a typical
+    /// runtime dir, however long the workspace path is.
+    #[test]
+    fn runtime_socket_paths_fit_the_unix_limit_for_any_workspace() {
+        let id = format!("/home/u/{}", "deep/".repeat(100));
+        let runtime = Path::new("/run/user/100000/gavmo")
+            .join(workspace_hash(&id).get(..16).unwrap())
+            .join("virtiofs-workspace.sock");
+        assert!(runtime.as_os_str().len() <= 107, "{}", runtime.display());
+    }
+
+    #[test]
+    fn human_bytes_formats_log_sizes() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(29_757_145_088), "27.7 GiB");
+    }
+
+    #[test]
+    fn the_runtime_base_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (data, _state) = test_app_state();
+        let mode = std::fs::metadata(data.path().join("run"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     /// Share dir names are deterministic, hex-only, and distinct per workspace.
     #[test]
-    fn mcp_share_dir_name_is_deterministic_and_filesystem_safe() {
-        let a = mcp_share_dir_name("/home/user/project-a");
-        let b = mcp_share_dir_name("/home/user/project-b");
+    fn workspace_hash_is_deterministic_and_filesystem_safe() {
+        let a = workspace_hash("/home/user/project-a");
+        let b = workspace_hash("/home/user/project-b");
 
-        assert_eq!(a, mcp_share_dir_name("/home/user/project-a"));
+        assert_eq!(a, workspace_hash("/home/user/project-a"));
         assert_ne!(a, b);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// Long workspace paths must still give a usable (<= 255 byte) name.
     #[test]
-    fn mcp_share_dir_name_has_fixed_length_for_long_paths() {
+    fn workspace_hash_has_fixed_length_for_long_paths() {
         let long = format!("/home/user/{}", "d/".repeat(200));
-        assert_eq!(mcp_share_dir_name(&long).len(), 64);
-        assert_eq!(mcp_share_dir_name("/").len(), 64);
+        assert_eq!(workspace_hash(&long).len(), 64);
+        assert_eq!(workspace_hash("/").len(), 64);
     }
 
     #[cfg(unix)]

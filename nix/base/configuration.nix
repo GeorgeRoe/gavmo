@@ -555,7 +555,8 @@ in
   # rather than let the agent run without the tools it expects.
   #
   # Host-visible failure signal (Rust <-> image contract): writes to
-  # /workspace/.gavmo/vm (`VmConfig` state_dir in crates/vm/src/config.rs)
+  # /workspace/.gavmo/vm (`VmConfig::guest_output_dir` in crates/vm/src/config.rs;
+  # it holds only this guest output - host VM state lives outside the repo)
   #   - rebuild-<UTC timestamp>.log: full nixos-rebuild output
   #   - rebuild-failed: on failure only, holding the log's filename; crates/vm
   #     races it against opencode's port so failures surface in seconds

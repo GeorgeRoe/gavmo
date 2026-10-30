@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
-use crate::fsutil::remove_if_exists;
+use crate::fsutil::{check_socket_path, remove_if_exists};
+use crate::qemu::qemu_opt_path;
 
 /// A single host directory exposed to the guest.
 #[derive(Debug, Clone)]
@@ -28,11 +29,17 @@ pub const GUEST_AGENT_GID: u32 = 1000;
 /// [`VirtiofsShare`] is the only implementation.
 pub trait ShareBackend: Send + Sync {
     /// QEMU command-line arguments contributed by this share.
-    fn qemu_args(&self, state_dir: &Path, spec: &ShareSpec) -> Vec<String>;
+    fn qemu_args(&self, runtime_dir: &Path, spec: &ShareSpec) -> Result<Vec<String>>;
 
     /// Spawns any helper process this backend needs (`virtiofsd` per share).
-    fn start(&self, _state_dir: &Path, _spec: &ShareSpec) -> Result<Option<Child>> {
+    fn start(&self, _runtime_dir: &Path, _spec: &ShareSpec) -> Result<Option<Child>> {
         Ok(None)
+    }
+
+    /// A path the helper creates once it is ready for qemu to connect
+    /// (virtiofsd's socket). qemu is only started after all of these exist.
+    fn ready_path(&self, _runtime_dir: &Path, _spec: &ShareSpec) -> Option<PathBuf> {
+        None
     }
 }
 
@@ -50,33 +57,35 @@ pub struct VirtiofsShare;
 impl VirtiofsShare {
     /// Path to this share's virtiofsd unix socket, shared by
     /// [`Self::start`] (binds) and [`Self::qemu_args`] (connects).
-    fn socket_path(state_dir: &Path, mount_tag: &str) -> PathBuf {
-        state_dir.join(format!("virtiofs-{mount_tag}.sock"))
+    fn socket_path(runtime_dir: &Path, mount_tag: &str) -> PathBuf {
+        runtime_dir.join(format!("virtiofs-{mount_tag}.sock"))
     }
 }
 
 impl ShareBackend for VirtiofsShare {
-    fn qemu_args(&self, state_dir: &Path, spec: &ShareSpec) -> Vec<String> {
+    fn qemu_args(&self, runtime_dir: &Path, spec: &ShareSpec) -> Result<Vec<String>> {
         let chardev_id = format!("char-{}", spec.mount_tag);
+        let socket = qemu_opt_path(&Self::socket_path(runtime_dir, spec.mount_tag))?;
 
-        vec![
+        Ok(vec![
             "-chardev".to_string(),
-            format!(
-                "socket,id={id},path={path}",
-                id = chardev_id,
-                path = Self::socket_path(state_dir, spec.mount_tag).display(),
-            ),
+            format!("socket,id={id},path={path}", id = chardev_id, path = socket,),
             "-device".to_string(),
             format!(
                 "vhost-user-fs-pci,chardev={id},tag={tag}",
                 id = chardev_id,
                 tag = spec.mount_tag,
             ),
-        ]
+        ])
     }
 
-    fn start(&self, state_dir: &Path, spec: &ShareSpec) -> Result<Option<Child>> {
-        let socket_path = Self::socket_path(state_dir, spec.mount_tag);
+    fn ready_path(&self, runtime_dir: &Path, spec: &ShareSpec) -> Option<PathBuf> {
+        Some(Self::socket_path(runtime_dir, spec.mount_tag))
+    }
+
+    fn start(&self, runtime_dir: &Path, spec: &ShareSpec) -> Result<Option<Child>> {
+        let socket_path = Self::socket_path(runtime_dir, spec.mount_tag);
+        check_socket_path(&socket_path)?;
 
         // A stale socket from a crashed boot would make virtiofsd fail to
         // bind. Absent is the normal case; anything else would only resurface
@@ -148,15 +157,15 @@ mod tests {
             mount_tag: "workspace",
             read_only: false,
         };
-        let state_dir = PathBuf::from("/home/user/project/.gavmo/vm");
+        let runtime_dir = PathBuf::from("/run/user/1000/gavmo/abc");
 
-        let args = VirtiofsShare.qemu_args(&state_dir, &spec);
+        let args = VirtiofsShare.qemu_args(&runtime_dir, &spec).unwrap();
 
         assert_eq!(
             args,
             vec![
                 "-chardev".to_string(),
-                "socket,id=char-workspace,path=/home/user/project/.gavmo/vm/virtiofs-workspace.sock"
+                "socket,id=char-workspace,path=/run/user/1000/gavmo/abc/virtiofs-workspace.sock"
                     .to_string(),
                 "-device".to_string(),
                 "vhost-user-fs-pci,chardev=char-workspace,tag=workspace".to_string(),
@@ -166,14 +175,14 @@ mod tests {
 
     #[test]
     fn qemu_args_use_a_distinct_socket_and_tag_per_share() {
-        let state_dir = PathBuf::from("/home/user/project/.gavmo/vm");
+        let runtime_dir = PathBuf::from("/run/user/1000/gavmo/abc");
         let gcloud_spec = ShareSpec {
             host_path: PathBuf::from("/home/user/.config/gcloud"),
             mount_tag: "gcloud",
             read_only: true,
         };
 
-        let args = VirtiofsShare.qemu_args(&state_dir, &gcloud_spec);
+        let args = VirtiofsShare.qemu_args(&runtime_dir, &gcloud_spec).unwrap();
 
         assert!(
             args.iter()
@@ -187,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_is_namespaced_by_state_dir_and_tag() {
+    fn socket_path_is_namespaced_by_runtime_dir_and_tag() {
         let state_dir = PathBuf::from("/some/state/dir");
         assert_eq!(
             VirtiofsShare::socket_path(&state_dir, "mcp"),
@@ -202,7 +211,7 @@ mod tests {
             mount_tag: "workspace",
             read_only: false,
         };
-        let socket_path = PathBuf::from("/home/user/project/.gavmo/vm/virtiofs-workspace.sock");
+        let socket_path = PathBuf::from("/run/user/1000/gavmo/abc/virtiofs-workspace.sock");
 
         let args = build_virtiofsd_args(&socket_path, &spec, 1001, 1001);
 
@@ -210,7 +219,7 @@ mod tests {
             args,
             vec![
                 "--socket-path".to_string(),
-                "/home/user/project/.gavmo/vm/virtiofs-workspace.sock".to_string(),
+                "/run/user/1000/gavmo/abc/virtiofs-workspace.sock".to_string(),
                 "--shared-dir".to_string(),
                 "/home/user/project".to_string(),
                 "--cache=auto".to_string(),

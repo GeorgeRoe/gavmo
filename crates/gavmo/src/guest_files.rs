@@ -1,8 +1,7 @@
 //! Reading files a guest VM can write.
 //!
 //! The repo is shared read-write into the guest, so anything under it -
-//! `gavmo.yaml`, and today also `.gavmo/vm/console.log` and the rebuild logs -
-//! is attacker-controlled from the daemon's point of view. A guest could
+//! `gavmo.yaml` and the rebuild logs in `.gavmo/vm/` - is attacker-controlled from the daemon's point of view. A guest could
 //! replace such a file with a symlink to a host secret (which the daemon would
 //! then show in the browser), a FIFO (hanging the reader forever), or a huge
 //! file (exhausting memory).
@@ -12,8 +11,9 @@
 //! opened descriptor; listed parent directories must not be symlinks; and at
 //! most `max_bytes` are read.
 //!
-//! The parent check is best effort (a guest could race it); the real fix is
-//! keeping VM state out of the shared tree altogether.
+//! The parent check is best effort (a guest could race it). Files host
+//! processes open or write (disk, console log, sockets) are therefore kept
+//! out of the shared tree altogether; see `vm::VmConfig`.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};

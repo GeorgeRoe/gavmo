@@ -18,6 +18,7 @@ pub mod stats;
 
 pub use config::{GUEST_OPENCODE_PORT, VmConfig};
 pub use error::{Error, Result};
+pub use fsutil::create_private_dir_all;
 pub use handle::{RunningVm, VmStatus};
 pub use qmp::{GuestMemory, guest_memory};
 pub use share::{GUEST_AGENT_GID, GUEST_AGENT_UID, ShareBackend, ShareSpec, VirtiofsShare};
