@@ -81,8 +81,28 @@ pub enum Error {
         source: io::Error,
     },
 
-    #[error("QMP command failed: {0}")]
-    QmpExecute(String),
+    #[error("QMP handshake on {path} failed: {source}")]
+    QmpHandshake {
+        path: PathBuf,
+        #[source]
+        source: qapi::ExecuteError,
+    },
+
+    #[error("QMP command `{command}` failed: {source}")]
+    QmpCommand {
+        command: &'static str,
+        #[source]
+        source: qapi::ExecuteError,
+    },
+
+    #[error("QMP command `{command}` did not complete within {timeout:?}")]
+    QmpTimeout {
+        command: &'static str,
+        timeout: Duration,
+    },
+
+    #[error("QMP worker task failed: {0}")]
+    QmpTask(#[source] tokio::task::JoinError),
 
     #[error("vm did not become healthy within {0:?}")]
     HealthTimeout(Duration),

@@ -7,6 +7,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Duration;
 
 use qapi::qmp;
 
@@ -114,37 +115,65 @@ fn parse_guest_stats(value: &serde_json::Value) -> Option<GuestMemory> {
     })
 }
 
+/// Upper bound on a whole QMP exchange (connect, handshake, command). A
+/// wedged qemu must never hang a caller: `stop()` would otherwise never reach
+/// its SIGKILL fallback, and status polls would pile up.
+const QMP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Opens a fresh QMP connection to `socket_path`, performs the capabilities
-/// handshake, executes a single command, and closes the connection.
+/// handshake, executes a single command, and closes the connection. Fails
+/// with [`Error::QmpTimeout`] after [`QMP_TIMEOUT`].
 async fn execute<C>(socket_path: &Path, command: C) -> Result<C::Ok>
 where
     C: qapi::Command + Send + 'static,
     C::Ok: Send + 'static,
 {
-    let socket_path = socket_path.to_path_buf();
-    tokio::task::spawn_blocking(move || execute_blocking(&socket_path, command))
-        .await
-        .map_err(|join_err| Error::QmpExecute(format!("qmp task panicked: {join_err}")))?
+    execute_with_timeout(socket_path, command, QMP_TIMEOUT).await
 }
 
-fn execute_blocking<C>(socket_path: &Path, command: C) -> Result<C::Ok>
+async fn execute_with_timeout<C>(socket_path: &Path, command: C, limit: Duration) -> Result<C::Ok>
+where
+    C: qapi::Command + Send + 'static,
+    C::Ok: Send + 'static,
+{
+    let socket_path = socket_path.to_path_buf();
+    // The socket timeouts make the blocking task itself finish soon after
+    // `limit` too, rather than lingering on the blocking pool.
+    let task = tokio::task::spawn_blocking(move || execute_blocking(&socket_path, command, limit));
+    match tokio::time::timeout(limit, task).await {
+        Ok(joined) => joined.map_err(Error::QmpTask)?,
+        Err(_elapsed) => Err(Error::QmpTimeout {
+            command: C::NAME,
+            timeout: limit,
+        }),
+    }
+}
+
+fn execute_blocking<C>(socket_path: &Path, command: C, limit: Duration) -> Result<C::Ok>
 where
     C: qapi::Command,
 {
-    let stream = UnixStream::connect(socket_path).map_err(|source| Error::QmpConnect {
+    let connect_err = |source| Error::QmpConnect {
         path: socket_path.to_path_buf(),
         source,
-    })?;
+    };
+    let stream = UnixStream::connect(socket_path).map_err(connect_err)?;
+    stream.set_read_timeout(Some(limit)).map_err(connect_err)?;
+    stream.set_write_timeout(Some(limit)).map_err(connect_err)?;
 
     // `Qmp::from_stream` needs `Read + Write + Clone`, which `&UnixStream`
     // provides.
     let mut qmp = qapi::Qmp::from_stream(&stream);
 
-    qmp.handshake()
-        .map_err(|e| Error::QmpExecute(format!("handshake failed: {e:?}")))?;
+    qmp.handshake().map_err(|source| Error::QmpHandshake {
+        path: socket_path.to_path_buf(),
+        source,
+    })?;
 
-    qmp.execute(&command)
-        .map_err(|e| Error::QmpExecute(format!("{e:?}")))
+    qmp.execute(&command).map_err(|source| Error::QmpCommand {
+        command: C::NAME,
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -196,6 +225,42 @@ mod tests {
         assert_eq!(
             parse_guest_stats(&json!({"last-update": 123, "stats": {}})),
             None
+        );
+    }
+
+    /// A peer that accepts but never speaks (a wedged qemu) must time out
+    /// promptly rather than hang the caller.
+    #[tokio::test]
+    async fn execute_times_out_against_a_silent_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _held = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+            drop(conn);
+        });
+
+        let started = std::time::Instant::now();
+        let result =
+            execute_with_timeout(&path, qmp::query_status {}, Duration::from_millis(300)).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::QmpTimeout { .. } | Error::QmpHandshake { .. })
+            ),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn execute_reports_a_missing_socket_as_connect_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = execute(&dir.path().join("absent.sock"), qmp::query_status {}).await;
+        assert!(
+            matches!(result, Err(Error::QmpConnect { .. })),
+            "{result:?}"
         );
     }
 }
