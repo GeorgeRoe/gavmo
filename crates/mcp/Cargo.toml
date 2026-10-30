@@ -13,3 +13,11 @@ workspace = true
 rmcp = { version = "=3.5.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
 http.workspace = true
 serde_json.workspace = true
+# The bearer-token gate in front of rmcp's service (same types rmcp uses).
+tower-service = "0.3"
+bytes = "1"
+http-body-util = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { workspace = true, features = ["util"] }

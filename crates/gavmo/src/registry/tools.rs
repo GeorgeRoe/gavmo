@@ -240,6 +240,14 @@ impl ToolExecutor for AppState {
         tools
     }
 
+    fn has_tool(&self, scope: &WorkspaceScope, name: &str) -> bool {
+        name == "gavmo_ping"
+            || self
+                .integrations_for(&scope.workspace_id)
+                .iter()
+                .any(|integration| integration.id == name)
+    }
+
     async fn call_tool(
         &self,
         scope: &WorkspaceScope,
