@@ -28,6 +28,8 @@ pub struct WorkspaceInfo {
 pub enum WorkspaceStatus {
     Stopped,
     Booting,
+    /// A stop, reset or remove is in progress.
+    Stopping,
     Running {
         url: String,
     },
@@ -985,7 +987,7 @@ fn WorkspaceModal(
                                 open(ev);
                             }
                         }
-                        disabled=move || busy.get()
+                        disabled=move || busy.get() || matches!(card_info.get().status, WorkspaceStatus::Stopping)
                     >
                         {move || if matches!(
                             card_info.get().status,
@@ -1397,6 +1399,7 @@ fn status_view(status: &WorkspaceStatus) -> (&'static str, String, Option<String
         // Covers "never booted" too, so "idle" rather than "stopped".
         WorkspaceStatus::Stopped => ("idle", "idle".into(), None),
         WorkspaceStatus::Booting => ("booting", "booting…".into(), None),
+        WorkspaceStatus::Stopping => ("booting", "stopping…".into(), None),
         WorkspaceStatus::Running { url } => ("running", "running".into(), Some(url.clone())),
         WorkspaceStatus::Failed { reason } => ("failed", format!("failed: {reason}"), None),
         // Same badge color as "failed"; the modal offers the build log.

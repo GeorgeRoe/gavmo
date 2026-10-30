@@ -18,6 +18,9 @@ pub mod integrations;
 #[cfg(feature = "ssr")]
 pub mod registry;
 
+#[cfg(feature = "ssr")]
+mod vm_handle;
+
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {

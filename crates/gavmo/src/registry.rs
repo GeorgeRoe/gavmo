@@ -14,13 +14,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use vm::{Error as VmError, RunningVm, VmConfig, VmStatus};
+use vm::{Error as VmError, VmConfig, VmStatus};
 
 use mcp::{TokenAuthority, ToolDescriptor, ToolExecutor, ToolOutcome, WorkspaceScope};
 use secrets::SecretStore;
 
 use crate::app::{ToolConfig, VmStats, WorkspaceInfo, WorkspaceStatus};
 use crate::integrations::{BindingState, CandidateTool, Credential, Delivery, ResolvedIntegration};
+use crate::vm_handle::{Launcher, QemuLauncher, VmHandle};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -92,43 +93,93 @@ struct Inner {
     /// The user's home dir, which no workspace may equal or contain.
     home_dir: Option<PathBuf>,
 
-    /// Bearer token -> workspace id. A `std::sync::Mutex` because
-    /// `TokenAuthority::resolve` is synchronous and the lock is never held
-    /// across an `.await`. Re-minted per boot; cleared on `stop`/`reset`.
+    /// Index: bearer token -> workspace id, mirroring the tokens held in
+    /// `running`. A `std::sync::Mutex` because `TokenAuthority::resolve` is
+    /// synchronous; never held across an `.await`. Only [`AppState::replace_slot`]
+    /// writes it.
     mcp_tokens: std::sync::Mutex<HashMap<String, String>>,
 
     /// Host secret store backing the tool integrations; an encrypted vault
     /// opened lazily on first access.
     secret_store: Arc<dyn SecretStore>,
 
-    /// Workspace id -> tool integrations resolved for its current boot.
-    /// Cleared on `stop`/`reset`; `std::sync::Mutex` since `list_tools` is sync.
-    workspace_integrations: std::sync::Mutex<HashMap<String, Vec<ResolvedIntegration>>>,
+    /// Index: workspace id -> integrations of its `Running` slot. Only
+    /// [`AppState::replace_slot`] writes it; `std::sync::Mutex` since
+    /// `list_tools` is sync.
+    workspace_integrations: std::sync::Mutex<HashMap<String, Arc<[ResolvedIntegration]>>>,
+
+    /// Per-workspace lifecycle locks: open, stop, reset and remove of one
+    /// workspace run one at a time (open refuses rather than waits).
+    lifecycle: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Source of [`VmSlot::Booting::generation`].
+    boot_generation: std::sync::atomic::AtomicU64,
+    /// Boots VMs (qemu in production, a fake in tests).
+    launcher: Arc<dyn Launcher>,
 
     /// Shared HTTP client for the tool forwarder; clones share one
     /// connection pool across all workspaces.
     http_client: reqwest::Client,
 }
 
-/// State of a workspace's VM while a boot is in flight or has settled.
-/// Boots happen in a background task (see [`AppState::open_workspace`]) so
-/// the server function returns immediately; the live status poll picks up
-/// the transition from `Booting` to `Running`/`Failed`.
+/// The lifecycle state of a workspace's VM. Absence from the map means
+/// stopped.
+///
+/// The MCP token and resolved integrations live *in* the slot, and the
+/// lookup indexes `mcp_tokens` / `workspace_integrations` are only ever
+/// updated together with the slot (see [`AppState::replace_slot`]), under
+/// the `running` lock. A workspace's credentials are therefore valid exactly
+/// while it is `Booting` (token only) or `Running`; every other transition
+/// revokes them in the same step.
 enum VmSlot {
-    /// `RunningVm::boot` is in progress in this task. Stop/reset abort it;
-    /// since qemu's `Child` is `kill_on_drop`, awaiting the aborted handle
-    /// guarantees qemu is gone before they proceed (e.g. touch the overlay).
-    Booting(tokio::task::JoinHandle<()>),
-    /// Booted and (as of the last check) healthy. Boxed because `RunningVm`
-    /// is much larger than the other variants.
-    Running(Box<RunningVm>),
-    /// The last boot attempt failed; kept so the reason stays visible in
-    /// the UI until the next `open_workspace`.
+    /// A boot task is in flight. Stop/reset abort it; since qemu's `Child`
+    /// is `kill_on_drop`, awaiting the aborted handle guarantees qemu is
+    /// gone. `generation` identifies this particular boot, so a finishing
+    /// task can tell whether it is still the one wanted.
+    Booting {
+        task: tokio::task::JoinHandle<()>,
+        generation: u64,
+        token: String,
+    },
+    /// Booted and (as of the last check) alive.
+    Running(Box<RunningSlot>),
+    /// A stop, reset or remove is tearing the VM down. Credentials are
+    /// already revoked; a finishing boot task must not resurrect it.
+    Stopping,
+    /// The last boot attempt failed, or the VM died; kept so the reason
+    /// stays visible until the next `open_workspace`.
     Failed(String),
     /// The repo's `gavmo.nix` failed to build (detected early via the
     /// guest's failure marker). `log` is the log filename relative to the
     /// workspace's `.gavmo/vm` dir, readable via [`AppState::read_build_log`].
     BuildFailed { log: String },
+}
+
+struct RunningSlot {
+    vm: Box<dyn VmHandle>,
+    token: String,
+    integrations: Arc<[ResolvedIntegration]>,
+}
+
+impl VmSlot {
+    fn token(&self) -> Option<&str> {
+        match self {
+            Self::Booting { token, .. } => Some(token),
+            Self::Running(running) => Some(&running.token),
+            Self::Stopping | Self::Failed(_) | Self::BuildFailed { .. } => None,
+        }
+    }
+
+    /// Whether a VM (or its boot) is live.
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Booting { .. } | Self::Running(_))
+    }
+}
+
+/// What a teardown found in the slot it replaced with `Stopping`.
+enum Teardown {
+    Vm(Box<dyn VmHandle>),
+    Boot(tokio::task::JoinHandle<()>),
+    Nothing,
 }
 
 impl AppState {
@@ -153,6 +204,7 @@ impl AppState {
             dirs::home_dir().as_deref(),
             &default_runtime_base()?,
             secret_store,
+            Arc::new(QemuLauncher),
         )
     }
 
@@ -165,6 +217,7 @@ impl AppState {
         home_dir: Option<&Path>,
         runtime_base_dir: &Path,
         secret_store: Arc<dyn SecretStore>,
+        launcher: Arc<dyn Launcher>,
     ) -> io::Result<Self> {
         std::fs::create_dir_all(gavmo_data_dir)?;
         vm::create_private_dir_all(runtime_base_dir).map_err(io::Error::other)?;
@@ -198,6 +251,9 @@ impl AppState {
                 mcp_tokens: std::sync::Mutex::new(HashMap::new()),
                 secret_store,
                 workspace_integrations: std::sync::Mutex::new(HashMap::new()),
+                lifecycle: std::sync::Mutex::new(HashMap::new()),
+                boot_generation: std::sync::atomic::AtomicU64::new(0),
+                launcher,
                 http_client: crate::integrations::forwarding_client().map_err(io::Error::other)?,
             }),
         })
@@ -205,20 +261,29 @@ impl AppState {
 
     /// All known workspaces plus each one's current status.
     pub async fn list(&self) -> Vec<WorkspaceInfo> {
-        let registry = self.inner.registry.lock().await;
-        let mut running = self.inner.running.lock().await;
-
-        let mut out = Vec::with_capacity(registry.workspaces.len());
-        for rec in &registry.workspaces {
-            let status = match running.get_mut(&rec.path) {
-                Some(slot) => slot_status(slot).await,
-                None => WorkspaceStatus::Stopped,
-            };
-            out.push(WorkspaceInfo {
-                id: rec.path.clone(),
-                path: rec.path.clone(),
-                status,
-            });
+        let mut dead = Vec::new();
+        let out = {
+            let registry = self.inner.registry.lock().await;
+            let mut running = self.inner.running.lock().await;
+            let mut out = Vec::with_capacity(registry.workspaces.len());
+            for rec in &registry.workspaces {
+                let status = match running.get_mut(&rec.path) {
+                    Some(slot) => slot_status(slot).await,
+                    None => WorkspaceStatus::Stopped,
+                };
+                if let Some(reason) = dead_reason(&status) {
+                    dead.push((rec.path.clone(), reason));
+                }
+                out.push(WorkspaceInfo {
+                    id: rec.path.clone(),
+                    path: rec.path.clone(),
+                    status,
+                });
+            }
+            out
+        };
+        for (id, reason) in dead {
+            self.mark_dead(&id, reason).await;
         }
         out
     }
@@ -296,147 +361,280 @@ impl AppState {
         if !self.is_known(id).await {
             return WorkspaceStatus::Stopped;
         }
-        let mut running = self.inner.running.lock().await;
-        match running.get_mut(id) {
+        let status = match self.inner.running.lock().await.get_mut(id) {
             Some(slot) => slot_status(slot).await,
             None => WorkspaceStatus::Stopped,
+        };
+        if let Some(reason) = dead_reason(&status) {
+            self.mark_dead(id, reason).await;
         }
+        status
+    }
+
+    // --- Lifecycle ---
+    //
+    // Invariants:
+    // - open/stop/reset/remove of one workspace hold its lifecycle lock for
+    //   their whole duration, so they never interleave (open refuses instead
+    //   of waiting, so a click during a slow stop errors instead of hanging);
+    // - every slot change goes through `replace_slot` under the `running`
+    //   lock, which keeps credentials in step with the slot;
+    // - the `running` lock is never held across a VM stop or a boot.
+
+    /// The lifecycle lock for `id`, created on first use.
+    fn lifecycle_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            lock_unpoisoned(&self.inner.lifecycle)
+                .entry(id.to_owned())
+                .or_default(),
+        )
+    }
+
+    /// Replaces (`Some`) or removes (`None`) `id`'s slot, updating the token
+    /// and integration indexes in the same step. Callers hold the `running`
+    /// lock (they pass its map), so no reader sees the two disagree.
+    fn replace_slot(
+        &self,
+        running: &mut HashMap<String, VmSlot>,
+        id: &str,
+        slot: Option<VmSlot>,
+    ) -> Option<VmSlot> {
+        let new_token = slot.as_ref().and_then(VmSlot::token).map(str::to_owned);
+        let new_integrations = match &slot {
+            Some(VmSlot::Running(running)) => Some(Arc::clone(&running.integrations)),
+            _ => None,
+        };
+        let old = match slot {
+            Some(slot) => running.insert(id.to_owned(), slot),
+            None => running.remove(id),
+        };
+
+        let mut tokens = lock_unpoisoned(&self.inner.mcp_tokens);
+        tokens.retain(|_, owner| owner != id);
+        if let Some(token) = new_token {
+            tokens.insert(token, id.to_owned());
+        }
+        drop(tokens);
+        let mut integrations = lock_unpoisoned(&self.inner.workspace_integrations);
+        match new_integrations {
+            Some(list) => integrations.insert(id.to_owned(), list),
+            None => integrations.remove(id),
+        };
+        old
     }
 
     /// Kicks off booting the VM for a workspace (or is a no-op if it's
     /// already booting/running) and returns immediately without waiting for
     /// the boot. Callers poll `status`/`list` to observe the transition.
+    ///
+    /// Refused while another lifecycle operation (stop, reset, remove) on the
+    /// same workspace is in progress.
     pub async fn open_workspace(&self, id: &str) -> Result<(), String> {
         // Otherwise any host directory could be booted with `id` mounted
         // read-write into the guest.
         self.require_known(id).await?;
+        let Ok(_lifecycle) = self.lifecycle_lock(id).try_lock_owned() else {
+            return Err(
+                "this workspace is busy (stopping, resetting or being removed); \
+                        try again in a moment"
+                    .to_owned(),
+            );
+        };
+        // Re-checked under the lifecycle lock: a remove that just finished
+        // has dropped it from the registry.
+        self.require_known(id).await?;
 
         // Bail early if already up: our own live VM holds the persisted port,
         // so `resolve_host_port` would see it as taken and needlessly
-        // reallocate it.
-        if matches!(
-            self.inner.running.lock().await.get(id),
-            Some(VmSlot::Booting(_) | VmSlot::Running(_))
-        ) {
+        // reallocate it. Nothing else can start or stop it meanwhile.
+        if self
+            .inner
+            .running
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(VmSlot::is_active)
+        {
             return Ok(());
         }
 
         // Takes only the `registry` lock, not nested under `running`: lock
-        // order is registry then running (as in `list`), so the reverse
-        // would risk deadlock.
+        // order is registry then running (as in `list`).
         let host_port = self
             .resolve_host_port(id)
             .await
             .map_err(|e| format!("failed to resolve a host port: {e}"))?;
 
-        // Check, mint, spawn and insert under one held lock with no `.await`
-        // between check and insert (TOCTOU): two concurrent opens for the
-        // same `id` can never both boot. This check, not the early peek, is
-        // the load-bearing one.
-        let mut running = self.inner.running.lock().await;
-        match running.get(id) {
-            Some(VmSlot::Booting(_) | VmSlot::Running(_)) => return Ok(()),
-            // Retrying after `BuildFailed` is expected once `gavmo.nix` is fixed.
-            Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
-        }
-
         // Mint the per-boot MCP token only on a real new boot: rotating a
         // running VM's token would break its already-loaded `gavmo-opencode`.
-        // The small file write under the `running` lock is accepted.
         let mcp_dir = self.mcp_dir_for(id);
-        if let Err(e) = self.mint_mcp_token(id, &mcp_dir).await {
-            let reason = format!("failed to write MCP token: {e}");
-            running.insert(id.to_string(), VmSlot::Failed(reason.clone()));
-            return Err(reason);
-        }
+        let token = match mint_mcp_token(&mcp_dir).await {
+            Ok(token) => token,
+            Err(e) => {
+                let reason = format!("failed to write MCP token: {e}");
+                let mut running = self.inner.running.lock().await;
+                self.replace_slot(&mut running, id, Some(VmSlot::Failed(reason.clone())));
+                return Err(reason);
+            }
+        };
 
         let cfg = self.vm_config(id, mcp_dir, host_port);
+        let generation = self
+            .inner
+            .boot_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // Held across spawn + insert, so the task (which needs this lock to
+        // publish its result) can't finish before its `Booting` slot exists.
+        let mut running = self.inner.running.lock().await;
         let state = self.clone();
-        let task_id = id.to_string();
-        let handle = tokio::spawn(async move {
-            let result = RunningVm::boot(cfg).await;
-
-            // Resolved before taking the `running` lock so the keyring check
-            // can't block `status`/`list`. A failed boot exposes no tools.
-            let integrations = if result.is_ok() {
-                state.resolve_integrations_for(&task_id).await
-            } else {
-                Vec::new()
-            };
-
-            let mut running = state.inner.running.lock().await;
-
-            // If the slot is no longer `Booting` (superseded or stopped),
-            // don't resurrect it; stop any VM we booted rather than leak qemu.
-            // A variant check, not task identity: being replaced by another
-            // `Booting` before we get here is an accepted small race.
-            let still_wanted = matches!(running.get(&task_id), Some(VmSlot::Booting(_)));
-            match result {
-                Ok(vm) if still_wanted => {
-                    state.set_integrations(&task_id, integrations);
-                    running.insert(task_id, VmSlot::Running(Box::new(vm)));
-                }
-                Ok(vm) => {
-                    drop(running);
-                    if let Err(e) = vm.stop().await {
-                        tracing::warn!(
-                            workspace = %task_id,
-                            error = %e,
-                            "failed to stop a superseded VM cleanly"
-                        );
-                    }
-                }
-                Err(e) if still_wanted => {
-                    let slot = match &e {
-                        VmError::RebuildFailed { log_file } => VmSlot::BuildFailed {
-                            log: log_file.clone(),
-                        },
-                        _ => VmSlot::Failed(e.to_string()),
-                    };
-                    running.insert(task_id, slot);
-                }
-                Err(_) => {}
-            }
+        let task_id = id.to_owned();
+        let task_token = token.clone();
+        let boot = self.inner.launcher.boot(cfg);
+        let task = tokio::spawn(async move {
+            let result = boot.await;
+            state
+                .finish_boot(&task_id, generation, task_token, result)
+                .await;
         });
-
-        running.insert(id.to_string(), VmSlot::Booting(handle));
-
+        self.replace_slot(
+            &mut running,
+            id,
+            Some(VmSlot::Booting {
+                task,
+                generation,
+                token,
+            }),
+        );
         Ok(())
     }
 
+    /// Publishes a boot's outcome, but only if its `Booting` slot (same
+    /// generation) is still there; otherwise a stop/reset has taken over and
+    /// any VM that did boot is stopped here rather than leaked.
+    async fn finish_boot(
+        &self,
+        id: &str,
+        generation: u64,
+        token: String,
+        result: vm::Result<Box<dyn VmHandle>>,
+    ) {
+        // Resolved before taking the `running` lock so the keyring check
+        // can't block `status`/`list`. A failed boot exposes no tools.
+        let integrations: Arc<[ResolvedIntegration]> = if result.is_ok() {
+            self.resolve_integrations_for(id).await.into()
+        } else {
+            Arc::new([])
+        };
+
+        let mut running = self.inner.running.lock().await;
+        let still_wanted = matches!(
+            running.get(id),
+            Some(VmSlot::Booting { generation: g, .. }) if *g == generation
+        );
+        match result {
+            Ok(vm) if still_wanted => {
+                self.replace_slot(
+                    &mut running,
+                    id,
+                    Some(VmSlot::Running(Box::new(RunningSlot {
+                        vm,
+                        token,
+                        integrations,
+                    }))),
+                );
+            }
+            Ok(vm) => {
+                drop(running);
+                stop_vm_logged(id, vm, "superseded").await;
+            }
+            Err(e) if still_wanted => {
+                self.replace_slot(&mut running, id, Some(slot_for_boot_error(&e)));
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Marks `id`'s slot `Stopping` (revoking its credentials at once) and
+    /// returns what has to be torn down. The caller must hold `id`'s
+    /// lifecycle lock and must later replace the `Stopping` slot.
+    async fn begin_teardown(&self, id: &str) -> Teardown {
+        let mut running = self.inner.running.lock().await;
+        if !running.get(id).is_some_and(VmSlot::is_active) {
+            return Teardown::Nothing;
+        }
+        match self.replace_slot(&mut running, id, Some(VmSlot::Stopping)) {
+            Some(VmSlot::Running(slot)) => Teardown::Vm(slot.vm),
+            Some(VmSlot::Booting { task, .. }) => Teardown::Boot(task),
+            _ => Teardown::Nothing,
+        }
+    }
+
+    /// Carries out a [`Teardown`]: stops the VM, or aborts and awaits the boot
+    /// task (so qemu is gone on return either way).
+    async fn run_teardown(id: &str, teardown: Teardown) -> Result<(), String> {
+        match teardown {
+            Teardown::Vm(vm) => vm.stop().await.map_err(|e| e.to_string()),
+            Teardown::Boot(task) => {
+                abort_boot_task(id, task).await;
+                Ok(())
+            }
+            Teardown::Nothing => Ok(()),
+        }
+    }
+
+    /// Replaces `id`'s slot with `slot` (or removes it), unless it changed
+    /// from what a teardown left. Only `Stopping` (ours) or an inactive slot
+    /// is replaced; under the lifecycle lock nothing else can appear.
+    async fn end_teardown(&self, id: &str, slot: Option<VmSlot>) {
+        let mut running = self.inner.running.lock().await;
+        if !running.get(id).is_some_and(VmSlot::is_active) {
+            self.replace_slot(&mut running, id, slot);
+        }
+    }
+
     /// Stops the VM for a workspace and drops it from the running map. A
-    /// no-op if it isn't currently running or booting.
+    /// no-op if it isn't currently running or booting. Credentials are
+    /// revoked before the (possibly slow) shutdown starts.
     ///
     /// An in-flight boot is aborted and awaited, so qemu is gone on return
     /// (killed on drop, or gracefully stopped by the boot task if it had
     /// just succeeded - rarely blocking up to ~35s).
     pub async fn stop_workspace(&self, id: &str) -> Result<(), String> {
-        // Revoke the MCP token first so a stopping VM can never authorize
-        // gateway calls again, however the stop resolves.
-        self.clear_mcp_token(id);
-        self.clear_integrations(id);
-
-        let slot = self.inner.running.lock().await.remove(id);
-        match slot {
-            Some(VmSlot::Running(vm)) => vm.stop().await.map_err(|e| e.to_string()),
-            Some(VmSlot::Booting(handle)) => {
-                abort_boot_task(id, handle).await;
-                Ok(())
-            }
-            Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => Ok(()),
+        // Unknown ids with nothing running have nothing to stop (and get no
+        // lifecycle lock entry).
+        if !self.is_known(id).await && !self.inner.running.lock().await.contains_key(id) {
+            return Ok(());
         }
+        let lifecycle = self.lifecycle_lock(id);
+        let _held = lifecycle.lock().await;
+        let teardown = self.begin_teardown(id).await;
+        let result = Self::run_teardown(id, teardown).await;
+        self.end_teardown(id, None).await;
+        result
     }
 
     /// Stops the VM and drops the workspace from the registry. Non-destructive:
     /// its VM state (`~/.local/share/gavmo/vms/<hash>`) and `.gavmo/` in the
-    /// repo are kept, so re-adding the path restores its overlay and sessions. A no-op for unknown ids.
+    /// repo are kept, so re-adding the path restores its overlay and sessions.
+    /// A no-op for unknown ids.
+    ///
+    /// The registry entry goes first, so no `open` can start meanwhile.
     pub async fn remove_workspace(&self, id: &str) -> Result<(), String> {
-        self.stop_workspace(id).await?;
-
-        let mut registry = self.inner.registry.lock().await;
-        registry.workspaces.retain(|w| w.path != id);
-        save_registry(&self.inner.registry_path, &registry).map_err(|e| e.to_string())
+        let lifecycle = self.lifecycle_lock(id);
+        let _held = lifecycle.lock().await;
+        {
+            let mut registry = self.inner.registry.lock().await;
+            let before = registry.workspaces.len();
+            registry.workspaces.retain(|w| w.path != id);
+            if registry.workspaces.len() != before {
+                save_registry(&self.inner.registry_path, &registry).map_err(|e| e.to_string())?;
+            }
+        }
+        let teardown = self.begin_teardown(id).await;
+        let result = Self::run_teardown(id, teardown).await;
+        self.end_teardown(id, None).await;
+        result
     }
 
     /// Stops the VM and deletes its host state (overlay disk, console log),
@@ -446,36 +644,64 @@ impl AppState {
     /// it was created from.
     ///
     /// Destructive (the guest's `/nix` cache is lost; opencode sessions in
-    /// `<repo>/.gavmo/opencode` are kept); the caller
-    /// must have obtained user confirmation. An in-flight boot is aborted and
-    /// awaited first, so qemu can't still be writing the overlay.
+    /// `<repo>/.gavmo/opencode` are kept); the caller must have obtained user
+    /// confirmation. An in-flight boot is aborted and awaited first, and the
+    /// workspace stays `Stopping` (refusing opens) until the files are gone,
+    /// so qemu can't be writing the overlay while it is deleted.
     pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
         // The state dir is derived from `id` and deleted below.
         self.require_known(id).await.map_err(unknown_workspace_io)?;
-        self.clear_mcp_token(id);
-        self.clear_integrations(id);
+        let lifecycle = self.lifecycle_lock(id);
+        let _held = lifecycle.lock().await;
 
-        let slot = self.inner.running.lock().await.remove(id);
-        match slot {
-            // The state dir is deleted regardless: qemu has been killed by
-            // `stop` at the latest via SIGKILL, so a failure here is only
-            // worth logging, not blocking the reset the user confirmed.
-            Some(VmSlot::Running(vm)) => {
-                if let Err(e) = vm.stop().await {
-                    tracing::warn!(workspace = %id, error = %e, "VM did not stop cleanly during reset");
-                }
-            }
-            Some(VmSlot::Booting(handle)) => abort_boot_task(id, handle).await,
-            Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
+        let teardown = self.begin_teardown(id).await;
+        // The state dir is deleted regardless: qemu has been killed by `stop`
+        // at the latest via SIGKILL, so a failure is only worth logging, not
+        // blocking the reset the user confirmed.
+        if let Err(e) = Self::run_teardown(id, teardown).await {
+            tracing::warn!(workspace = %id, error = %e, "VM did not stop cleanly during reset");
         }
 
         // The next open builds a fresh overlay from the current base image.
         // The guest output dir goes too (stale rebuild logs, and any VM files
         // left there by GAVMO versions that kept state in the repo);
         // `remove_dir_all` never follows a symlink planted in its place.
-        remove_dir_all_idempotent(&self.host_state_dir_for(id)).await?;
-        remove_dir_all_idempotent(&self.runtime_dir_for(id)).await?;
-        remove_dir_all_idempotent(&Self::guest_output_dir_for(id)).await
+        let result = async {
+            remove_dir_all_idempotent(&self.host_state_dir_for(id)).await?;
+            remove_dir_all_idempotent(&self.runtime_dir_for(id)).await?;
+            remove_dir_all_idempotent(&Self::guest_output_dir_for(id)).await
+        }
+        .await;
+        let after = match &result {
+            Ok(()) => None,
+            Err(e) => Some(VmSlot::Failed(format!(
+                "reset could not delete VM state: {e}"
+            ))),
+        };
+        self.end_teardown(id, after).await;
+        result
+    }
+
+    /// Moves a `Running` slot whose VM has died to `Failed` (revoking its
+    /// credentials, and letting `open` boot it again), and reaps the dead
+    /// VM's helpers in the background. A no-op if the slot changed meanwhile
+    /// or `id` is mid-lifecycle-operation (that operation handles it).
+    async fn mark_dead(&self, id: &str, reason: String) {
+        let lifecycle = self.lifecycle_lock(id);
+        let Ok(_held) = lifecycle.try_lock() else {
+            return;
+        };
+        let mut running = self.inner.running.lock().await;
+        if !matches!(running.get(id), Some(VmSlot::Running(_))) {
+            return;
+        }
+        if let Some(VmSlot::Running(slot)) =
+            self.replace_slot(&mut running, id, Some(VmSlot::Failed(reason)))
+        {
+            drop(running);
+            let id = id.to_owned();
+            tokio::spawn(async move { stop_vm_logged(&id, slot.vm, "dead").await });
+        }
     }
 
     /// Builds the per-VM [`VmConfig`] for a workspace path. `host_port` is
@@ -548,27 +774,6 @@ impl AppState {
         self.inner.mcp_base_dir.join(workspace_hash(id))
     }
 
-    /// Mints a fresh MCP token for `id`, writes it to the share as
-    /// `token.env` (the guest's `GAVMO_MCP_TOKEN`), and records it in
-    /// `mcp_tokens`, replacing any previous one: one valid token per workspace.
-    async fn mint_mcp_token(&self, id: &str, dir: &Path) -> io::Result<()> {
-        tokio::fs::create_dir_all(dir).await?;
-        let token = uuid::Uuid::new_v4().to_string();
-        let path = dir.join("token.env");
-        write_owner_only(&path, format!("GAVMO_MCP_TOKEN={token}\n").as_bytes()).await?;
-
-        let mut tokens = lock_unpoisoned(&self.inner.mcp_tokens);
-        tokens.retain(|_, v| v != id);
-        tokens.insert(token, id.to_string());
-        Ok(())
-    }
-
-    /// Invalidates `id`'s MCP token, so a stopped VM can't call the gateway
-    /// even if its `token.env` is still on disk.
-    fn clear_mcp_token(&self, id: &str) {
-        lock_unpoisoned(&self.inner.mcp_tokens).retain(|_, v| v != id);
-    }
-
     /// Resolves the enabled tool integrations for `id`: tools requested in
     /// `gavmo.yaml` that have a correctly bound secret configured.
     async fn resolve_integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
@@ -594,22 +799,12 @@ impl AppState {
             .collect()
     }
 
-    /// Records the resolved integrations for a freshly-booted workspace.
-    fn set_integrations(&self, id: &str, integrations: Vec<ResolvedIntegration>) {
-        lock_unpoisoned(&self.inner.workspace_integrations).insert(id.to_string(), integrations);
-    }
-
-    /// Forgets a workspace's integrations on stop/reset.
-    fn clear_integrations(&self, id: &str) {
-        lock_unpoisoned(&self.inner.workspace_integrations).remove(id);
-    }
-
-    /// The integrations currently resolved for `id` (empty if none/stopped).
-    fn integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
+    /// The integrations of `id`'s `Running` slot (empty if none/stopped).
+    fn integrations_for(&self, id: &str) -> Arc<[ResolvedIntegration]> {
         lock_unpoisoned(&self.inner.workspace_integrations)
             .get(id)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| Arc::new([]))
     }
 
     /// Every tool this workspace's `gavmo.yaml` requests, read live (no secret
@@ -877,19 +1072,17 @@ impl AppState {
     /// The `running` lock is released before the CPU sampling sleep and the
     /// QMP call, so stats polls never block `stop`/`reset`.
     pub async fn vm_stats(&self, id: &str) -> Option<VmStats> {
-        let (pid, uptime_secs, vcpus, host_port, qmp_socket_path) = {
-            let mut running = self.inner.running.lock().await;
-            match running.get_mut(id) {
-                Some(VmSlot::Running(vm)) => (
-                    vm.qemu_pid()?,
-                    vm.uptime().as_secs(),
-                    vm.vcpus(),
-                    vm.host_port(),
-                    vm.qmp_socket_path(),
-                ),
-                _ => return None,
-            }
+        let info = match self.inner.running.lock().await.get(id) {
+            Some(VmSlot::Running(running)) => running.vm.info(),
+            _ => return None,
         };
+        let pid = info.qemu_pid?;
+        let (uptime_secs, vcpus, host_port, qmp_socket_path) = (
+            info.uptime.as_secs(),
+            info.vcpus,
+            info.host_port,
+            info.qmp_socket_path,
+        );
 
         let disk_bytes =
             vm::stats::file_size_or_zero(&self.host_state_dir_for(id).join("disk.qcow2")).ok()?;
@@ -930,9 +1123,9 @@ impl TokenAuthority for AppState {
 impl ToolExecutor for AppState {
     fn list_tools(&self, scope: &WorkspaceScope) -> Vec<ToolDescriptor> {
         let mut tools = vec![ping_descriptor()];
-        for integration in self.integrations_for(&scope.workspace_id) {
+        for integration in self.integrations_for(&scope.workspace_id).iter() {
             tools.push(crate::integrations::integration_tool_descriptor(
-                &integration,
+                integration,
             ));
         }
         tools
@@ -951,8 +1144,9 @@ impl ToolExecutor for AppState {
         // A miss is only possible if tools were cleared between list and call.
         match self
             .integrations_for(&scope.workspace_id)
-            .into_iter()
+            .iter()
             .find(|integration| integration.id == name)
+            .cloned()
         {
             Some(integration) => {
                 // Fetched fresh per call; credentials are never cached.
@@ -1125,6 +1319,34 @@ fn unknown_workspace_io(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, message)
 }
 
+/// Mints a fresh MCP token and writes it to the share dir as `token.env` (the
+/// guest's `GAVMO_MCP_TOKEN`). It becomes valid only once the caller puts it
+/// in a slot (see [`AppState::replace_slot`]).
+async fn mint_mcp_token(dir: &Path) -> io::Result<String> {
+    tokio::fs::create_dir_all(dir).await?;
+    let token = uuid::Uuid::new_v4().to_string();
+    let path = dir.join("token.env");
+    write_owner_only(&path, format!("GAVMO_MCP_TOKEN={token}\n").as_bytes()).await?;
+    Ok(token)
+}
+
+/// The slot for a failed boot: `BuildFailed` for a `gavmo.nix` failure.
+fn slot_for_boot_error(e: &VmError) -> VmSlot {
+    match e {
+        VmError::RebuildFailed { log_file } => VmSlot::BuildFailed {
+            log: log_file.clone(),
+        },
+        _ => VmSlot::Failed(e.to_string()),
+    }
+}
+
+/// Stops a VM that no slot owns any more, logging (not returning) failure.
+async fn stop_vm_logged(id: &str, vm: Box<dyn VmHandle>, what: &str) {
+    if let Err(e) = vm.stop().await {
+        tracing::warn!(workspace = %id, error = %e, "failed to stop a {what} VM cleanly");
+    }
+}
+
 /// Aborts an in-flight boot task and waits for it to finish, so qemu (owned
 /// by the task, `kill_on_drop`) is gone on return. Cancellation, or the task
 /// having already finished, is the expected outcome; a panic is logged.
@@ -1263,12 +1485,22 @@ fn sanitize_console(bytes: &[u8]) -> String {
 /// last poll).
 async fn slot_status(slot: &mut VmSlot) -> WorkspaceStatus {
     match slot {
-        VmSlot::Booting(_) => WorkspaceStatus::Booting,
-        VmSlot::Running(vm) => to_status(vm.status().await),
+        VmSlot::Booting { .. } => WorkspaceStatus::Booting,
+        VmSlot::Running(running) => to_status(running.vm.status().await),
+        VmSlot::Stopping => WorkspaceStatus::Stopping,
         VmSlot::Failed(reason) => WorkspaceStatus::Failed {
             reason: reason.clone(),
         },
         VmSlot::BuildFailed { log } => WorkspaceStatus::BuildFailed { log: log.clone() },
+    }
+}
+
+/// A `Running` slot reporting `Failed` means its qemu is gone (the `vm` crate
+/// only reports `Failed` for an exited or unwaitable process).
+fn dead_reason(status: &WorkspaceStatus) -> Option<String> {
+    match status {
+        WorkspaceStatus::Failed { reason } => Some(reason.clone()),
+        _ => None,
     }
 }
 
@@ -1451,13 +1683,7 @@ mod tests {
         let err = VmError::RebuildFailed {
             log_file: "rebuild-2026-01-01T00-00-00Z.log".to_string(),
         };
-        // Mirrors the boot task's error mapping, which needs a real VM to test.
-        let slot = match &err {
-            VmError::RebuildFailed { log_file } => VmSlot::BuildFailed {
-                log: log_file.clone(),
-            },
-            _ => VmSlot::Failed(err.to_string()),
-        };
+        let slot = slot_for_boot_error(&err);
         assert!(matches!(
             slot,
             VmSlot::BuildFailed { log } if log == "rebuild-2026-01-01T00-00-00Z.log"
@@ -1658,6 +1884,17 @@ mod tests {
     /// secret store, and its own temp data dir (kept alive by the returned
     /// `TempDir`), so tests never read or write the user's real registry.
     fn test_app_state() -> (tempfile::TempDir, AppState) {
+        let (data, state, _script) = scripted_app_state();
+        (data, state)
+    }
+
+    /// [`test_app_state`] plus the controls of its fake VM launcher.
+    fn scripted_app_state() -> (
+        tempfile::TempDir,
+        AppState,
+        Arc<crate::vm_handle::fake::Script>,
+    ) {
+        let script = crate::vm_handle::fake::Script::new();
         let data = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir(
             PathBuf::from("/nonexistent/gavmo-test-base.qcow2"),
@@ -1666,17 +1903,22 @@ mod tests {
             Some(Path::new("/nonexistent/gavmo-test-home")),
             &data.path().join("run"),
             Arc::new(secrets::MemoryStore::new()),
+            Arc::new(crate::vm_handle::fake::FakeLauncher(Arc::clone(&script))),
         )
         .unwrap();
-        (data, state)
+        (data, state, script)
     }
 
     /// A `Booting` slot whose task never finishes in test time, standing in
     /// for an in-flight boot.
     fn never_finishing_boot_slot() -> VmSlot {
-        VmSlot::Booting(tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(600)).await;
-        }))
+        VmSlot::Booting {
+            task: tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }),
+            generation: u64::MAX,
+            token: "test-token".to_owned(),
+        }
     }
 
     /// `stop_workspace` aborts an in-flight boot and returns promptly
@@ -2006,6 +2248,213 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
     }
 
+    // --- Lifecycle (with the fake launcher) ---
+
+    /// A registered workspace backed by a real (empty) temp dir.
+    async fn registered_repo(state: &AppState) -> (tempfile::TempDir, String) {
+        let repo = tempfile::tempdir().unwrap();
+        let id = repo.path().to_str().unwrap().to_owned();
+        register(state, &id).await;
+        (repo, id)
+    }
+
+    /// Polls `cond` until true, failing after 5s instead of hanging.
+    async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond().await {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn slot_is(state: &AppState, id: &str, pred: impl Fn(Option<&VmSlot>) -> bool) -> bool {
+        pred(state.inner.running.lock().await.get(id))
+    }
+
+    fn current_token(state: &AppState, id: &str) -> Option<String> {
+        lock_unpoisoned(&state.inner.mcp_tokens)
+            .iter()
+            .find(|(_, owner)| *owner == id)
+            .map(|(token, _)| token.clone())
+    }
+
+    /// Opens `id` and lets its fake boot finish.
+    async fn open_and_run(state: &AppState, script: &crate::vm_handle::fake::Script, id: &str) {
+        state.open_workspace(id).await.unwrap();
+        script.release_boots(1);
+        eventually("Running", async || {
+            slot_is(state, id, |s| matches!(s, Some(VmSlot::Running(_)))).await
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_boot_once() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        let (a, b) = tokio::join!(state.open_workspace(&id), state.open_workspace(&id));
+        // One boots; the other is a no-op or refused as busy, never a 2nd boot.
+        assert!(a.is_ok() || b.is_ok());
+        script.release_boots(2);
+        eventually("Running", async || {
+            slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Running(_)))).await
+        })
+        .await;
+        state.open_workspace(&id).await.unwrap();
+        assert_eq!(script.boots(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_revokes_credentials_and_stops_the_vm() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        let token = current_token(&state, &id).expect("a running VM has a token");
+        assert!(TokenAuthority::resolve(&state, &token).is_some());
+
+        state.stop_workspace(&id).await.unwrap();
+        assert_eq!(TokenAuthority::resolve(&state, &token), None);
+        assert!(state.integrations_for(&id).is_empty());
+        assert!(slot_is(&state, &id, |s| s.is_none()).await);
+        assert_eq!(script.stops(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_during_boot_aborts_it_and_revokes_the_token() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        state.open_workspace(&id).await.unwrap();
+        let token = current_token(&state, &id).expect("booting VMs hold a token");
+
+        state.stop_workspace(&id).await.unwrap();
+        // A late permit must not resurrect anything.
+        script.release_boots(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(slot_is(&state, &id, |s| s.is_none()).await);
+        assert_eq!(TokenAuthority::resolve(&state, &token), None);
+    }
+
+    /// While a stop is in progress, open is refused (not queued) and the UI
+    /// sees `Stopping`.
+    #[tokio::test]
+    async fn open_is_refused_while_a_stop_is_in_progress() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        script
+            .stops_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let stopping = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { state.stop_workspace(&id).await }
+        });
+        eventually("Stopping", async || {
+            slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Stopping))).await
+        })
+        .await;
+        assert_eq!(state.status(&id).await, WorkspaceStatus::Stopping);
+        let refused = state.open_workspace(&id).await.unwrap_err();
+        assert!(refused.contains("busy"), "{refused}");
+
+        script.stop_gate.add_permits(1);
+        stopping.await.unwrap().unwrap();
+        open_and_run(&state, &script, &id).await;
+        assert_eq!(script.boots(), 2);
+    }
+
+    /// Reset keeps the workspace `Stopping` until its files are deleted.
+    #[tokio::test]
+    async fn reset_holds_off_opens_until_state_is_deleted() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        let disk_dir = state.host_state_dir_for(&id);
+        tokio::fs::create_dir_all(&disk_dir).await.unwrap();
+        script
+            .stops_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let resetting = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { state.reset_workspace(&id).await }
+        });
+        eventually("Stopping", async || {
+            slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Stopping))).await
+        })
+        .await;
+        assert!(state.open_workspace(&id).await.is_err());
+        script.stop_gate.add_permits(1);
+        resetting.await.unwrap().unwrap();
+        assert!(!disk_dir.exists());
+        assert!(slot_is(&state, &id, |s| s.is_none()).await);
+    }
+
+    #[tokio::test]
+    async fn remove_unregisters_first_then_stops() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+
+        state.remove_workspace(&id).await.unwrap();
+        assert!(!state.is_known(&id).await);
+        assert!(slot_is(&state, &id, |s| s.is_none()).await);
+        assert_eq!(script.stops(), 1);
+        assert!(state.open_workspace(&id).await.is_err());
+        assert_eq!(script.boots(), 1);
+    }
+
+    /// A Running VM whose qemu died becomes Failed (credentials revoked, VM
+    /// reaped) and can be opened again.
+    #[tokio::test]
+    async fn a_dead_vm_becomes_failed_and_can_be_reopened() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        let token = current_token(&state, &id).unwrap();
+
+        script.set_status(VmStatus::Failed {
+            reason: "qemu exited: signal 9".to_owned(),
+        });
+        assert!(matches!(
+            state.status(&id).await,
+            WorkspaceStatus::Failed { .. }
+        ));
+        assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Failed(_)))).await);
+        assert_eq!(TokenAuthority::resolve(&state, &token), None);
+        eventually("dead VM reaped", async || script.stops() == 1).await;
+
+        script.set_status(VmStatus::Running {
+            url: "http://127.0.0.1:1".to_owned(),
+        });
+        open_and_run(&state, &script, &id).await;
+        assert_eq!(script.boots(), 2);
+    }
+
+    /// A boot finishing after its slot was taken over stops its VM instead of
+    /// publishing it.
+    #[tokio::test]
+    async fn a_superseded_boot_result_is_stopped_not_published() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        {
+            let mut running = state.inner.running.lock().await;
+            state.replace_slot(&mut running, &id, Some(VmSlot::Stopping));
+        }
+        let cfg = state.vm_config(&id, state.mcp_dir_for(&id), 1);
+        script.release_boots(1);
+        let vm = state.inner.launcher.boot(cfg).await.unwrap();
+
+        state
+            .finish_boot(&id, 12345, "late".to_owned(), Ok(vm))
+            .await;
+        assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Stopping))).await);
+        assert_eq!(TokenAuthority::resolve(&state, "late"), None);
+        assert_eq!(script.stops(), 1);
+    }
+
     /// Share dir names are deterministic, hex-only, and distinct per workspace.
     #[test]
     fn workspace_hash_is_deterministic_and_filesystem_safe() {
@@ -2044,76 +2493,54 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"b");
     }
 
-    /// Minting writes `token.env` and the token resolves to the workspace.
+    /// Minting writes `token.env`; the token is not valid until a slot
+    /// holds it.
     #[tokio::test]
-    async fn mint_mcp_token_writes_env_file_and_resolves_via_token_authority() {
+    async fn a_minted_token_is_written_but_only_valid_once_installed() {
         let (_data, state) = test_app_state();
-        let id = "mint-mcp-token-writes-env-file-and-resolves";
         let (_tmp, dir) = unique_temp_dir("mcp-token-mint");
 
-        state.mint_mcp_token(id, &dir).await.unwrap();
-
+        let token = mint_mcp_token(&dir).await.unwrap();
         let contents = tokio::fs::read_to_string(dir.join("token.env"))
             .await
             .unwrap();
-        let token = contents
-            .trim()
-            .strip_prefix("GAVMO_MCP_TOKEN=")
-            .expect("token.env should contain GAVMO_MCP_TOKEN=<token>")
-            .to_string();
-        assert!(!token.is_empty());
+        assert_eq!(contents, format!("GAVMO_MCP_TOKEN={token}\n"));
+        assert_eq!(TokenAuthority::resolve(&state, &token), None);
+    }
 
+    /// The token index follows the slot: valid while Booting/Running,
+    /// revoked by any other slot, and replaced by a newer boot's token.
+    #[tokio::test]
+    async fn replace_slot_keeps_tokens_in_step_with_the_slot() {
+        let (_data, state) = test_app_state();
+        let id = "/ws";
+        let booting = |token: &str| VmSlot::Booting {
+            task: tokio::spawn(async {}),
+            generation: 0,
+            token: token.to_owned(),
+        };
+        let mut running = state.inner.running.lock().await;
+
+        state.replace_slot(&mut running, id, Some(booting("old")));
         assert_eq!(
-            TokenAuthority::resolve(&state, &token),
+            TokenAuthority::resolve(&state, "old"),
             Some(WorkspaceScope {
-                workspace_id: id.to_string()
+                workspace_id: id.to_owned()
             })
         );
-    }
+        state.replace_slot(&mut running, id, Some(booting("new")));
+        assert_eq!(TokenAuthority::resolve(&state, "old"), None);
+        assert!(TokenAuthority::resolve(&state, "new").is_some());
 
-    /// Re-minting invalidates the workspace's previous token.
-    #[tokio::test]
-    async fn minting_a_new_token_invalidates_the_previous_one_for_the_same_workspace() {
-        let (_data, state) = test_app_state();
-        let id = "minting-a-new-token-invalidates-the-previous-one";
-        let (_tmp, dir) = unique_temp_dir("mcp-token-remint");
-
-        state.mint_mcp_token(id, &dir).await.unwrap();
-        let old_token = {
-            let tokens = state.inner.mcp_tokens.lock().unwrap();
-            tokens
-                .iter()
-                .find(|(_, v)| *v == id)
-                .map(|(k, _)| k.clone())
-                .unwrap()
-        };
-
-        state.mint_mcp_token(id, &dir).await.unwrap();
-
-        assert_eq!(TokenAuthority::resolve(&state, &old_token), None);
-    }
-
-    /// `clear_mcp_token` makes the workspace's token stop resolving.
-    #[tokio::test]
-    async fn clear_mcp_token_invalidates_resolution() {
-        let (_data, state) = test_app_state();
-        let id = "clear-mcp-token-invalidates-resolution";
-        let (_tmp, dir) = unique_temp_dir("mcp-token-clear");
-
-        state.mint_mcp_token(id, &dir).await.unwrap();
-        let token = {
-            let tokens = state.inner.mcp_tokens.lock().unwrap();
-            tokens
-                .iter()
-                .find(|(_, v)| *v == id)
-                .map(|(k, _)| k.clone())
-                .unwrap()
-        };
-        assert!(TokenAuthority::resolve(&state, &token).is_some());
-
-        state.clear_mcp_token(id);
-
-        assert_eq!(TokenAuthority::resolve(&state, &token), None);
+        for revoking in [
+            Some(VmSlot::Stopping),
+            Some(VmSlot::Failed("x".to_owned())),
+            None,
+        ] {
+            state.replace_slot(&mut running, id, Some(booting("t")));
+            state.replace_slot(&mut running, id, revoking);
+            assert_eq!(TokenAuthority::resolve(&state, "t"), None);
+        }
     }
 
     /// An unknown token resolves to nothing.
