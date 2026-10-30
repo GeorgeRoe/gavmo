@@ -23,4 +23,3 @@ pub use fsutil::create_private_dir_all;
 pub use handle::{RunningVm, VmStatus};
 pub use process::reap_stale;
 pub use qmp::{GuestMemory, guest_memory};
-pub use share::{GUEST_AGENT_GID, GUEST_AGENT_UID, ShareBackend, ShareSpec, VirtiofsShare};

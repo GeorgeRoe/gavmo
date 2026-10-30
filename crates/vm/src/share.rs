@@ -7,44 +7,9 @@ use crate::error::{Error, Result};
 use crate::fsutil::{check_socket_path, remove_if_exists};
 use crate::qemu::qemu_opt_path;
 
-/// A single host directory exposed to the guest.
-#[derive(Debug, Clone)]
-pub struct ShareSpec {
-    /// Host directory to expose.
-    pub host_path: PathBuf,
-    /// Guest-visible mount tag. Must match the mounts in
-    /// `nix/base/configuration.nix`.
-    pub mount_tag: &'static str,
-    /// Whether the guest should only get read access.
-    pub read_only: bool,
-}
-
-/// Guest uid/gid of the unprivileged `agent` user that runs `opencode`.
-/// Must match `users.users.agent` in `nix/base/configuration.nix` by hand.
-/// Each share's host owner is mapped to these.
-pub const GUEST_AGENT_UID: u32 = 1000;
-pub const GUEST_AGENT_GID: u32 = 1000;
-
-/// How a host directory is made available inside the guest.
-/// [`VirtiofsShare`] is the only implementation.
-pub trait ShareBackend: Send + Sync {
-    /// QEMU command-line arguments contributed by this share.
-    fn qemu_args(&self, runtime_dir: &Path, spec: &ShareSpec) -> Result<Vec<String>>;
-
-    /// Spawns any helper process this backend needs (`virtiofsd` per share).
-    fn start(&self, _runtime_dir: &Path, _spec: &ShareSpec) -> Result<Option<Child>> {
-        Ok(None)
-    }
-
-    /// A path the helper creates once it is ready for qemu to connect
-    /// (virtiofsd's socket). qemu is only started after all of these exist.
-    fn ready_path(&self, _runtime_dir: &Path, _spec: &ShareSpec) -> Option<PathBuf> {
-        None
-    }
-}
-
-/// virtiofs share backend: `vhost-user-fs-pci` plus one `virtiofsd` per
-/// share.
+/// A host directory exposed to the guest over virtiofs: a
+/// `vhost-user-fs-pci` device in qemu plus one `virtiofsd` per share. The
+/// set of shares is fixed by the base image ([`crate::VmConfig::shares`]).
 ///
 /// virtiofs rather than 9p because virtiofsd can map the share's real host
 /// owner to the unprivileged guest `agent` user; 9p's xattr-mapped
@@ -52,39 +17,50 @@ pub trait ShareBackend: Send + Sync {
 ///
 /// `--translate-uid`/`--translate-gid` rather than `--uid-map`/`--gid-map`:
 /// the latter need a user namespace, which fails unprivileged.
-pub struct VirtiofsShare;
-
-impl VirtiofsShare {
-    /// Path to this share's virtiofsd unix socket, shared by
-    /// [`Self::start`] (binds) and [`Self::qemu_args`] (connects).
-    fn socket_path(runtime_dir: &Path, mount_tag: &str) -> PathBuf {
-        runtime_dir.join(format!("virtiofs-{mount_tag}.sock"))
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShareSpec {
+    /// Host directory to expose.
+    pub(crate) host_path: PathBuf,
+    /// Guest-visible mount tag. Must match the mounts in
+    /// `nix/base/configuration.nix`.
+    pub(crate) mount_tag: &'static str,
+    /// Whether the guest should only get read access.
+    pub(crate) read_only: bool,
 }
 
-impl ShareBackend for VirtiofsShare {
-    fn qemu_args(&self, runtime_dir: &Path, spec: &ShareSpec) -> Result<Vec<String>> {
-        let chardev_id = format!("char-{}", spec.mount_tag);
-        let socket = qemu_opt_path(&Self::socket_path(runtime_dir, spec.mount_tag))?;
+/// Guest uid/gid of the unprivileged `agent` user that runs `opencode`.
+/// Must match `users.users.agent` in `nix/base/configuration.nix` by hand.
+/// Each share's host owner is mapped to these.
+pub(crate) const GUEST_AGENT_UID: u32 = 1000;
+pub(crate) const GUEST_AGENT_GID: u32 = 1000;
+
+impl ShareSpec {
+    /// This share's virtiofsd unix socket: [`Self::start_virtiofsd`] binds
+    /// it, [`Self::qemu_args`] connects to it, and qemu may only start once
+    /// it exists.
+    pub(crate) fn socket_path(&self, runtime_dir: &Path) -> PathBuf {
+        runtime_dir.join(format!("virtiofs-{}.sock", self.mount_tag))
+    }
+
+    /// The qemu arguments for this share.
+    pub(crate) fn qemu_args(&self, runtime_dir: &Path) -> Result<Vec<String>> {
+        let chardev_id = format!("char-{}", self.mount_tag);
+        let socket = qemu_opt_path(&self.socket_path(runtime_dir))?;
 
         Ok(vec![
             "-chardev".to_string(),
-            format!("socket,id={id},path={path}", id = chardev_id, path = socket,),
+            format!("socket,id={chardev_id},path={socket}"),
             "-device".to_string(),
             format!(
-                "vhost-user-fs-pci,chardev={id},tag={tag}",
-                id = chardev_id,
-                tag = spec.mount_tag,
+                "vhost-user-fs-pci,chardev={chardev_id},tag={tag}",
+                tag = self.mount_tag,
             ),
         ])
     }
 
-    fn ready_path(&self, runtime_dir: &Path, spec: &ShareSpec) -> Option<PathBuf> {
-        Some(Self::socket_path(runtime_dir, spec.mount_tag))
-    }
-
-    fn start(&self, runtime_dir: &Path, spec: &ShareSpec) -> Result<Option<Child>> {
-        let socket_path = Self::socket_path(runtime_dir, spec.mount_tag);
+    /// Spawns this share's `virtiofsd`.
+    pub(crate) fn start_virtiofsd(&self, runtime_dir: &Path) -> Result<Child> {
+        let socket_path = self.socket_path(runtime_dir);
         check_socket_path(&socket_path)?;
 
         // A stale socket from a crashed boot would make virtiofsd fail to
@@ -92,26 +68,24 @@ impl ShareBackend for VirtiofsShare {
         // later as an opaque virtiofsd/qemu failure, so report it now.
         remove_if_exists(&socket_path)?;
 
-        let meta = std::fs::metadata(&spec.host_path).map_err(|source| Error::Stat {
-            path: spec.host_path.clone(),
+        let meta = std::fs::metadata(&self.host_path).map_err(|source| Error::Stat {
+            path: self.host_path.clone(),
             source,
         })?;
 
-        let args = build_virtiofsd_args(&socket_path, spec, meta.uid(), meta.gid());
+        let args = build_virtiofsd_args(&socket_path, self, meta.uid(), meta.gid());
         let mut command = Command::new("virtiofsd");
         // Dies with the daemon; virtiofsd also writes `<socket>.pid`, which
         // `process::reap_stale` uses if it is ever orphaned anyway.
         crate::process::die_with_parent(&mut command);
-        let child = command
+        command
             .args(&args)
             .kill_on_drop(true)
             .spawn()
             .map_err(|source| Error::Spawn {
                 program: "virtiofsd".to_string(),
                 source,
-            })?;
-
-        Ok(Some(child))
+            })
     }
 }
 
@@ -163,7 +137,7 @@ mod tests {
         };
         let runtime_dir = PathBuf::from("/run/user/1000/gavmo/abc");
 
-        let args = VirtiofsShare.qemu_args(&runtime_dir, &spec).unwrap();
+        let args = spec.qemu_args(&runtime_dir).unwrap();
 
         assert_eq!(
             args,
@@ -186,7 +160,7 @@ mod tests {
             read_only: true,
         };
 
-        let args = VirtiofsShare.qemu_args(&runtime_dir, &gcloud_spec).unwrap();
+        let args = gcloud_spec.qemu_args(&runtime_dir).unwrap();
 
         assert!(
             args.iter()
@@ -201,9 +175,13 @@ mod tests {
 
     #[test]
     fn socket_path_is_namespaced_by_runtime_dir_and_tag() {
-        let state_dir = PathBuf::from("/some/state/dir");
+        let spec = ShareSpec {
+            host_path: PathBuf::from("/x"),
+            mount_tag: "mcp",
+            read_only: true,
+        };
         assert_eq!(
-            VirtiofsShare::socket_path(&state_dir, "mcp"),
+            spec.socket_path(Path::new("/some/state/dir")),
             PathBuf::from("/some/state/dir/virtiofs-mcp.sock")
         );
     }

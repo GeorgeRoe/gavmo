@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::share::ShareSpec;
+
 /// The fixed guest-side port `opencode web` listens on. Baked into the base
 /// image; only the host-side forwarded port (`VmConfig::host_port`) varies.
 pub const GUEST_OPENCODE_PORT: u16 = 7080;
@@ -69,6 +71,29 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
+    /// The guest's virtiofs shares: the repo read-write, the gcloud and MCP
+    /// dirs read-only. Tags must match the mounts in
+    /// `nix/base/configuration.nix`.
+    pub(crate) fn shares(&self) -> Vec<ShareSpec> {
+        vec![
+            ShareSpec {
+                host_path: self.repo_dir.clone(),
+                mount_tag: "workspace",
+                read_only: false,
+            },
+            ShareSpec {
+                host_path: self.gcloud_dir.clone(),
+                mount_tag: "gcloud",
+                read_only: true,
+            },
+            ShareSpec {
+                host_path: self.mcp_dir.clone(),
+                mount_tag: "mcp",
+                read_only: true,
+            },
+        ]
+    }
+
     /// Path to this VM's persistent, copy-on-write overlay disk.
     pub fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.qcow2")

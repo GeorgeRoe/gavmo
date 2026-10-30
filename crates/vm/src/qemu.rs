@@ -6,7 +6,7 @@ use tokio::process::Child;
 use crate::config::{GUEST_OPENCODE_PORT, VmConfig};
 use crate::error::{Error, Result};
 use crate::fsutil::{check_socket_path, remove_if_exists};
-use crate::share::{ShareBackend, ShareSpec};
+use crate::share::ShareSpec;
 
 /// The `id=` of the `virtio-balloon-pci` device. `qmp.rs` derives the
 /// balloon's QOM path (`/machine/peripheral/<id>`) from this.
@@ -74,10 +74,7 @@ fn disk_args(cfg: &VmConfig) -> Result<Vec<String>> {
 
 /// Builds the full `qemu-system-x86_64` argument list for a VM boot. Pure,
 /// for unit testing without `qemu` or `/dev/kvm`.
-pub(crate) fn build_qemu_args(
-    cfg: &VmConfig,
-    shares: &[(&dyn ShareBackend, ShareSpec)],
-) -> Result<Vec<String>> {
+pub(crate) fn build_qemu_args(cfg: &VmConfig, shares: &[ShareSpec]) -> Result<Vec<String>> {
     let mut args = Vec::new();
 
     // Hosts are Linux-only (virtiofs); the `cfg` just keeps non-Linux
@@ -126,8 +123,8 @@ pub(crate) fn build_qemu_args(
         "virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"
     ));
 
-    for (backend, spec) in shares {
-        args.extend(backend.qemu_args(&cfg.runtime_dir, spec)?);
+    for share in shares {
+        args.extend(share.qemu_args(&cfg.runtime_dir)?);
     }
 
     // QMP on a unix socket; no human monitor anywhere (in particular not on
@@ -166,7 +163,7 @@ pub(crate) fn build_qemu_args(
 /// children.
 pub(crate) async fn spawn_qemu(
     cfg: &VmConfig,
-    shares: &[(&dyn ShareBackend, ShareSpec)],
+    shares: &[ShareSpec],
 ) -> Result<(Child, Vec<Child>)> {
     // Validate everything before starting any helper, so a bad path doesn't
     // leave virtiofsd processes behind.
@@ -177,18 +174,14 @@ pub(crate) async fn spawn_qemu(
     remove_if_exists(&qmp_socket)?;
 
     let mut helpers = Vec::new();
-    for (backend, spec) in shares {
-        if let Some(child) = backend.start(&cfg.runtime_dir, spec)? {
-            helpers.push(child);
-        }
+    for share in shares {
+        helpers.push(share.start_virtiofsd(&cfg.runtime_dir)?);
     }
 
     // qemu connects to each helper's socket at startup and fails outright if
     // it isn't there yet. On error the helpers are dropped (`kill_on_drop`).
-    for (backend, spec) in shares {
-        if let Some(path) = backend.ready_path(&cfg.runtime_dir, spec) {
-            wait_for_path(&path, &mut helpers).await?;
-        }
+    for share in shares {
+        wait_for_path(&share.socket_path(&cfg.runtime_dir), &mut helpers).await?;
     }
 
     let log = open_qemu_log(&cfg.qemu_log_path())?;
@@ -287,7 +280,6 @@ async fn wait_for_path(path: &Path, helpers: &mut [Child]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::share::VirtiofsShare;
     use std::path::PathBuf;
 
     fn test_cfg() -> VmConfig {
@@ -336,15 +328,7 @@ mod tests {
     #[test]
     fn no_host_opened_file_is_under_the_repo() {
         let cfg = test_cfg();
-        let virtiofs = VirtiofsShare;
-        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![(
-            &virtiofs,
-            ShareSpec {
-                host_path: cfg.repo_dir.clone(),
-                mount_tag: "workspace",
-                read_only: false,
-            },
-        )];
+        let shares = cfg.shares();
         let args = build_qemu_args(&cfg, &shares).unwrap();
         assert!(
             !args.iter().any(|a| a.contains("/home/user/project")),
@@ -412,37 +396,32 @@ mod tests {
         ));
     }
 
-    /// Mirrors the three shares `RunningVm::boot` assembles.
+    /// Only the repo is writable from the guest; the gcloud credentials and
+    /// the MCP token are read-only.
+    #[test]
+    fn shares_are_the_repo_read_write_and_the_rest_read_only() {
+        let cfg = test_cfg();
+        let shares: Vec<_> = cfg
+            .shares()
+            .into_iter()
+            .map(|s| (s.mount_tag, s.host_path, s.read_only))
+            .collect();
+        assert_eq!(
+            shares,
+            [
+                ("workspace", cfg.repo_dir.clone(), false),
+                ("gcloud", cfg.gcloud_dir.clone(), true),
+                ("mcp", cfg.mcp_dir.clone(), true),
+            ]
+        );
+    }
+
+    /// The shares `RunningVm::boot` uses ([`VmConfig::shares`]), with the
+    /// tags the base image mounts.
     #[test]
     fn args_include_each_share() {
         let cfg = test_cfg();
-        let virtiofs = VirtiofsShare;
-        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
-            (
-                &virtiofs,
-                ShareSpec {
-                    host_path: cfg.repo_dir.clone(),
-                    mount_tag: "workspace",
-                    read_only: false,
-                },
-            ),
-            (
-                &virtiofs,
-                ShareSpec {
-                    host_path: cfg.gcloud_dir.clone(),
-                    mount_tag: "gcloud",
-                    read_only: true,
-                },
-            ),
-            (
-                &virtiofs,
-                ShareSpec {
-                    host_path: cfg.mcp_dir.clone(),
-                    mount_tag: "mcp",
-                    read_only: true,
-                },
-            ),
-        ];
+        let shares = cfg.shares();
 
         let args = build_qemu_args(&cfg, &shares).unwrap();
 
@@ -464,15 +443,7 @@ mod tests {
     #[test]
     fn args_add_shared_memory_backend_when_shares_are_present() {
         let cfg = test_cfg();
-        let virtiofs = VirtiofsShare;
-        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![(
-            &virtiofs,
-            ShareSpec {
-                host_path: cfg.repo_dir.clone(),
-                mount_tag: "workspace",
-                read_only: false,
-            },
-        )];
+        let shares = cfg.shares();
 
         let args = build_qemu_args(&cfg, &shares).unwrap();
 
@@ -570,25 +541,7 @@ mod tests {
             "64M".as_ref(),
         ]);
 
-        let virtiofs = VirtiofsShare;
-        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
-            (
-                &virtiofs,
-                ShareSpec {
-                    host_path: cfg.repo_dir.clone(),
-                    mount_tag: "workspace",
-                    read_only: false,
-                },
-            ),
-            (
-                &virtiofs,
-                ShareSpec {
-                    host_path: cfg.gcloud_dir.clone(),
-                    mount_tag: "gcloud",
-                    read_only: true,
-                },
-            ),
-        ];
+        let shares = cfg.shares();
         let (mut qemu, mut helpers) = spawn_qemu(&cfg, &shares).await.unwrap();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);

@@ -10,7 +10,6 @@ use crate::fsutil::{create_private_dir_all, remove_if_exists_async};
 use crate::health::{probe_once, wait_for_ready};
 use crate::qemu::spawn_qemu;
 use crate::qmp;
-use crate::share::{ShareBackend, ShareSpec, VirtiofsShare};
 
 /// How long to wait for `opencode web` to become reachable during boot.
 /// Also covers the in-guest `gavmo-rebuild` of the repo's `gavmo.nix`,
@@ -27,12 +26,6 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the guest's balloon driver reports memory stats to qemu; the
 /// control panel's Memory stat is only as fresh as this.
 const BALLOON_STATS_INTERVAL_SECS: u32 = 2;
-
-// Guest-visible virtiofs mount tags. Must match the mounts in
-// `nix/base/configuration.nix`.
-const MOUNT_TAG_WORKSPACE: &str = "workspace";
-const MOUNT_TAG_GCLOUD: &str = "gcloud";
-const MOUNT_TAG_MCP: &str = "mcp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmStatus {
@@ -69,35 +62,13 @@ impl RunningVm {
         create_private_dir_all(&cfg.runtime_dir)?;
         ensure_overlay(&cfg.base_image, &cfg.disk_path()).await?;
 
-        let virtiofs = VirtiofsShare;
-        let workspace_share = ShareSpec {
-            host_path: cfg.repo_dir.clone(),
-            mount_tag: MOUNT_TAG_WORKSPACE,
-            read_only: false,
-        };
-        let gcloud_share = ShareSpec {
-            host_path: cfg.gcloud_dir.clone(),
-            mount_tag: MOUNT_TAG_GCLOUD,
-            read_only: true,
-        };
-        let mcp_share = ShareSpec {
-            host_path: cfg.mcp_dir.clone(),
-            mount_tag: MOUNT_TAG_MCP,
-            read_only: true,
-        };
-        let shares: Vec<(&dyn ShareBackend, ShareSpec)> = vec![
-            (&virtiofs, workspace_share),
-            (&virtiofs, gcloud_share),
-            (&virtiofs, mcp_share),
-        ];
-
         // Clear a stale rebuild-failure marker so a previous boot's result
         // isn't mistaken for this one's. NotFound is the common case; any
         // other failure must abort, or the stale marker would immediately
         // (and wrongly) fail this boot.
         remove_if_exists_async(&cfg.rebuild_failed_marker_path()).await?;
 
-        let (qemu, helpers) = spawn_qemu(&cfg, &shares).await?;
+        let (qemu, helpers) = spawn_qemu(&cfg, &cfg.shares()).await?;
         let host_port = cfg.host_port;
         let marker_path = cfg.rebuild_failed_marker_path();
         let mut vm = RunningVm {
