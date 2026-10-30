@@ -8,7 +8,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["process", "net", "rt", "time", "io-util", "fs", "sync"] }
+tokio = { workspace = true, features = ["process", "net", "rt", "time", "io-util", "fs", "sync", "macros"] }
 qapi = { version = "0.15", features = ["qmp"] }
 thiserror.workspace = true
 # Direct dep: `qapi_spec::Any` (QOM property values, e.g. balloon stats)
