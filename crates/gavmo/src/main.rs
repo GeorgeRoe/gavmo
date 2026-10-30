@@ -88,15 +88,15 @@ mod daemon {
         warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);
 
         // Guests reach host loopback via 10.0.2.2, so 127.0.0.1 is no
-        // boundary; the persisted token keeps guests out of `#[server]` fns.
-        let ui_token = Arc::new(
-            auth::load_or_create_token()
-                .context("failed to load/create the control-panel session token")?,
-        );
+        // boundary; sessions (from the host-only token) keep guests out of
+        // `#[server]` fns.
+        let auth = auth::Auth::load_default()
+            .await
+            .context("failed to load the control-panel token or sessions")?;
 
         let conf = get_configuration(None).context("failed to load Leptos configuration")?;
         let ui_addr = conf.leptos_options.site_addr;
-        let ui_router = build_ui_router(conf.leptos_options, &app_state, &ui_token);
+        let ui_router = build_ui_router(conf.leptos_options, &app_state, &auth);
 
         // Separate port from the UI: guests must reach the bearer-authenticated
         // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
@@ -108,7 +108,7 @@ mod daemon {
         let ui_listener = bind(ui_addr, "control panel").await?;
         tracing::info!("GAVMO MCP gateway listening on http://{mcp_addr}/mcp");
         tracing::info!("GAVMO daemon listening on http://{ui_addr}");
-        announce_login_url(ui_addr.port(), &ui_token);
+        announce_login_url(ui_addr.port(), auth.token());
 
         // Either server stopping is fatal: a UI without its gateway (or vice
         // versa) would look healthy while silently failing. Every exit path
@@ -164,7 +164,7 @@ mod daemon {
     fn build_ui_router(
         leptos_options: LeptosOptions,
         app_state: &AppState,
-        ui_token: &Arc<String>,
+        auth: &Arc<auth::Auth>,
     ) -> Router {
         let routes = generate_route_list(App);
 
@@ -198,9 +198,9 @@ mod daemon {
             .with_state(leptos_options)
             // `/login` sits behind the auth layer too; it stays reachable only
             // because `auth::is_public_path` allowlists it, not via layer order.
-            .merge(auth::login_router(Arc::clone(ui_token)))
+            .merge(auth::login_router(Arc::clone(auth)))
             .layer(axum::middleware::from_fn_with_state(
-                Arc::clone(ui_token),
+                Arc::clone(auth),
                 auth::require_session,
             ))
     }

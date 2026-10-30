@@ -7,7 +7,13 @@
 pub mod app;
 
 #[cfg(feature = "ssr")]
+mod atomic_file;
+
+#[cfg(feature = "ssr")]
 pub mod auth;
+
+#[cfg(feature = "ssr")]
+mod sessions;
 
 #[cfg(feature = "ssr")]
 mod guest_files;

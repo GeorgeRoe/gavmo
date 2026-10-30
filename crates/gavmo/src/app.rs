@@ -535,9 +535,17 @@ fn HomePage() -> impl IntoView {
     view! {
         <header class="topbar">
             <h1>"GAVMO"</h1>
-            <button class="primary" on:click=move |_| show_browser.set(true)>
-                "Add workspace"
-            </button>
+            <div class="topbar-actions">
+                <button class="primary" on:click=move |_| show_browser.set(true)>
+                    "Add workspace"
+                </button>
+                // A plain same-origin form POST; the server ends every session.
+                <form method="post" action="/logout">
+                    <button r#type="submit" title="End every browser session; log in again with the URL gavmo prints">
+                        "Log out everywhere"
+                    </button>
+                </form>
+            </div>
         </header>
 
         <Show

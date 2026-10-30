@@ -1730,27 +1730,9 @@ async fn save_registry(path: &Path, registry: &Registry) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(registry)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || write_atomically(&path, &bytes))
+    tokio::task::spawn_blocking(move || crate::atomic_file::write_atomically(&path, &bytes))
         .await
         .map_err(io::Error::other)?
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".workspaces.")
-        .suffix(".tmp")
-        .permissions(std::fs::Permissions::from_mode(0o600))
-        .tempfile_in(dir)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]

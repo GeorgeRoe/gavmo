@@ -590,3 +590,13 @@ button.danger:hover:not(:disabled) {
   border-color: var(--err);
   color: var(--err);
 }
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.topbar-actions form {
+  margin: 0;
+}
