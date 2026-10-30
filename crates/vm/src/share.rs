@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -5,7 +6,7 @@ use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
 use crate::fsutil::{check_socket_path, remove_if_exists};
-use crate::qemu::qemu_opt_path;
+use crate::qemu::opt_with_path;
 
 /// A host directory exposed to the guest over virtiofs: a
 /// `vhost-user-fs-pci` device in qemu plus one `virtiofsd` per share. The
@@ -43,19 +44,22 @@ impl ShareSpec {
     }
 
     /// The qemu arguments for this share.
-    pub(crate) fn qemu_args(&self, runtime_dir: &Path) -> Result<Vec<String>> {
+    pub(crate) fn qemu_args(&self, runtime_dir: &Path) -> Vec<OsString> {
         let chardev_id = format!("char-{}", self.mount_tag);
-        let socket = qemu_opt_path(&self.socket_path(runtime_dir))?;
-
-        Ok(vec![
-            "-chardev".to_string(),
-            format!("socket,id={chardev_id},path={socket}"),
-            "-device".to_string(),
+        vec![
+            "-chardev".into(),
+            opt_with_path(
+                &format!("socket,id={chardev_id},path="),
+                &self.socket_path(runtime_dir),
+                "",
+            ),
+            "-device".into(),
             format!(
                 "vhost-user-fs-pci,chardev={chardev_id},tag={tag}",
                 tag = self.mount_tag,
-            ),
-        ])
+            )
+            .into(),
+        ]
     }
 
     /// Spawns this share's `virtiofsd`.
@@ -90,36 +94,38 @@ impl ShareSpec {
 }
 
 /// Builds the `virtiofsd` argument list for one share. Pure (host owner
-/// passed in rather than stat'd) for unit testing.
+/// passed in rather than stat'd) for unit testing. Paths are passed as-is
+/// (`OsString`), so a repo path that isn't UTF-8 shares that directory
+/// rather than a lossily-converted name.
 #[expect(clippy::similar_names, reason = "uid/gid are the conventional names")]
 fn build_virtiofsd_args(
     socket_path: &Path,
     spec: &ShareSpec,
     host_uid: u32,
     host_gid: u32,
-) -> Vec<String> {
-    let mut args = vec![
-        "--socket-path".to_string(),
-        socket_path.display().to_string(),
-        "--shared-dir".to_string(),
-        spec.host_path.display().to_string(),
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "--socket-path".into(),
+        socket_path.into(),
+        "--shared-dir".into(),
+        spec.host_path.clone().into(),
         // Must match the guest-side mount's cache mode.
-        "--cache=auto".to_string(),
+        "--cache=auto".into(),
         // The default namespace sandbox needs privilege virtiofsd lacks
         // when run unprivileged; uid/gid translation doesn't need it.
-        "--sandbox".to_string(),
-        "none".to_string(),
+        "--sandbox".into(),
+        "none".into(),
         // File handles need CAP_DAC_READ_SEARCH; `never` skips the doomed
         // attempt and its warning. Must be one `=` token (clap require-equals).
-        "--inode-file-handles=never".to_string(),
+        "--inode-file-handles=never".into(),
         // Map the share's host owner to the guest `agent` uid/gid.
-        "--translate-uid".to_string(),
-        format!("map:{GUEST_AGENT_UID}:{host_uid}:1"),
-        "--translate-gid".to_string(),
-        format!("map:{GUEST_AGENT_GID}:{host_gid}:1"),
+        "--translate-uid".into(),
+        format!("map:{GUEST_AGENT_UID}:{host_uid}:1").into(),
+        "--translate-gid".into(),
+        format!("map:{GUEST_AGENT_GID}:{host_gid}:1").into(),
     ];
     if spec.read_only {
-        args.push("--readonly".to_string());
+        args.push("--readonly".into());
     }
     args
 }
@@ -127,6 +133,10 @@ fn build_virtiofsd_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter().map(|a| a.into_string().unwrap()).collect()
+    }
 
     #[test]
     fn qemu_args_reference_the_sockets_virtiofsd_will_bind() {
@@ -137,7 +147,7 @@ mod tests {
         };
         let runtime_dir = PathBuf::from("/run/user/1000/gavmo/abc");
 
-        let args = spec.qemu_args(&runtime_dir).unwrap();
+        let args = strings(spec.qemu_args(&runtime_dir));
 
         assert_eq!(
             args,
@@ -160,7 +170,7 @@ mod tests {
             read_only: true,
         };
 
-        let args = gcloud_spec.qemu_args(&runtime_dir).unwrap();
+        let args = strings(gcloud_spec.qemu_args(&runtime_dir));
 
         assert!(
             args.iter()
@@ -195,7 +205,7 @@ mod tests {
         };
         let socket_path = PathBuf::from("/run/user/1000/gavmo/abc/virtiofs-workspace.sock");
 
-        let args = build_virtiofsd_args(&socket_path, &spec, 1001, 1001);
+        let args = strings(build_virtiofsd_args(&socket_path, &spec, 1001, 1001));
 
         assert_eq!(
             args,
@@ -216,6 +226,28 @@ mod tests {
         );
     }
 
+    /// A repo path that isn't UTF-8 reaches virtiofsd byte-for-byte; it used
+    /// to go through `Path::display`, which swaps such bytes for U+FFFD and
+    /// so names a different directory.
+    #[test]
+    fn virtiofsd_args_pass_non_utf8_paths_through_unchanged() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let repo = OsStr::from_bytes(b"/home/user/caf\xe9");
+        let spec = ShareSpec {
+            host_path: PathBuf::from(repo),
+            mount_tag: "workspace",
+            read_only: false,
+        };
+        let args = build_virtiofsd_args(Path::new("/run/s.sock"), &spec, 1000, 1000);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--shared-dir" && w[1].as_os_str() == repo),
+            "{args:?}"
+        );
+    }
+
     /// Distinct uid and gid values guard against swapping the uid/gid
     /// translation targets.
     #[test]
@@ -227,7 +259,7 @@ mod tests {
         };
         let socket_path = PathBuf::from("/state/virtiofs-gcloud.sock");
 
-        let args = build_virtiofsd_args(&socket_path, &spec, 4321, 100);
+        let args = strings(build_virtiofsd_args(&socket_path, &spec, 4321, 100));
 
         assert!(
             args.windows(2)
@@ -250,7 +282,7 @@ mod tests {
         };
         let socket_path = PathBuf::from("/state/virtiofs-workspace.sock");
 
-        let args = build_virtiofsd_args(&socket_path, &spec, 1000, 1000);
+        let args = strings(build_virtiofsd_args(&socket_path, &spec, 1000, 1000));
 
         assert!(
             args.windows(2)
@@ -267,7 +299,7 @@ mod tests {
         };
         let socket_path = PathBuf::from("/state/virtiofs-gcloud.sock");
 
-        let args = build_virtiofsd_args(&socket_path, &spec, 1000, 1000);
+        let args = strings(build_virtiofsd_args(&socket_path, &spec, 1000, 1000));
 
         assert_eq!(args.last().unwrap(), "--readonly");
     }
@@ -281,7 +313,7 @@ mod tests {
         };
         let socket_path = PathBuf::from("/state/virtiofs-workspace.sock");
 
-        let args = build_virtiofsd_args(&socket_path, &spec, 1000, 1000);
+        let args = strings(build_virtiofsd_args(&socket_path, &spec, 1000, 1000));
 
         assert!(!args.iter().any(|a| a == "--readonly"));
     }

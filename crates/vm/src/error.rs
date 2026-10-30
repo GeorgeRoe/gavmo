@@ -46,7 +46,8 @@ pub enum Error {
     #[error("socket path {path} is longer than the {max}-byte unix socket limit")]
     SocketPathTooLong { path: PathBuf, max: usize },
 
-    /// A path that can't be passed to qemu safely (qemu options are text).
+    /// A disk path that can't go into qemu's `-blockdev` JSON, which is UTF-8
+    /// only. (Everything else is passed to qemu byte-for-byte.)
     #[error("path {path} cannot be passed to qemu: {reason}")]
     UnsupportedPath { path: PathBuf, reason: &'static str },
 

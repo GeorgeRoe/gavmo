@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -13,17 +15,30 @@ use crate::share::ShareSpec;
 pub(crate) const BALLOON_DEVICE_ID: &str = "balloon0";
 
 /// Formats `path` for a qemu `key=value,...` option string: commas are
-/// doubled (qemu's escape), and non-UTF-8 paths are refused rather than
-/// silently mangled.
-pub(crate) fn qemu_opt_path(path: &Path) -> Result<String> {
-    let text = path.to_str().ok_or_else(|| Error::UnsupportedPath {
-        path: path.to_path_buf(),
-        reason: "is not valid UTF-8",
-    })?;
-    Ok(text.replace(',', ",,"))
+/// doubled (qemu's escape). Byte-wise, so any path works unchanged,
+/// including non-UTF-8 ones.
+pub(crate) fn qemu_opt_path(path: &Path) -> OsString {
+    let mut escaped = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        escaped.push(byte);
+        if byte == b',' {
+            escaped.push(b',');
+        }
+    }
+    OsString::from_vec(escaped)
 }
 
-/// Same check for paths embedded in JSON (`serde_json` does the quoting).
+/// `before`, then `path` escaped as an option value, then `after`.
+pub(crate) fn opt_with_path(before: &str, path: &Path, after: &str) -> OsString {
+    let mut opt = OsString::from(before);
+    opt.push(qemu_opt_path(path));
+    opt.push(after);
+    opt
+}
+
+/// A path embedded in JSON (the `-blockdev` nodes), which can only hold
+/// UTF-8: anything else is refused rather than silently mangled. Only the
+/// daemon's own disk paths go through here, never the repo's.
 fn utf8_path(path: &Path) -> Result<&str> {
     path.to_str().ok_or_else(|| Error::UnsupportedPath {
         path: path.to_path_buf(),
@@ -74,86 +89,90 @@ fn disk_args(cfg: &VmConfig) -> Result<Vec<String>> {
 
 /// Builds the full `qemu-system-x86_64` argument list for a VM boot. Pure,
 /// for unit testing without `qemu` or `/dev/kvm`.
-pub(crate) fn build_qemu_args(cfg: &VmConfig, shares: &[ShareSpec]) -> Result<Vec<String>> {
-    let mut args = Vec::new();
+pub(crate) fn build_qemu_args(cfg: &VmConfig, shares: &[ShareSpec]) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = Vec::new();
+    let mut push = |arg: &dyn AsRef<std::ffi::OsStr>| args.push(arg.as_ref().to_owned());
 
     // Hosts are Linux-only (virtiofs); the `cfg` just keeps non-Linux
     // development builds compiling.
     #[cfg(target_os = "linux")]
-    {
-        args.push("-enable-kvm".to_owned());
-        args.push("-cpu".to_owned());
-        args.push("host".to_owned());
+    for arg in ["-enable-kvm", "-cpu", "host"] {
+        push(&arg);
     }
 
-    args.push("-smp".to_owned());
-    args.push(cfg.vcpus.to_string());
-    args.push("-m".to_owned());
-    args.push(cfg.memory_mib.to_string());
+    push(&"-smp");
+    push(&cfg.vcpus.to_string());
+    push(&"-m");
+    push(&cfg.memory_mib.to_string());
 
     // virtiofs needs guest RAM in a shared memory backend so `virtiofsd`
     // can map it; `-numa node,memdev=mem` is how QEMU wires guest RAM to
     // that backend, even for a single-node guest.
     if !shares.is_empty() {
-        args.push("-object".to_owned());
-        args.push(format!(
+        push(&"-object");
+        push(&format!(
             "memory-backend-memfd,id=mem,size={mem}M,share=on",
             mem = cfg.memory_mib,
         ));
-        args.push("-numa".to_owned());
-        args.push("node,memdev=mem".to_owned());
+        push(&"-numa");
+        push(&"node,memdev=mem");
     }
 
-    args.extend(disk_args(cfg)?);
+    for arg in disk_args(cfg)? {
+        push(&arg);
+    }
 
-    args.push("-netdev".to_owned());
-    args.push(format!(
+    push(&"-netdev");
+    push(&format!(
         "user,id=net0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}",
         host_port = cfg.host_port,
         guest_port = GUEST_OPENCODE_PORT,
     ));
-    args.push("-device".to_owned());
-    args.push("virtio-net-pci,netdev=net0".to_owned());
+    push(&"-device");
+    push(&"virtio-net-pci,netdev=net0");
 
     // The balloon is never inflated; it exists only so the guest reports
     // its own memory usage over QMP (host RSS doesn't reflect guest usage).
     // `deflate-on-oom=on` is a free safety net.
-    args.push("-device".to_owned());
-    args.push(format!(
+    push(&"-device");
+    push(&format!(
         "virtio-balloon-pci,id={BALLOON_DEVICE_ID},deflate-on-oom=on"
     ));
 
     for share in shares {
-        args.extend(share.qemu_args(&cfg.runtime_dir)?);
+        for arg in share.qemu_args(&cfg.runtime_dir) {
+            push(&arg);
+        }
     }
 
     // QMP on a unix socket; no human monitor anywhere (in particular not on
     // the daemon's stdio, where `-nographic` would put it).
     // `-qmp` rather than `-chardev` + `-mon`: `-mon` is deprecated in recent
     // qemu and its `monitor-qmp` replacement is missing from older ones.
-    args.push("-qmp".to_owned());
-    args.push(format!(
-        "unix:{},server=on,wait=off",
-        qemu_opt_path(&cfg.qmp_socket_path())?
+    push(&"-qmp");
+    push(&opt_with_path(
+        "unix:",
+        &cfg.qmp_socket_path(),
+        ",server=on,wait=off",
     ));
-    args.push("-monitor".to_owned());
-    args.push("none".to_owned());
-    args.push("-display".to_owned());
-    args.push("none".to_owned());
+    for arg in ["-monitor", "none", "-display", "none"] {
+        push(&arg);
+    }
 
     // Lets a later daemon find and stop this qemu if it is ever orphaned
     // (see `process::reap_stale`). A plain path argument, not an option
     // string, so no comma escaping.
-    args.push("-pidfile".to_owned());
-    args.push(utf8_path(&crate::process::qemu_pidfile(&cfg.runtime_dir))?.to_owned());
+    push(&"-pidfile");
+    push(&crate::process::qemu_pidfile(&cfg.runtime_dir));
 
-    args.push("-chardev".to_owned());
-    args.push(format!(
-        "file,id=serial0,path={}",
-        qemu_opt_path(&cfg.console_log_path())?
+    push(&"-chardev");
+    push(&opt_with_path(
+        "file,id=serial0,path=",
+        &cfg.console_log_path(),
+        "",
     ));
-    args.push("-serial".to_owned());
-    args.push("chardev:serial0".to_owned());
+    push(&"-serial");
+    push(&"chardev:serial0");
 
     Ok(args)
 }
@@ -280,6 +299,15 @@ async fn wait_for_path(path: &Path, helpers: &mut [Child]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The arguments as strings (the test paths are UTF-8).
+    fn str_args(cfg: &VmConfig, shares: &[ShareSpec]) -> Vec<String> {
+        build_qemu_args(cfg, shares)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect()
+    }
     use std::path::PathBuf;
 
     fn test_cfg() -> VmConfig {
@@ -301,7 +329,7 @@ mod tests {
     #[test]
     fn args_include_forwarded_port_and_guest_port() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]).unwrap();
+        let args = str_args(&cfg, &[]);
 
         assert!(args.contains(&"-netdev".to_string()));
         let netdev = args
@@ -314,7 +342,7 @@ mod tests {
     #[test]
     fn args_reference_the_overlay_disk_and_qmp_socket() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]).unwrap();
+        let args = str_args(&cfg, &[]);
 
         assert!(args.windows(2).any(|w| w[0] == "-blockdev"
             && w[1].contains(r#""filename":"/home/user/.local/share/gavmo/vms/abc/disk.qcow2""#)));
@@ -329,7 +357,7 @@ mod tests {
     fn no_host_opened_file_is_under_the_repo() {
         let cfg = test_cfg();
         let shares = cfg.shares();
-        let args = build_qemu_args(&cfg, &shares).unwrap();
+        let args = str_args(&cfg, &shares);
         assert!(
             !args.iter().any(|a| a.contains("/home/user/project")),
             "{args:?}"
@@ -340,7 +368,7 @@ mod tests {
     /// tampered qcow2 header can't make qemu open another host file.
     #[test]
     fn disk_backing_is_explicit_not_read_from_the_header() {
-        let args = build_qemu_args(&test_cfg(), &[]).unwrap();
+        let args = str_args(&test_cfg(), &[]);
         let nodes: Vec<serde_json::Value> = args
             .windows(2)
             .filter(|w| w[0] == "-blockdev")
@@ -365,7 +393,7 @@ mod tests {
 
     #[test]
     fn no_human_monitor_and_no_stdio_display() {
-        let args = build_qemu_args(&test_cfg(), &[]).unwrap();
+        let args = str_args(&test_cfg(), &[]);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-monitor" && w[1] == "none")
@@ -374,22 +402,40 @@ mod tests {
     }
 
     #[test]
-    fn option_paths_escape_commas_and_reject_non_utf8() {
-        assert_eq!(
-            qemu_opt_path(Path::new("/a,b/c,,d")).unwrap(),
-            "/a,,b/c,,,,d"
-        );
+    fn option_paths_escape_commas_bytewise() {
+        assert_eq!(qemu_opt_path(Path::new("/a,b/c,,d")), "/a,,b/c,,,,d");
         let mut cfg = test_cfg();
         cfg.state_dir = PathBuf::from("/x,file.locking=off");
-        let args = build_qemu_args(&cfg, &[]).unwrap();
+        let args = str_args(&cfg, &[]);
         assert!(
             args.iter()
                 .any(|a| a == "file,id=serial0,path=/x,,file.locking=off/console.log")
         );
+    }
 
-        cfg.state_dir = PathBuf::from(
-            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/bad\xff"),
+    /// Option strings and plain path arguments carry any path unchanged;
+    /// only the `-blockdev` JSON (the daemon's own disk paths) needs UTF-8,
+    /// and refuses rather than mangles anything else.
+    #[test]
+    fn non_utf8_paths_pass_through_except_into_json() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut cfg = test_cfg();
+        cfg.runtime_dir = PathBuf::from(OsStr::from_bytes(b"/run/b,ad\xff"));
+        let args = build_qemu_args(&cfg, &cfg.shares()).unwrap();
+        let has = |bytes: &[u8]| args.iter().any(|a| a.as_bytes() == bytes);
+        assert!(has(b"unix:/run/b,,ad\xff/qmp.sock,server=on,wait=off"));
+        assert!(
+            has(b"/run/b,ad\xff/qemu.pid"),
+            "the pidfile is a plain argument"
         );
+        assert!(has(
+            b"socket,id=char-mcp,path=/run/b,,ad\xff/virtiofs-mcp.sock"
+        ));
+
+        let mut cfg = test_cfg();
+        cfg.state_dir = PathBuf::from(OsStr::from_bytes(b"/bad\xff"));
         assert!(matches!(
             build_qemu_args(&cfg, &[]),
             Err(Error::UnsupportedPath { .. })
@@ -423,7 +469,7 @@ mod tests {
         let cfg = test_cfg();
         let shares = cfg.shares();
 
-        let args = build_qemu_args(&cfg, &shares).unwrap();
+        let args = str_args(&cfg, &shares);
 
         assert!(
             args.iter()
@@ -445,7 +491,7 @@ mod tests {
         let cfg = test_cfg();
         let shares = cfg.shares();
 
-        let args = build_qemu_args(&cfg, &shares).unwrap();
+        let args = str_args(&cfg, &shares);
 
         assert!(
             args.iter()
@@ -458,7 +504,7 @@ mod tests {
     fn args_omit_shared_memory_backend_when_there_are_no_shares() {
         let cfg = test_cfg();
 
-        let args = build_qemu_args(&cfg, &[]).unwrap();
+        let args = str_args(&cfg, &[]);
 
         assert!(!args.iter().any(|a| a.contains("memory-backend-memfd")));
     }
@@ -467,7 +513,7 @@ mod tests {
     #[test]
     fn kvm_acceleration_is_enabled_on_linux() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]).unwrap();
+        let args = str_args(&cfg, &[]);
 
         assert!(args.contains(&"-enable-kvm".to_string()));
     }
@@ -476,7 +522,7 @@ mod tests {
     #[test]
     fn args_include_the_balloon_device_for_guest_memory_stats() {
         let cfg = test_cfg();
-        let args = build_qemu_args(&cfg, &[]).unwrap();
+        let args = str_args(&cfg, &[]);
 
         assert!(
             args.iter()
