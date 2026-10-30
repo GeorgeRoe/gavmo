@@ -129,12 +129,7 @@ impl AppState {
                         .clone()
                         .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
                     base_url: tool.def.base_url,
-                    auth: match tool.def.auth {
-                        toolspec::AuthScheme::Basic => "basic",
-                        toolspec::AuthScheme::Bearer => "bearer",
-                        toolspec::AuthScheme::Header => "header",
-                    }
-                    .to_string(),
+                    auth: tool.def.auth.as_str().to_owned(),
                     secret_name: tool.def.secret,
                     instructions: tool.def.instructions,
                 }

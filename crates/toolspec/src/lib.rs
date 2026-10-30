@@ -5,7 +5,8 @@
 //! `gavmo.yaml` is untrusted: a repo can request a tool and name a secret, but
 //! never supply a credential.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::Deserialize;
 use url::Url;
@@ -34,8 +35,55 @@ pub enum AuthScheme {
     Header,
 }
 
+impl AuthScheme {
+    /// The `auth:` value in `gavmo.yaml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Bearer => "bearer",
+            Self::Header => "header",
+        }
+    }
+}
+
+impl fmt::Display for AuthScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Tool ids become MCP tool names, so they follow MCP's naming rule.
+pub const MAX_TOOL_ID_LEN: usize = 64;
+/// Tool ids starting with this are reserved for GAVMO's own tools
+/// (e.g. `gavmo_ping`), so a repo can't shadow or duplicate them.
+pub const RESERVED_TOOL_PREFIX: &str = "gavmo_";
+/// Most tools one `gavmo.yaml` may request.
+pub const MAX_TOOLS: usize = 64;
+const MAX_SECRET_NAME_LEN: usize = 128;
+
+/// Headers a tool may not use for its credential: ones that control HTTP
+/// framing, routing or connection handling, or carry other credentials.
+/// Setting them could smuggle requests, retarget them, or mix credentials.
+const FORBIDDEN_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "expect",
+    "cookie",
+    "proxy-authorization",
+    "proxy-connection",
+];
+
 /// One integration: everything needed to forward a request except the secret.
+/// Unknown keys are rejected, so a typo (`test_paht`) is an error rather than
+/// silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDef {
     #[serde(rename = "type")]
     pub kind: ToolKind,
@@ -60,34 +108,90 @@ pub struct ToolDef {
 }
 
 impl ToolDef {
-    /// Requires an http(s) `base_url` with a host, and a `header_name` when
-    /// `auth == Header`.
+    /// Checks everything that isn't structural:
+    /// - `id`: 1-64 of `[A-Za-z0-9_-]`, not starting with `gavmo_`;
+    /// - `base_url`: http(s) with a host, and no userinfo, query or fragment
+    ///   (none of which can be part of a destination a credential is bound
+    ///   to);
+    /// - `secret`: 1-128 of `[A-Za-z0-9_.-]`;
+    /// - `header_name`: required for, and only allowed with, `auth: header`;
+    ///   a valid header name that isn't framing/routing/credential-related.
     pub fn validate(&self, id: &str) -> Result<(), ValidationError> {
-        let url = Url::parse(&self.base_url).map_err(|e| ValidationError::BadBaseUrl {
-            id: id.to_string(),
-            reason: e.to_string(),
-        })?;
+        validate_tool_id(id)?;
+        let bad_url = |reason: &str| ValidationError::BadBaseUrl {
+            id: id.to_owned(),
+            reason: reason.to_owned(),
+        };
+        let url = Url::parse(&self.base_url).map_err(|e| bad_url(&e.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err(ValidationError::BadBaseUrl {
-                id: id.to_string(),
-                reason: "base_url must be an http(s) URL with a host".to_string(),
-            });
+            return Err(bad_url("base_url must be an http(s) URL with a host"));
         }
-        match self.auth {
-            AuthScheme::Header if self.header_name.as_deref().unwrap_or("").is_empty() => {
-                Err(ValidationError::MissingHeaderName { id: id.to_string() })
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(bad_url("base_url must not contain user:password@"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(bad_url("base_url must not have a query or fragment"));
+        }
+        if !is_name(&self.secret, MAX_SECRET_NAME_LEN, |c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+        }) {
+            return Err(ValidationError::BadSecretName { id: id.to_owned() });
+        }
+        match (self.auth, self.header_name.as_deref()) {
+            (AuthScheme::Header, None | Some("")) => {
+                Err(ValidationError::MissingHeaderName { id: id.to_owned() })
             }
-            _ => Ok(()),
+            (AuthScheme::Header, Some(name)) => validate_header_name(id, name),
+            (_, Some(_)) => Err(ValidationError::UnexpectedHeaderName { id: id.to_owned() }),
+            (_, None) => Ok(()),
         }
     }
 }
 
-/// The per-repo `gavmo.yaml` (untrusted).
+/// `true` if `s` is 1..=`max` chars, all accepted by `ok`.
+fn is_name(s: &str, max: usize, ok: impl Fn(char) -> bool) -> bool {
+    !s.is_empty() && s.len() <= max && s.chars().all(ok)
+}
+
+/// Tool ids become MCP tool names: 1-64 of `[A-Za-z0-9_-]`, and the
+/// `gavmo_` prefix is reserved.
+pub fn validate_tool_id(id: &str) -> Result<(), ValidationError> {
+    if !is_name(id, MAX_TOOL_ID_LEN, |c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
+    }) {
+        return Err(ValidationError::BadToolId { id: id.to_owned() });
+    }
+    if id.starts_with(RESERVED_TOOL_PREFIX) {
+        return Err(ValidationError::ReservedToolId { id: id.to_owned() });
+    }
+    Ok(())
+}
+
+/// A header name: an RFC 9110 token (letters, digits and a few symbols), not forbidden.
+fn validate_header_name(id: &str, name: &str) -> Result<(), ValidationError> {
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    let bad = |reason: &str| ValidationError::BadHeaderName {
+        id: id.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if !is_name(name, 128, is_token_char) {
+        return Err(bad("not a valid HTTP header name"));
+    }
+    let lower = name.to_ascii_lowercase();
+    if FORBIDDEN_HEADERS.contains(&lower.as_str()) || lower.starts_with("proxy-") {
+        return Err(bad(
+            "this header controls the request itself and can't carry a credential",
+        ));
+    }
+    Ok(())
+}
+
+/// The per-repo `gavmo.yaml` (untrusted). Unknown keys are rejected.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GavmoConfig {
-    /// Tool requests, keyed by id.
-    pub tools: HashMap<String, ToolDef>,
+    /// Tool requests, keyed by id. Sorted, so listings are stable.
+    pub tools: BTreeMap<String, ToolDef>,
 }
 
 // --- Errors ---
@@ -99,6 +203,20 @@ pub enum ValidationError {
     BadBaseUrl { id: String, reason: String },
     #[error("tool {id:?} uses auth: header but has no header_name")]
     MissingHeaderName { id: String },
+    #[error("tool {id:?} sets header_name but doesn't use auth: header")]
+    UnexpectedHeaderName { id: String },
+    #[error("tool {id:?} has an invalid header_name: {reason}")]
+    BadHeaderName { id: String, reason: String },
+    #[error("tool id {id:?} must be 1-64 characters of A-Z, a-z, 0-9, _ and -")]
+    BadToolId { id: String },
+    #[error("tool id {id:?} is reserved (ids starting with gavmo_ are GAVMO's own)")]
+    ReservedToolId { id: String },
+    #[error(
+        "tool {id:?} has an invalid secret name (1-128 characters of A-Z, a-z, 0-9, _, - and .)"
+    )]
+    BadSecretName { id: String },
+    #[error("too many tools ({count}); at most {max} are allowed")]
+    TooManyTools { count: usize, max: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +256,13 @@ pub enum HostLockError {
 /// Parses and validates a `gavmo.yaml` document.
 pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
     let config: GavmoConfig = serde_yaml_ng::from_str(yaml)?;
+    if config.tools.len() > MAX_TOOLS {
+        return Err(ValidationError::TooManyTools {
+            count: config.tools.len(),
+            max: MAX_TOOLS,
+        }
+        .into());
+    }
     for (id, def) in &config.tools {
         def.validate(id)?;
     }
@@ -570,5 +695,135 @@ tools:
             canonical_base_url("not a url"),
             Err(HostLockError::InvalidBaseUrl(_))
         ));
+    }
+
+    fn tool_yaml(id: &str, extra: &str) -> String {
+        format!(
+            "tools:\n  {id}:\n    type: http\n    base_url: https://h.example.com\n    auth: bearer\n    secret: s\n{extra}"
+        )
+    }
+
+    #[test]
+    fn tool_ids_must_be_mcp_names_and_not_reserved() {
+        for good in ["jira", "dafni-jira", "a_b-9", &"x".repeat(64)] {
+            assert!(parse_config(&tool_yaml(good, "")).is_ok(), "{good}");
+        }
+        for bad in [
+            "\"has space\"",
+            "\"ünicode\"",
+            "\"a.b\"",
+            &"x".repeat(65),
+            "\"\"",
+        ] {
+            assert!(
+                matches!(
+                    parse_config(&tool_yaml(bad, "")),
+                    Err(ParseError::Validation(ValidationError::BadToolId { .. }))
+                ),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            parse_config(&tool_yaml("gavmo_ping", "")),
+            Err(ParseError::Validation(
+                ValidationError::ReservedToolId { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn secret_names_are_restricted() {
+        let yaml = "tools:\n  t:\n    type: http\n    base_url: https://h.example.com\n    auth: bearer\n    secret: \"a\\x1fb\"\n";
+        assert!(matches!(
+            parse_config(yaml),
+            Err(ParseError::Validation(
+                ValidationError::BadSecretName { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn header_names_are_validated_and_dangerous_ones_refused() {
+        let with_header = |name: &str| {
+            format!(
+                "tools:\n  t:\n    type: http\n    base_url: https://h.example.com\n    auth: header\n    header_name: \"{name}\"\n    secret: s\n"
+            )
+        };
+        assert!(parse_config(&with_header("X-API-Key")).is_ok());
+        assert!(parse_config(&with_header("Authorization")).is_ok());
+        for bad in [
+            "Host",
+            "content-length",
+            "Transfer-Encoding",
+            "Cookie",
+            "Proxy-Foo",
+            "X Bad",
+            "X:Y",
+        ] {
+            assert!(
+                matches!(
+                    parse_config(&with_header(bad)),
+                    Err(ParseError::Validation(
+                        ValidationError::BadHeaderName { .. }
+                    ))
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_name_is_only_allowed_with_header_auth() {
+        assert!(matches!(
+            parse_config(&tool_yaml("t", "    header_name: X-Key\n")),
+            Err(ParseError::Validation(
+                ValidationError::UnexpectedHeaderName { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn base_url_must_not_carry_userinfo_query_or_fragment() {
+        for url in [
+            "https://u:p@h.example.com",
+            "https://h.example.com/?x=1",
+            "https://h.example.com/#f",
+        ] {
+            let yaml = format!(
+                "tools:\n  t:\n    type: http\n    base_url: \"{url}\"\n    auth: bearer\n    secret: s\n"
+            );
+            assert!(
+                matches!(
+                    parse_config(&yaml),
+                    Err(ParseError::Validation(ValidationError::BadBaseUrl { .. }))
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        assert!(matches!(
+            parse_config(&tool_yaml("t", "    test_paht: /x\n")),
+            Err(ParseError::Yaml(_))
+        ));
+        assert!(matches!(
+            parse_config("tool:\n  t: {}\n"),
+            Err(ParseError::Yaml(_))
+        ));
+    }
+
+    #[test]
+    fn tools_are_listed_in_a_stable_order() {
+        let yaml = "tools:\n  zeta:\n    type: http\n    base_url: https://a.example.com\n    auth: bearer\n    secret: s\n  alpha:\n    type: http\n    base_url: https://b.example.com\n    auth: bearer\n    secret: s\n";
+        let ids: Vec<_> = parse_config(yaml).unwrap().tools.into_keys().collect();
+        assert_eq!(ids, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn auth_scheme_displays_as_its_yaml_value() {
+        assert_eq!(AuthScheme::Header.to_string(), "header");
+        assert_eq!(AuthScheme::Basic.as_str(), "basic");
     }
 }

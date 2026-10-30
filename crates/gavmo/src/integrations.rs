@@ -980,7 +980,7 @@ tools:
         }
         let stored = bound(base, header("X-API-Key"), token("t"));
         assert_eq!(
-            classify_binding(&def(base, &header("Cookie")), Some(&stored)),
+            classify_binding(&def(base, &header("X-Echo-Me")), Some(&stored)),
             BindingState::DeliveryChanged {
                 approved: Some(header("X-API-Key"))
             }
