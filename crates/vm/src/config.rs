@@ -79,6 +79,12 @@ impl VmConfig {
         self.state_dir.join("console.log")
     }
 
+    /// Path to qemu's own stdout/stderr, kept so a boot that dies early can
+    /// report why.
+    pub fn qemu_log_path(&self) -> PathBuf {
+        self.state_dir.join("qemu.log")
+    }
+
     /// Path to the QMP control-channel unix socket.
     pub fn qmp_socket_path(&self) -> PathBuf {
         self.runtime_dir.join("qmp.sock")

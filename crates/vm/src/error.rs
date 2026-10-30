@@ -104,6 +104,27 @@ pub enum Error {
     #[error("QMP worker task failed: {0}")]
     QmpTask(#[source] tokio::task::JoinError),
 
+    #[error("qemu exited during boot ({status}){}", fmt_tail(stderr_tail))]
+    QemuExited {
+        status: ExitStatus,
+        /// The end of qemu's stderr, usually naming the problem.
+        stderr_tail: String,
+    },
+
+    #[error("failed to wait for `{program}`: {source}")]
+    Wait {
+        program: &'static str,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to open qemu log {path}: {source}")]
+    QemuLog {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("vm did not become healthy within {0:?}")]
     HealthTimeout(Duration),
 
@@ -115,3 +136,11 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+fn fmt_tail(tail: &str) -> String {
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {tail}")
+    }
+}

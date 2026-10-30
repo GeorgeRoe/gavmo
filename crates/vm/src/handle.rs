@@ -100,7 +100,7 @@ impl RunningVm {
         let (qemu, helpers) = spawn_qemu(&cfg, &shares).await?;
         let host_port = cfg.host_port;
         let marker_path = cfg.rebuild_failed_marker_path();
-        let vm = RunningVm {
+        let mut vm = RunningVm {
             cfg,
             qemu,
             helpers,
@@ -108,8 +108,13 @@ impl RunningVm {
         };
 
         // On `Err`, `vm` is dropped and `kill_on_drop` tears down qemu; the
-        // rebuild log is already on disk in `state_dir`.
-        wait_for_ready(host_port, &marker_path, BOOT_HEALTH_TIMEOUT).await?;
+        // rebuild log is already on disk in `guest_output_dir`.
+        wait_ready_or_exit(
+            &mut vm.qemu,
+            &vm.cfg.qemu_log_path(),
+            wait_for_ready(host_port, &marker_path, BOOT_HEALTH_TIMEOUT),
+        )
+        .await?;
 
         // Best-effort: without balloon stats the VM runs fine, it just shows
         // no live memory usage. Not worth failing a healthy boot over.
@@ -255,6 +260,29 @@ impl RunningVm {
     }
 }
 
+/// Runs the readiness wait, but fails as soon as qemu exits - bad arguments,
+/// a missing `/dev/kvm`, a locked or unopenable disk - with the tail of its
+/// log, instead of waiting out the whole boot timeout.
+async fn wait_ready_or_exit(
+    qemu: &mut Child,
+    log_path: &std::path::Path,
+    ready: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        result = ready => result,
+        exit = qemu.wait() => {
+            let status = exit.map_err(|source| Error::Wait {
+                program: "qemu-system-x86_64",
+                source,
+            })?;
+            Err(Error::QemuExited {
+                status,
+                stderr_tail: crate::qemu::qemu_log_tail(log_path).await,
+            })
+        }
+    }
+}
+
 /// SIGKILLs and reaps `child`, unless it has already exited (tokio's
 /// `kill` errors on an already-reaped child, which is not a failure here).
 async fn kill_and_reap(child: &mut Child, program: &'static str) -> Result<()> {
@@ -293,5 +321,89 @@ mod tests {
         let mut child = Command::new("true").spawn().unwrap();
         child.wait().await.unwrap();
         kill_and_reap(&mut child, "true").await.unwrap();
+    }
+
+    /// A qemu that dies during boot fails the boot at once, with its stderr.
+    #[tokio::test]
+    async fn boot_wait_fails_fast_with_the_log_tail_when_qemu_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("qemu.log");
+        let file = std::fs::File::create(&log).unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "echo 'qemu: could not open disk' >&2; exit 3"])
+            .stderr(file)
+            .spawn()
+            .unwrap();
+
+        let never_ready = std::future::pending::<Result<()>>();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_ready_or_exit(&mut child, &log, never_ready),
+        )
+        .await
+        .expect("must not wait for readiness once qemu has exited");
+
+        match result {
+            Err(Error::QemuExited {
+                status,
+                stderr_tail,
+            }) => {
+                assert_eq!(status.code(), Some(3));
+                assert_eq!(stderr_tail, "qemu: could not open disk");
+            }
+            other => panic!("expected QemuExited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_wait_returns_readiness_while_qemu_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = sleeper();
+        let result =
+            wait_ready_or_exit(&mut child, &dir.path().join("qemu.log"), async { Ok(()) }).await;
+        assert!(result.is_ok());
+        kill_and_reap(&mut child, "sleep").await.unwrap();
+    }
+
+    /// Real qemu + virtiofsd: an unopenable base image makes qemu exit, and
+    /// `boot` reports qemu's own message within seconds.
+    #[tokio::test]
+    #[ignore = "needs qemu, virtiofsd and /dev/kvm"]
+    async fn real_qemu_boot_failure_is_reported_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = VmConfig {
+            workspace_id: "t".to_owned(),
+            repo_dir: tmp.path().join("repo"),
+            state_dir: tmp.path().join("state"),
+            runtime_dir: tmp.path().join("run"),
+            guest_output_dir: tmp.path().join("repo/.gavmo/vm"),
+            base_image: tmp.path().join("missing-base.qcow2"),
+            gcloud_dir: tmp.path().join("gcloud"),
+            mcp_dir: tmp.path().join("mcp"),
+            memory_mib: 256,
+            vcpus: 1,
+            host_port: 1,
+        };
+        for dir in [&cfg.repo_dir, &cfg.gcloud_dir, &cfg.mcp_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        create_private_dir_all(&cfg.state_dir).unwrap();
+        // A pre-existing overlay, so only qemu (not qemu-img) sees the
+        // missing base.
+        let status = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2"])
+            .arg(cfg.disk_path())
+            .arg("64M")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let started = Instant::now();
+        let Err(err) = RunningVm::boot(cfg).await else {
+            panic!("boot must fail");
+        };
+        assert!(started.elapsed() < Duration::from_secs(30), "{err}");
+        assert!(matches!(err, Error::QemuExited { .. }), "{err}");
+        assert!(err.to_string().contains("missing-base.qcow2"), "{err}");
     }
 }

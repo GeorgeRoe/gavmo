@@ -185,10 +185,19 @@ pub(crate) async fn spawn_qemu(
         }
     }
 
+    let log = open_qemu_log(&cfg.qemu_log_path())?;
+    let log_err = |source| Error::QemuLog {
+        path: cfg.qemu_log_path(),
+        source,
+    };
     let child = tokio::process::Command::new("qemu-system-x86_64")
         .args(&args)
         // Nothing may read the daemon's terminal.
         .stdin(Stdio::null())
+        // Per-VM log instead of the daemon's stdio, so an early exit can be
+        // explained (see `Error::QemuExited`).
+        .stdout(log.try_clone().map_err(log_err)?)
+        .stderr(log)
         .kill_on_drop(true)
         .spawn()
         .map_err(|source| Error::Spawn {
@@ -197,6 +206,48 @@ pub(crate) async fn spawn_qemu(
         })?;
 
     Ok((child, helpers))
+}
+
+/// Opens (truncating) qemu's log in the host-only state dir: `0600`, never
+/// following a symlink.
+fn open_qemu_log(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| Error::QemuLog {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// The last few KiB of qemu's log, trimmed, for error messages. Empty if
+/// unreadable.
+pub(crate) async fn qemu_log_tail(path: &Path) -> String {
+    const TAIL: u64 = 2048;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        let len = file.metadata().ok()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+        let mut bytes = Vec::new();
+        file.take(TAIL).read_to_end(&mut bytes).ok()?;
+        Some(String::from_utf8_lossy(&bytes).trim().to_owned())
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// How long a share helper may take to create its socket.
