@@ -19,7 +19,7 @@ use super::paths::{check_workspace_path, human_bytes, workspace_hash};
 use super::ports::{alloc_port, choose_host_port, resolve_host_port_in};
 use super::store::{Registry, WorkspaceRecord, load_registry, save_registry};
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
-use crate::app::WorkspaceStatus;
+use crate::types::WorkspaceStatus;
 
 /// systemd's SGR-colored `[  OK  ]` lines with `\r\n` come out as plain text.
 #[test]
@@ -1167,8 +1167,8 @@ async fn an_unreadable_secret_store_is_an_error_not_unconfigured() {
     let err = state.list_tool_configs(&id).await.unwrap_err();
     assert!(matches!(err, RegistryError::SecretStore(_)), "{err}");
     assert!(matches!(
-        crate::app::AppError::from(err),
-        crate::app::AppError::SecretStore(msg) if msg.contains("keyring locked")
+        crate::types::AppError::from(err),
+        crate::types::AppError::SecretStore(msg) if msg.contains("keyring locked")
     ));
     // Booting still works, just without tools.
     assert!(state.resolve_integrations_for(&id).await.is_empty());

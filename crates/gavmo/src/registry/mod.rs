@@ -35,8 +35,8 @@ use self::paths::{
     canonical_or_self, check_workspace_path, default_runtime_base, warn_about_legacy_vm_state,
 };
 use self::store::{Registry, WorkspaceRecord, load_registry, save_registry};
-use crate::app::{WorkspaceInfo, WorkspaceStatus};
 use crate::integrations::ResolvedIntegration;
+use crate::types::{WorkspaceInfo, WorkspaceStatus};
 use crate::vm_handle::{Launcher, QemuLauncher};
 
 /// Default guest memory, in MiB.

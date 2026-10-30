@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::AppState;
 use super::lifecycle::VmSlot;
-use crate::app::VmStats;
+use crate::types::VmStats;
 use crate::vm_handle::VmInfo;
 
 /// Gap between the two `/proc` samples [`AppState::vm_stats`] diffs for CPU

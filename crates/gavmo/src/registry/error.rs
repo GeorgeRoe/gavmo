@@ -2,7 +2,7 @@
 
 use std::io;
 
-use crate::app::AppError;
+use crate::types::AppError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {

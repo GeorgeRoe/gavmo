@@ -13,8 +13,8 @@ use vm::{Error as VmError, VmConfig, VmStatus};
 use super::AppState;
 use super::store::save_registry;
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
-use crate::app::WorkspaceStatus;
 use crate::integrations::ResolvedIntegration;
+use crate::types::WorkspaceStatus;
 use crate::vm_handle::{VmHandle, VmInfo};
 
 /// How often a running VM's monitor probes it (QMP + HTTP).

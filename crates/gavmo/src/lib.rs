@@ -4,7 +4,9 @@
 //! for `wasm32` (`hydrate`) as the browser bundle. Server-only modules and
 //! dependencies (e.g. `vm`) must never reach the wasm build.
 
+pub mod api;
 pub mod app;
+pub mod types;
 
 #[cfg(feature = "ssr")]
 mod atomic_file;

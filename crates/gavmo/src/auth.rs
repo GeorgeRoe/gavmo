@@ -373,11 +373,11 @@ fn is_same_origin_request(headers: &HeaderMap) -> bool {
         .is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host))
 }
 
-/// A 401 whose body is a JSON-encoded [`crate::app::AppError::Unauthorized`],
+/// A 401 whose body is a JSON-encoded [`crate::types::AppError::Unauthorized`],
 /// the same encoding server functions use for errors, so the browser can
 /// tell "logged out" from other failures and send the user to log in.
 fn unauthorized_api_response() -> Response {
-    let body = serde_json::to_string(&crate::app::AppError::Unauthorized)
+    let body = serde_json::to_string(&crate::types::AppError::Unauthorized)
         .unwrap_or_else(|_| "\"Unauthorized\"".to_owned());
     (
         StatusCode::UNAUTHORIZED,
@@ -943,7 +943,7 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
-        let decoded: crate::app::AppError = serde_json::from_slice(&body).unwrap();
-        assert_eq!(decoded, crate::app::AppError::Unauthorized);
+        let decoded: crate::types::AppError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded, crate::types::AppError::Unauthorized);
     }
 }

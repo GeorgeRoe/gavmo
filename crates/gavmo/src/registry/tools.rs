@@ -7,8 +7,8 @@ use mcp::{TokenAuthority, ToolDescriptor, ToolExecutor, ToolOutcome, WorkspaceSc
 use super::AppState;
 use super::error::{RegistryError, Result};
 use super::util::lock_unpoisoned;
-use crate::app::ToolConfig;
 use crate::integrations::{BindingState, CandidateTool, Credential, Delivery, ResolvedIntegration};
+use crate::types::ToolConfig;
 
 impl AppState {
     /// Resolves the enabled tool integrations for `id`: tools requested in
