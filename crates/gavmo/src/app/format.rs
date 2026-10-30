@@ -1,6 +1,24 @@
 //! Status badges and number formatting.
 
 use crate::types::WorkspaceStatus;
+
+/// A workspace's short name: its directory name, or the whole path for `/`.
+pub(crate) fn display_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
+/// `part` as a percentage of `whole`, clamped to `0..=100` (for bar widths).
+pub(crate) fn percent_of(part: f64, whole: f64) -> f64 {
+    if whole <= 0.0 {
+        return 0.0;
+    }
+    (part / whole * 100.0).clamp(0.0, 100.0)
+}
+
+/// Badge class, label and (for running VMs) URL for a status.
 pub(crate) fn status_view(status: &WorkspaceStatus) -> (&'static str, String, Option<String>) {
     match status {
         // Covers "never booted" too, so "idle" rather than "stopped".
@@ -72,5 +90,20 @@ mod format_tests {
         assert_eq!(format_uptime(192), "3m 12s");
         assert_eq!(format_uptime(7_500), "2h 05m");
         assert_eq!(format_uptime(97_200), "1d 03h");
+    }
+
+    #[test]
+    fn display_name_is_the_last_component() {
+        assert_eq!(display_name("/home/u/project"), "project");
+        assert_eq!(display_name("/home/u/project/"), "project");
+        assert_eq!(display_name("/"), "/");
+    }
+
+    #[test]
+    fn percent_of_clamps_and_handles_zero() {
+        assert!((percent_of(50.0, 200.0) - 25.0).abs() < 1e-9);
+        assert!((percent_of(500.0, 200.0) - 100.0).abs() < 1e-9);
+        assert!(percent_of(5.0, 0.0).abs() < 1e-9);
+        assert!(percent_of(-5.0, 10.0).abs() < 1e-9);
     }
 }

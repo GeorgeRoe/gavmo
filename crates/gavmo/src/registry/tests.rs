@@ -461,7 +461,7 @@ async fn id_gated_entry_points_reject_unknown_workspaces() {
     assert!(state.inner.running.lock().await.is_empty(), "no boot task");
     assert!(state.reset_workspace(&id).await.is_err());
     assert!(state_dir.exists(), "reset must not delete an unknown dir");
-    assert!(state.read_console_log(&id).await.is_err());
+    assert!(state.read_console_log(&id, 0).await.is_err());
     assert!(
         state
             .read_build_log(&id, "rebuild-2026-01-01T00-00-00Z.log")
@@ -489,7 +489,7 @@ async fn id_gated_entry_points_reject_unknown_workspaces() {
             .unwrap(),
         "secret log"
     );
-    assert_eq!(state.list_tool_configs(&id).await.unwrap().len(), 1);
+    assert_eq!(state.list_tool_configs(&id).await.unwrap().tools.len(), 1);
 }
 
 /// An alias of a registered path is not the registered workspace.
@@ -597,11 +597,14 @@ async fn console_and_build_logs_refuse_guest_planted_symlinks() {
     let state_dir = repo_dir.join(".gavmo").join("vm");
     std::fs::create_dir_all(&state_dir).unwrap();
     std::os::unix::fs::symlink(&secret, state_dir.join("console.log")).unwrap();
-    assert_eq!(state.read_console_log(&id).await.unwrap(), "");
+    assert_eq!(state.read_console_log(&id, 0).await.unwrap().text, "");
     let host_state = state.host_state_dir_for(&id);
     std::fs::create_dir_all(&host_state).unwrap();
-    std::fs::write(host_state.join("console.log"), b"real console").unwrap();
-    assert_eq!(state.read_console_log(&id).await.unwrap(), "real console");
+    std::fs::write(host_state.join("console.log"), b"real console\n").unwrap();
+    assert_eq!(
+        state.read_console_log(&id, 0).await.unwrap().text,
+        "real console\n"
+    );
 
     // Whole state dir swapped for a symlink to a host dir.
     std::fs::remove_dir_all(&state_dir).unwrap();
@@ -623,12 +626,65 @@ async fn console_log_returns_only_the_newest_bytes() {
     let state_dir = state.host_state_dir_for(&id);
     std::fs::create_dir_all(&state_dir).unwrap();
     let mut big = vec![b'a'; usize::try_from(MAX_CONSOLE_LOG_BYTES).unwrap() * 2];
-    big.extend_from_slice(b"NEWEST");
+    big.extend_from_slice(b"\nNEWEST\n");
     std::fs::write(state_dir.join("console.log"), &big).unwrap();
 
-    let text = state.read_console_log(&id).await.unwrap();
-    assert!(text.ends_with("NEWEST"));
-    assert!(text.len() as u64 <= MAX_CONSOLE_LOG_BYTES);
+    let chunk = state.read_console_log(&id, 0).await.unwrap();
+    assert!(chunk.replace);
+    assert!(chunk.text.ends_with("NEWEST\n"));
+    assert!(chunk.text.len() as u64 <= MAX_CONSOLE_LOG_BYTES);
+    assert_eq!(chunk.next_offset, big.len() as u64);
+}
+
+/// The console is followed incrementally, a line at a time, and restarts
+/// cleanly if the log shrinks (a new boot).
+#[tokio::test]
+async fn console_log_is_followed_from_an_offset() {
+    let (_tmp, repo_dir) = unique_temp_dir("follow-console");
+    let id = repo_dir.to_string_lossy().into_owned();
+    let (_data, state) = test_app_state();
+    register(&state, &id).await;
+    let dir = state.host_state_dir_for(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("console.log");
+
+    // Nothing yet.
+    let first = state.read_console_log(&id, 0).await.unwrap();
+    assert_eq!((first.text.as_str(), first.next_offset), ("", 0));
+
+    // A partial line is held back until it is complete.
+    std::fs::write(&log, b"one\ntw").unwrap();
+    let a = state.read_console_log(&id, 0).await.unwrap();
+    assert_eq!(
+        (a.text.as_str(), a.replace, a.next_offset),
+        ("one\n", true, 4)
+    );
+    std::fs::write(&log, b"one\ntwo\nthree\n").unwrap();
+    let b = state.read_console_log(&id, a.next_offset).await.unwrap();
+    assert_eq!((b.text.as_str(), b.replace), ("two\nthree\n", false));
+    let c = state.read_console_log(&id, b.next_offset).await.unwrap();
+    assert_eq!((c.text.as_str(), c.replace), ("", false));
+
+    // The log was restarted: shorter than our offset.
+    std::fs::write(&log, b"new boot\n").unwrap();
+    let d = state.read_console_log(&id, b.next_offset).await.unwrap();
+    assert_eq!(
+        (d.text.as_str(), d.replace, d.next_offset),
+        ("new boot\n", true, 9)
+    );
+}
+
+/// An invalid `gavmo.yaml` is reported, not shown as "no tools".
+#[tokio::test]
+async fn an_invalid_gavmo_yaml_is_reported_in_the_tool_list() {
+    let (_data, state) = test_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    tokio::fs::write(Path::new(&id).join("gavmo.yaml"), "tools: [not, a, map]\n")
+        .await
+        .unwrap();
+    let list = state.list_tool_configs(&id).await.unwrap();
+    assert!(list.tools.is_empty());
+    assert!(list.config_error.is_some_and(|e| !e.is_empty()));
 }
 
 /// Everything a host process opens lives outside the guest-writable repo;

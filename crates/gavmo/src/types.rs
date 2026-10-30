@@ -117,6 +117,27 @@ pub struct DirEntry {
     pub path: String,
 }
 
+/// The tools panel's contents: the requested tools, plus why the repo's
+/// `gavmo.yaml` was ignored if it was (then `tools` is empty).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolList {
+    pub tools: Vec<ToolConfig>,
+    pub config_error: Option<String>,
+}
+
+/// A chunk of the boot console, from [`crate::api::read_console_log`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleChunk {
+    /// Sanitized text.
+    pub text: String,
+    /// `true` if `text` replaces what the client has (first read, the log
+    /// was truncated/restarted, or the client fell too far behind) rather
+    /// than following it.
+    pub replace: bool,
+    /// Pass back as `offset` on the next call.
+    pub next_offset: u64,
+}
+
 /// A tool requested by a workspace's `gavmo.yaml`, for the Tools panel.
 /// `auth` is a plain string (not the `ssr`-only `toolspec` enum) so this type
 /// also builds for hydrate.

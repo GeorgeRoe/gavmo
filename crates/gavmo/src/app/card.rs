@@ -5,7 +5,7 @@
     reason = "#[component] gives its props builder `pub` items, unreachable from a private module"
 )]
 
-use super::format::status_view;
+use super::format::{display_name, status_view};
 use super::transitions::{click_target, set_card_vt_name, start_view_transition, vt_name};
 use crate::types::{WorkspaceInfo, WorkspaceStatus};
 use leptos::prelude::*;
@@ -23,16 +23,15 @@ pub(crate) fn WorkspaceCard(
     // This card's slice of the list. The fallback only covers the instant
     // between removal and `<For>` unmounting the card.
     let card_info = Memo::new(move |_| {
-        let current_id = id.get_value();
-        workspaces
-            .get()
-            .into_iter()
-            .find(|w| w.id == current_id)
-            .unwrap_or_else(|| WorkspaceInfo {
-                id: current_id.clone(),
-                path: current_id,
-                status: WorkspaceStatus::Stopped,
-            })
+        id.with_value(|current| {
+            workspaces
+                .with(|ws| ws.iter().find(|w| &w.id == current).cloned())
+                .unwrap_or_else(|| WorkspaceInfo {
+                    id: current.clone(),
+                    path: current.clone(),
+                    status: WorkspaceStatus::Stopped,
+                })
+        })
     });
 
     // Only the card being opened/closed carries a `view-transition-name`:
@@ -67,8 +66,7 @@ pub(crate) fn WorkspaceCard(
             <div class="ws-id">
                 <span class="name">
                     {move || {
-                        let path = card_info.get().path;
-                        path.rsplit('/').next().unwrap_or(&path).to_string()
+                        card_info.with(|info| display_name(&info.path).to_owned())
                     }}
                 </span>
                 <span class="path">{move || card_info.get().path}</span>

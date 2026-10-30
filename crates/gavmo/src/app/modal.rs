@@ -12,7 +12,7 @@ use leptos::prelude::*;
 #[component]
 pub(crate) fn Modal(
     on_close: Callback<()>,
-    title: String,
+    #[prop(into)] title: String,
     #[prop(optional_no_strip)] vt_name: Option<String>,
     children: Children,
 ) -> impl IntoView {

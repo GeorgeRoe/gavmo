@@ -8,7 +8,7 @@ use super::AppState;
 use super::error::{RegistryError, Result};
 use super::util::lock_unpoisoned;
 use crate::integrations::{BindingState, CandidateTool, Credential, Delivery, ResolvedIntegration};
-use crate::types::ToolConfig;
+use crate::types::{ToolConfig, ToolList};
 
 impl AppState {
     /// Resolves the enabled tool integrations for `id`: tools requested in
@@ -55,12 +55,17 @@ impl AppState {
     /// Every tool this workspace's `gavmo.yaml` requests, read live (no secret
     /// access) so the control panel reflects config changes immediately.
     pub(super) async fn candidates_for(&self, id: &str) -> Vec<CandidateTool> {
+        self.candidates_and_config_error(id).await.0
+    }
+
+    /// [`Self::candidates_for`] plus why `gavmo.yaml` was ignored, if it was.
+    async fn candidates_and_config_error(&self, id: &str) -> (Vec<CandidateTool>, Option<String>) {
         // Reads `<id>/gavmo.yaml`.
         if !self.is_known(id).await {
-            return Vec::new();
+            return (Vec::new(), None);
         }
-        let config = crate::integrations::read_config(id).await;
-        crate::integrations::resolve_candidates(id, &config)
+        let (config, error) = crate::integrations::read_config(id).await;
+        (crate::integrations::resolve_candidates(id, &config), error)
     }
 
     /// Finds a single requested tool by id (structural; no secret-store access).
@@ -77,15 +82,15 @@ impl AppState {
     /// each has its credential configured. Fails with
     /// [`RegistryError::SecretStore`] if the store can't be read, rather than
     /// reporting every tool as unconfigured.
-    pub async fn list_tool_configs(&self, id: &str) -> Result<Vec<ToolConfig>> {
+    pub async fn list_tool_configs(&self, id: &str) -> Result<ToolList> {
         self.require_known(id).await?;
-        let candidates = self.candidates_for(id).await;
+        let (candidates, config_error) = self.candidates_and_config_error(id).await;
         // Values are needed to detect a changed destination, not just presence.
         let values = self
             .secrets_fetch_many(candidates.iter().map(|c| c.secret_key.clone()).collect())
             .await?;
 
-        Ok(candidates
+        let tools = candidates
             .into_iter()
             .map(|tool| {
                 let state = crate::integrations::classify_binding(
@@ -134,7 +139,11 @@ impl AppState {
                     instructions: tool.def.instructions,
                 }
             })
-            .collect())
+            .collect();
+        Ok(ToolList {
+            tools,
+            config_error,
+        })
     }
 
     /// Stores (or replaces) a tool's credential in the secret store. For Basic

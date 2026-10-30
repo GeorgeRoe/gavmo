@@ -5,6 +5,7 @@ use std::io;
 use std::path::Path;
 
 use super::AppState;
+use crate::types::ConsoleChunk;
 
 /// Most of the console log returned per poll (the newest output).
 pub(super) const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
@@ -53,24 +54,50 @@ impl AppState {
         Ok(text)
     }
 
-    /// Reads and sanitizes the guest's boot console log for the live panel.
-    /// A missing file (qemu not spawned yet) is an empty log, not an error.
-    /// Only the newest [`MAX_CONSOLE_LOG_BYTES`] are returned.
-    pub async fn read_console_log(&self, id: &str) -> Result<String> {
+    /// Reads the guest's boot console log for the live panel, incrementally:
+    /// `offset` is the `next_offset` of the previous chunk (0 at first).
+    ///
+    /// Returns the sanitized text after `offset`, ending at the last complete
+    /// line so an escape sequence or `\r\n` is never split across chunks. The
+    /// chunk *replaces* the client's text instead (with the newest
+    /// [`MAX_CONSOLE_LOG_BYTES`]) on the first read, when the log shrank
+    /// (qemu restarted it), or when more than that is new. A missing file
+    /// (qemu not spawned yet) is an empty log, not an error.
+    pub async fn read_console_log(&self, id: &str, offset: u64) -> Result<ConsoleChunk> {
+        use crate::guest_files::{Keep, read_guest_file};
+
         self.require_known(id).await?;
         // Host-only now, but read the same bounded, no-follow way regardless:
         // it is still mostly guest-produced text.
         let path = self.host_state_dir_for(id).join("console.log");
-        Ok(crate::guest_files::read_guest_file(
-            path,
-            Vec::new(),
-            MAX_CONSOLE_LOG_BYTES,
-            crate::guest_files::Keep::Tail,
-        )
-        .await
-        .map_err(io_ctx("reading the console log"))?
-        .map(|file| sanitize_console(&file.bytes))
-        .unwrap_or_default())
+        let read = |keep| read_guest_file(path.clone(), Vec::new(), MAX_CONSOLE_LOG_BYTES, keep);
+        let ctx = || io_ctx("reading the console log");
+
+        let Some(mut file) = read(Keep::From(offset)).await.map_err(ctx())? else {
+            return Ok(ConsoleChunk {
+                text: String::new(),
+                replace: offset > 0,
+                next_offset: 0,
+            });
+        };
+        let mut start = offset;
+        let replace = offset == 0 || offset > file.len || file.truncated;
+        if file.truncated || offset > file.len {
+            file = read(Keep::Tail).await.map_err(ctx())?.unwrap_or(file);
+            start = file.len.saturating_sub(file.bytes.len() as u64);
+        }
+        // Up to the last complete line; the rest comes next time.
+        let complete = file
+            .bytes
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let bytes = file.bytes.get(..complete).unwrap_or_default();
+        Ok(ConsoleChunk {
+            text: sanitize_console(bytes),
+            replace,
+            next_offset: start + bytes.len() as u64,
+        })
     }
 }
 

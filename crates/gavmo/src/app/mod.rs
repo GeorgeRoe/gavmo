@@ -6,6 +6,7 @@ mod card;
 mod folder_browser;
 mod format;
 mod home;
+mod hooks;
 mod modal;
 mod tools;
 mod transitions;

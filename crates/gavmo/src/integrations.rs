@@ -404,16 +404,28 @@ pub fn select_integrations(
 /// Largest `gavmo.yaml` accepted; a tool list is a few KiB at most.
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
-/// Reads a workspace's `gavmo.yaml`. Missing, unreadable or invalid files
-/// yield an empty config (logged), so a bad repo config never breaks a boot.
+/// Reads a workspace's `gavmo.yaml`. A missing file is an empty config; an
+/// unreadable, oversized, non-UTF-8 or invalid one is an empty config plus
+/// the reason (logged), so a bad repo config never breaks a boot but can
+/// still be shown to the user.
 ///
 /// The file is guest-writable, so it is read without following symlinks
 /// (it could otherwise point at any host file, whose contents YAML errors
 /// might then echo into the log) and with a size limit.
-pub async fn read_config(workspace_path: &str) -> GavmoConfig {
+pub async fn read_config(workspace_path: &str) -> (GavmoConfig, Option<String>) {
     let path = std::path::Path::new(workspace_path).join("gavmo.yaml");
+    match read_config_checked(&path).await {
+        Ok(config) => (config, None),
+        Err(reason) => {
+            tracing::warn!(path = %path.display(), "ignoring gavmo.yaml: {reason}");
+            (GavmoConfig::default(), Some(reason))
+        }
+    }
+}
+
+async fn read_config_checked(path: &std::path::Path) -> Result<GavmoConfig, String> {
     let file = match crate::guest_files::read_guest_file(
-        path.clone(),
+        path.to_path_buf(),
         Vec::new(),
         MAX_CONFIG_BYTES,
         crate::guest_files::Keep::Head,
@@ -421,30 +433,14 @@ pub async fn read_config(workspace_path: &str) -> GavmoConfig {
     .await
     {
         Ok(Some(file)) => file,
-        Ok(None) => return GavmoConfig::default(),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable gavmo.yaml");
-            return GavmoConfig::default();
-        }
+        Ok(None) => return Ok(GavmoConfig::default()),
+        Err(e) => return Err(format!("it could not be read: {e}")),
     };
     if file.truncated {
-        tracing::warn!(
-            path = %path.display(),
-            "ignoring gavmo.yaml larger than {MAX_CONFIG_BYTES} bytes"
-        );
-        return GavmoConfig::default();
+        return Err(format!("it is larger than {MAX_CONFIG_BYTES} bytes"));
     }
-    let Ok(text) = String::from_utf8(file.bytes) else {
-        tracing::warn!(path = %path.display(), "ignoring gavmo.yaml that is not UTF-8");
-        return GavmoConfig::default();
-    };
-    match toolspec::parse_config(&text) {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "ignoring invalid gavmo.yaml");
-            GavmoConfig::default()
-        }
-    }
+    let text = String::from_utf8(file.bytes).map_err(|e| format!("it is not valid UTF-8 ({e})"))?;
+    toolspec::parse_config(&text).map_err(|e| e.to_string())
 }
 
 /// Resolves requested tools without touching the secret store; the caller

@@ -1,7 +1,9 @@
 //! The server-function API: the control panel's entire interface to the
 //! daemon. Bodies only compile on the server, where they use the registry.
 
-use crate::types::{AppError, DirListing, ToolConfig, VmStats, WorkspaceInfo, WorkspaceStatus};
+use crate::types::{
+    AppError, ConsoleChunk, DirListing, ToolList, VmStats, WorkspaceInfo, WorkspaceStatus,
+};
 use leptos::prelude::*;
 
 #[server]
@@ -28,13 +30,16 @@ pub async fn read_build_log(id: String, log: String) -> Result<String, AppError>
         .map_err(AppError::from)
 }
 
-/// Fetches the guest's boot console (kernel + systemd output), sanitized for
-/// display. The log lives at a fixed path, so there is no client-controlled
-/// filename to validate.
+/// Fetches new boot console output (kernel + systemd) after `offset` (the
+/// previous chunk's `next_offset`, 0 at first), sanitized for display. The
+/// log lives at a fixed path, so there is no client-controlled filename.
 #[server]
-pub async fn read_console_log(id: String) -> Result<String, AppError> {
+pub async fn read_console_log(id: String, offset: u64) -> Result<ConsoleChunk, AppError> {
     let state = app_state()?;
-    state.read_console_log(&id).await.map_err(AppError::from)
+    state
+        .read_console_log(&id, offset)
+        .await
+        .map_err(AppError::from)
 }
 
 /// Fetches resource usage for a workspace's VM. `Ok(None)` means nothing to
@@ -101,7 +106,7 @@ pub async fn browse_dir(path: Option<String>) -> Result<DirListing, AppError> {
 /// Lists the tools a workspace's `gavmo.yaml` requests, with their configured
 /// status. Read live, so config/secret changes show without a restart.
 #[server]
-pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, AppError> {
+pub async fn list_tool_configs(id: String) -> Result<ToolList, AppError> {
     let state = app_state()?;
     Ok(state.list_tool_configs(&id).await?)
 }

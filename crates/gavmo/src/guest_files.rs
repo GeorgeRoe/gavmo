@@ -24,6 +24,8 @@ pub(crate) struct GuestFile {
     pub(crate) bytes: Vec<u8>,
     /// The file was larger than the limit and only part of it was read.
     pub(crate) truncated: bool,
+    /// The file's length when it was opened.
+    pub(crate) len: u64,
 }
 
 /// Which part to keep when a file exceeds the limit.
@@ -33,6 +35,9 @@ pub(crate) enum Keep {
     Head,
     /// The last `max_bytes` (logs: the newest output matters most).
     Tail,
+    /// Up to `max_bytes` starting at this offset (following a growing log).
+    /// An offset past the end reads nothing.
+    From(u64),
 }
 
 /// Reads at most `max_bytes` of the regular file `path`, refusing symlinks,
@@ -95,14 +100,23 @@ fn read_guest_file_blocking(
     }
 
     let len = meta.len();
-    let truncated = len > max_bytes;
-    if truncated && matches!(keep, Keep::Tail) {
-        file.seek(SeekFrom::Start(len - max_bytes))?;
-    }
+    let (start, truncated) = match keep {
+        Keep::Head => (0, len > max_bytes),
+        Keep::Tail => (len.saturating_sub(max_bytes), len > max_bytes),
+        Keep::From(offset) => {
+            let start = offset.min(len);
+            (start, len - start > max_bytes)
+        }
+    };
+    file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     // `take` also bounds a file that grows while being read.
     file.take(max_bytes).read_to_end(&mut bytes)?;
-    Ok(Some(GuestFile { bytes, truncated }))
+    Ok(Some(GuestFile {
+        bytes,
+        truncated,
+        len,
+    }))
 }
 
 fn refused(path: &Path, why: &str) -> io::Error {
@@ -141,7 +155,8 @@ mod tests {
             got,
             GuestFile {
                 bytes: b"hello".to_vec(),
-                truncated: false
+                truncated: false,
+                len: 5,
             }
         );
     }
@@ -174,7 +189,8 @@ mod tests {
             head,
             GuestFile {
                 bytes: b"0123".to_vec(),
-                truncated: true
+                truncated: true,
+                len: 10,
             }
         );
         let tail = read(&path, &[], 4, Keep::Tail).await.unwrap().unwrap();
@@ -182,9 +198,28 @@ mod tests {
             tail,
             GuestFile {
                 bytes: b"6789".to_vec(),
-                truncated: true
+                truncated: true,
+                len: 10,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reads_from_an_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let got = read(&path, &[], 4, Keep::From(3)).await.unwrap().unwrap();
+        assert_eq!(got.bytes, b"3456");
+        assert!(got.truncated);
+        let got = read(&path, &[], 100, Keep::From(8)).await.unwrap().unwrap();
+        assert_eq!((got.bytes.as_slice(), got.truncated), (&b"89"[..], false));
+        let past = read(&path, &[], 100, Keep::From(50))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(past.bytes.is_empty());
+        assert_eq!(past.len, 10);
     }
 
     #[cfg(unix)]
