@@ -354,7 +354,7 @@ impl AppState {
                 path: canonical,
                 host_port: None,
             });
-            save_registry(&self.inner.registry_path, &registry)?;
+            save_registry(&self.inner.registry_path, &registry).await?;
         }
         Ok(())
     }
@@ -677,7 +677,9 @@ impl AppState {
             let before = registry.workspaces.len();
             registry.workspaces.retain(|w| w.path != id);
             if registry.workspaces.len() != before {
-                save_registry(&self.inner.registry_path, &registry).map_err(|e| e.to_string())?;
+                save_registry(&self.inner.registry_path, &registry)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
         }
         let teardown = self.begin_teardown(id).await;
@@ -857,7 +859,7 @@ impl AppState {
         let mut registry = self.inner.registry.lock().await;
         let (port, changed) = resolve_host_port_in(&mut registry, id)?;
         if changed {
-            save_registry(&self.inner.registry_path, &registry)?;
+            save_registry(&self.inner.registry_path, &registry).await?;
         }
         Ok(port)
     }
@@ -1685,20 +1687,70 @@ fn resolve_host_port_in(registry: &mut Registry, id: &str) -> io::Result<(u16, b
     Ok((port, changed))
 }
 
-/// `~/.local/share/gavmo/workspaces.json` (or platform equivalent).
+/// Loads `~/.local/share/gavmo/workspaces.json` (or platform equivalent).
+///
+/// A missing file is an empty registry. A file that exists but isn't a valid
+/// registry (e.g. truncated by a crash before writes were atomic, or
+/// hand-edited) is moved aside to `workspaces.json.corrupt-<unix time>` and
+/// replaced by an empty registry, so the daemon still starts; the workspaces
+/// can be re-added (their VM disks are found again by path). Other read
+/// errors (permissions, I/O) are returned: nothing is discarded on a guess.
 fn load_registry(path: &Path) -> io::Result<Registry> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Registry::default()),
-        Err(e) => Err(e),
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) => return Err(e),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(registry) => Ok(registry),
+        Err(parse_error) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(format!(".corrupt-{stamp}"));
+            std::fs::rename(path, &aside)?;
+            tracing::error!(
+                error = %parse_error,
+                moved_to = %Path::new(&aside).display(),
+                "workspace registry was unreadable; starting with an empty one \
+                 (re-add your workspaces; their VM disks are kept)"
+            );
+            Ok(Registry::default())
+        }
     }
 }
 
-fn save_registry(path: &Path, registry: &Registry) -> io::Result<()> {
+/// Durably replaces the registry file: a uniquely named `0600` temp file in
+/// the same dir is written and fsynced, renamed over the old file, and the
+/// dir is fsynced - so a crash leaves the old or the new registry, never a
+/// truncated one. Runs on the blocking pool; callers hold the registry lock
+/// across it, which keeps concurrent saves ordered.
+async fn save_registry(path: &Path, registry: &Registry) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(registry)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, bytes)
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomically(&path, &bytes))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".workspaces.")
+        .suffix(".tmp")
+        .permissions(std::fs::Permissions::from_mode(0o600))
+        .tempfile_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -2653,6 +2705,65 @@ mod tests {
         assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Stopping))).await);
         assert_eq!(TokenAuthority::resolve(&state, "late"), None);
         assert_eq!(script.stops(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_registry_round_trips_atomically_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        let registry = Registry {
+            workspaces: vec![WorkspaceRecord {
+                path: "/srv/a".to_owned(),
+                host_port: Some(40000),
+            }],
+        };
+        save_registry(&path, &registry).await.unwrap();
+        save_registry(&path, &registry).await.unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert_eq!(loaded.workspaces.len(), 1);
+        assert_eq!(loaded.workspaces[0].host_port, Some(40000));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["workspaces.json"], "no temp files left behind");
+    }
+
+    /// A truncated registry (as a crash mid-write used to leave) no longer
+    /// stops the daemon starting; it is kept aside for inspection.
+    #[test]
+    fn a_corrupt_registry_is_moved_aside_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::fs::write(&path, br#"{"workspaces":[{"path":"/sr"#).unwrap();
+
+        let loaded = load_registry(&path).unwrap();
+        assert!(loaded.workspaces.is_empty());
+        assert!(!path.exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(
+            aside[0].starts_with("workspaces.json.corrupt-"),
+            "{aside:?}"
+        );
+    }
+
+    /// Unreadable (as opposed to unparseable) is an error: never discard data
+    /// on a guess.
+    #[test]
+    fn an_unreadable_registry_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_registry(&path).is_err());
+        assert!(path.is_dir());
     }
 
     /// Share dir names are deterministic, hex-only, and distinct per workspace.
