@@ -1,13 +1,16 @@
 [package]
 name = "toolspec"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-# Maintenance-only upstream but fine for our schema; `serde_yaml_ng` is a
-# drop-in fork if it ever needs replacing.
-serde_yaml = "0.9"
-thiserror = "2"
+serde.workspace = true
+# Maintained fork of the deprecated `serde_yaml`; same API surface.
+serde_yaml_ng = "0.10"
+thiserror.workspace = true
 # Spec-compliant parsing for host-lock checks; string prefixing is bypassable.
-url = "2"
+url.workspace = true

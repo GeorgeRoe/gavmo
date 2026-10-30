@@ -22,7 +22,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Polls `127.0.0.1:port` until `opencode web` answers, the `gavmo-rebuild`
 /// failure marker at `marker_path` appears, or `overall_timeout` elapses.
 /// The marker's contents become [`Error::RebuildFailed::log_file`].
-pub async fn wait_for_ready(port: u16, marker_path: &Path, overall_timeout: Duration) -> Result<()> {
+pub(crate) async fn wait_for_ready(
+    port: u16,
+    marker_path: &Path,
+    overall_timeout: Duration,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + overall_timeout;
 
     loop {
@@ -75,61 +79,57 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                let _ = socket
-                    .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-            }
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "probe sent no request");
+            socket
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
         });
 
         assert!(probe_once(port).await);
     }
 
-    #[tokio::test]
-    async fn probe_fails_when_nothing_is_listening() {
-        // Port 1 is privileged/unassigned; nothing should be listening.
-        assert!(!probe_once(1).await);
+    /// Binds then drops a listener so the port is known-closed, rather than
+    /// assuming some fixed port is free.
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
     }
 
-    /// A missing marker (NotFound) is the normal "no failure yet" state and
+    #[tokio::test]
+    async fn probe_fails_when_nothing_is_listening() {
+        assert!(!probe_once(closed_port().await).await);
+    }
+
+    /// A missing marker (`NotFound`) is the normal "no failure yet" state and
     /// must not short-circuit the wait.
     #[tokio::test]
     async fn wait_for_ready_times_out_when_nothing_ever_responds_and_no_marker_appears() {
-        let dir = std::env::temp_dir().join(format!(
-            "gavmo-health-test-{}-{}",
-            std::process::id(),
-            "notimeout"
-        ));
-        let marker = dir.join("rebuild-failed"); // deliberately never created
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("rebuild-failed"); // deliberately never created
 
-        let result = wait_for_ready(1, &marker, Duration::from_millis(600)).await;
+        let result = wait_for_ready(closed_port().await, &marker, Duration::from_millis(600)).await;
         assert!(matches!(result, Err(Error::HealthTimeout(_))));
     }
 
     #[tokio::test]
     async fn wait_for_ready_detects_the_rebuild_failure_marker_before_the_timeout() {
-        let dir = std::env::temp_dir().join(format!(
-            "gavmo-health-test-{}-{}",
-            std::process::id(),
-            "marker"
-        ));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let marker = dir.join("rebuild-failed");
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("rebuild-failed");
         tokio::fs::write(&marker, "rebuild-2026-01-01T00-00-00Z.log\n")
             .await
             .unwrap();
 
-        // Port 1 never answers; a long overall_timeout proves the marker
-        // check, not a timeout, resolves this.
-        let result = wait_for_ready(1, &marker, Duration::from_secs(30)).await;
+        // Nothing answers; a long overall_timeout proves the marker check,
+        // not a timeout, resolves this.
+        let result = wait_for_ready(closed_port().await, &marker, Duration::from_secs(30)).await;
         assert!(matches!(
             result,
             Err(Error::RebuildFailed { log_file })
                 if log_file == "rebuild-2026-01-01T00-00-00Z.log"
         ));
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

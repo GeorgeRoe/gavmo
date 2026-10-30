@@ -6,7 +6,7 @@
 //!   cargo run -p vm --example boot -- \
 //!       <base-image.qcow2> <repo-dir> <gcloud-dir> <host-port>
 //!
-//! Then open http://127.0.0.1:<host-port>. Requires `virtiofsd` on `PATH`.
+//! Then open `http://127.0.0.1:<host-port>`. Requires `virtiofsd` on `PATH`.
 //! Ctrl-C requests a graceful shutdown.
 
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or(USAGE)?
         .parse()
-        .map_err(|_| "host-port must be a valid u16")?;
+        .map_err(|e| format!("host-port must be a valid u16: {e}"))?;
 
     for (label, path) in [
         ("base image", &base_image),
@@ -40,10 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // All GAVMO state lives under <repo>/.gavmo, gitignored.
     let state_dir = repo_dir.join(".gavmo").join("vm");
-    let workspace_id = repo_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".to_string());
+    let workspace_id = repo_dir.file_name().map_or_else(
+        || "workspace".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
 
     // The daemon keeps this outside the repo so the MCP token never lands
     // in it; this debug runner has no app-data dir, so don't copy this.

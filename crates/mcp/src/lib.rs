@@ -80,7 +80,7 @@ pub trait ToolExecutor: Send + Sync + 'static {
         scope: &WorkspaceScope,
         name: &str,
         arguments: serde_json::Map<String, serde_json::Value>,
-    ) -> impl std::future::Future<Output = ToolOutcome> + Send;
+    ) -> impl Future<Output = ToolOutcome> + Send;
 }
 
 fn descriptor_to_tool(descriptor: ToolDescriptor) -> Tool {

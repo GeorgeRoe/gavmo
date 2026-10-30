@@ -1,6 +1,112 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Internal crates only; never publish to crates.io by accident.
+publish = false
+
+# Single source of truth for versions shared by more than one crate. Member
+# crates opt in with `foo = { workspace = true }` and may add features.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = "1"
+http = "1"
+url = "2"
+tempfile = "3"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal crates.
+vm = { path = "crates/vm" }
+mcp = { path = "crates/mcp" }
+secrets = { path = "crates/secrets" }
+toolspec = { path = "crates/toolspec" }
+
+[workspace.lints.rust]
+# No crate needs `unsafe` today. `deny` (not `forbid`) so a future, reviewed
+# use can opt out locally with `#[expect(unsafe_code, reason = "...")]`.
+unsafe_code = "deny"
+# Discarding a `#[must_use]` value (Result, Future, ...) is almost always a bug.
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+single_use_lifetimes = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+# `cfg(feature = "ssr"/"hydrate")` are real features; flag typos in others.
+unexpected_cfgs = "warn"
+
+[workspace.lints.clippy]
+# Broad nets, individually tuned below.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# --- Panics: library and server code must surface errors, not abort. ---
+# Tests are exempted via clippy.toml.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+get_unwrap = "warn"
+unwrap_in_result = "warn"
+panic_in_result_fn = "warn"
+exit = "warn"
+
+# --- Error handling: don't lose information. ---
+map_err_ignore = "warn"
+let_underscore_must_use = "warn"
+let_underscore_future = "deny"
+unused_result_ok = "warn"
+try_err = "warn"
+
+# --- Unsafe hygiene (for any future opt-out of `unsafe_code`). ---
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+# --- Numeric correctness. ---
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+
+# --- Misc correctness / hygiene. ---
+dbg_macro = "warn"
+mem_forget = "warn"
+rc_mutex = "warn"
+mutex_atomic = "warn"
+verbose_file_reads = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+infinite_loop = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+tests_outside_test_module = "warn"
+clone_on_ref_ptr = "warn"
+if_then_some_else_none = "warn"
+
+# --- Pedantic lints that are noise for this codebase. ---
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# u64 -> f64 only matters past 2^52; every such cast here feeds a display percentage.
+cast_precision_loss = "allow"
+# `#[server]` fns and rmcp handlers must be `async` by contract. (Blocking
+# work inside them is a separate, real problem tracked by review, not by lint.)
+unused_async = "allow"
+unused_async_trait_impl = "allow"
 
 # Size-optimized profile for the cargo-leptos WASM bundle in release mode.
 # Must live at the workspace root so cargo honors it for the member crate.
@@ -10,3 +116,8 @@ opt-level = 'z'
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Integer overflow is a logic bug; trap on it in release builds too rather than
+# silently wrapping (port arithmetic, byte counts, CPU-time deltas, ...).
+[profile.release]
+overflow-checks = true

@@ -1,10 +1,12 @@
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tokio::process::Child;
 
 use crate::config::VmConfig;
 use crate::disk::ensure_overlay;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::fsutil::remove_if_exists_async;
 use crate::health::{probe_once, wait_for_ready};
 use crate::qemu::spawn_qemu;
 use crate::qmp;
@@ -87,8 +89,10 @@ impl RunningVm {
         ];
 
         // Clear a stale rebuild-failure marker so a previous boot's result
-        // isn't mistaken for this one's. NotFound is the common case.
-        let _ = tokio::fs::remove_file(cfg.rebuild_failed_marker_path()).await;
+        // isn't mistaken for this one's. NotFound is the common case; any
+        // other failure must abort, or the stale marker would immediately
+        // (and wrongly) fail this boot.
+        remove_if_exists_async(&cfg.rebuild_failed_marker_path()).await?;
 
         let (qemu, helpers) = spawn_qemu(&cfg, &shares).await?;
         let host_port = cfg.host_port;
@@ -106,9 +110,16 @@ impl RunningVm {
 
         // Best-effort: without balloon stats the VM runs fine, it just shows
         // no live memory usage. Not worth failing a healthy boot over.
-        let _ =
+        if let Err(e) =
             qmp::set_balloon_stats_interval(&vm.cfg.qmp_socket_path(), BALLOON_STATS_INTERVAL_SECS)
-                .await;
+                .await
+        {
+            tracing::warn!(
+                workspace = %vm.cfg.workspace_id,
+                error = %e,
+                "could not enable balloon stats; guest memory usage will be unavailable"
+            );
+        }
 
         Ok(vm)
     }
@@ -116,27 +127,54 @@ impl RunningVm {
     /// Requests a graceful shutdown via QMP (ACPI powerdown), falling back
     /// to a forced `quit` and then SIGKILL if the guest doesn't exit in
     /// time. The overlay disk is always preserved.
+    ///
+    /// Every helper is torn down even if an earlier step fails; the first
+    /// failure to actually terminate a process is returned.
     pub async fn stop(mut self) -> Result<()> {
+        let workspace = self.cfg.workspace_id.clone();
         let qmp_sock = self.cfg.qmp_socket_path();
 
         let mut shut_down_gracefully = false;
-        if qmp_sock.exists() && qmp::system_powerdown(&qmp_sock).await.is_ok() {
-            shut_down_gracefully = tokio::time::timeout(SHUTDOWN_TIMEOUT, self.qemu.wait())
-                .await
-                .is_ok();
+        if qmp_sock.exists() {
+            match qmp::system_powerdown(&qmp_sock).await {
+                Ok(()) => {
+                    shut_down_gracefully = matches!(
+                        tokio::time::timeout(SHUTDOWN_TIMEOUT, self.qemu.wait()).await,
+                        Ok(Ok(_))
+                    );
+                    if !shut_down_gracefully {
+                        tracing::warn!(%workspace, "guest did not power off in time; forcing quit");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%workspace, error = %e, "ACPI powerdown failed; forcing quit");
+                }
+            }
         }
 
+        let mut result = Ok(());
         if !shut_down_gracefully {
-            let _ = qmp::quit(&qmp_sock).await;
-            let _ = tokio::time::timeout(QUIT_TIMEOUT, self.qemu.wait()).await;
-            let _ = self.qemu.kill().await;
+            if let Err(e) = qmp::quit(&qmp_sock).await {
+                tracing::warn!(%workspace, error = %e, "QMP quit failed; will SIGKILL qemu");
+            }
+            if tokio::time::timeout(QUIT_TIMEOUT, self.qemu.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!(%workspace, "qemu ignored quit; sending SIGKILL");
+            }
+            result = kill_and_reap(&mut self.qemu, "qemu-system-x86_64").await;
         }
 
         for mut helper in self.helpers.drain(..) {
-            let _ = helper.kill().await;
+            let helper_result = kill_and_reap(&mut helper, "virtiofsd").await;
+            if let Err(e) = &helper_result {
+                tracing::warn!(%workspace, error = %e, "failed to stop virtiofsd helper");
+            }
+            result = result.and(helper_result);
         }
 
-        Ok(())
+        result
     }
 
     /// Checks whether the VM process is alive, and if so whether
@@ -204,12 +242,53 @@ impl RunningVm {
 
     /// Path to this VM's QMP control socket, for
     /// [`crate::qmp::guest_memory`].
-    pub fn qmp_socket_path(&self) -> std::path::PathBuf {
+    pub fn qmp_socket_path(&self) -> PathBuf {
         self.cfg.qmp_socket_path()
     }
 
     /// Path to this VM's persistent overlay disk.
-    pub fn disk_path(&self) -> std::path::PathBuf {
+    pub fn disk_path(&self) -> PathBuf {
         self.cfg.disk_path()
+    }
+}
+
+/// SIGKILLs and reaps `child`, unless it has already exited (tokio's
+/// `kill` errors on an already-reaped child, which is not a failure here).
+async fn kill_and_reap(child: &mut Child, program: &'static str) -> Result<()> {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return Ok(());
+    }
+    child
+        .kill()
+        .await
+        .map_err(|source| Error::Kill { program, source })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::process::Command;
+
+    fn sleeper() -> Child {
+        Command::new("sleep")
+            .arg("600")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_kills_a_live_child() {
+        let mut child = sleeper();
+        kill_and_reap(&mut child, "sleep").await.unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    /// Killing a child that `wait()` already reaped must not be an error.
+    #[tokio::test]
+    async fn kill_and_reap_tolerates_an_already_reaped_child() {
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().await.unwrap();
+        kill_and_reap(&mut child, "true").await.unwrap();
     }
 }

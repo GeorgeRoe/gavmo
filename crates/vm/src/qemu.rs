@@ -10,7 +10,10 @@ pub(crate) const BALLOON_DEVICE_ID: &str = "balloon0";
 
 /// Builds the full `qemu-system-x86_64` argument list for a VM boot. Pure,
 /// for unit testing without `qemu` or `/dev/kvm`.
-pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]) -> Vec<String> {
+pub(crate) fn build_qemu_args(
+    cfg: &VmConfig,
+    shares: &[(&dyn ShareBackend, ShareSpec)],
+) -> Vec<String> {
     let mut args = Vec::new();
 
     // Hosts are Linux-only (virtiofs); the `cfg` just keeps non-Linux
@@ -83,7 +86,7 @@ pub fn build_qemu_args(cfg: &VmConfig, shares: &[(&dyn ShareBackend, ShareSpec)]
 /// Spawns `qemu-system-x86_64`, first starting any share helper processes
 /// (`virtiofsd`). The caller is responsible for cleaning up all returned
 /// children.
-pub async fn spawn_qemu(
+pub(crate) async fn spawn_qemu(
     cfg: &VmConfig,
     shares: &[(&dyn ShareBackend, ShareSpec)],
 ) -> Result<(Child, Vec<Child>)> {

@@ -3,10 +3,10 @@
 //! bodies only compile on the server, where they use the registry directly.
 
 use leptos::prelude::*;
-use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
+use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
-    components::{Route, Router, Routes},
     StaticSegment,
+    components::{Route, Router, Routes},
 };
 use serde::{Deserialize, Serialize};
 
@@ -377,10 +377,14 @@ fn set_card_vt_name(el: &web_sys::HtmlElement, name: Option<&str>) {
         let style = el.style();
         match name {
             Some(name) => {
-                let _ = style.set_property("view-transition-name", name);
+                if let Err(e) = style.set_property("view-transition-name", name) {
+                    leptos::logging::warn!("failed to set view-transition-name: {e:?}");
+                }
             }
             None => {
-                let _ = style.remove_property("view-transition-name");
+                if let Err(e) = style.remove_property("view-transition-name") {
+                    leptos::logging::warn!("failed to clear view-transition-name: {e:?}");
+                }
             }
         }
     }
@@ -417,12 +421,12 @@ fn scroll_to_bottom(el: &web_sys::HtmlPreElement) {
 #[cfg(feature = "hydrate")]
 fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOnce() + 'static) {
     use js_sys::Reflect;
-    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
-    use wasm_bindgen_futures::{future_to_promise, JsFuture};
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
     let document = document();
     let svt = Reflect::get(&document, &JsValue::from_str("startViewTransition"))
-        .and_then(|f| f.dyn_into::<js_sys::Function>());
+        .and_then(JsCast::dyn_into::<js_sys::Function>);
 
     let Ok(svt) = svt else {
         update();
@@ -445,7 +449,11 @@ fn start_view_transition(update: impl FnOnce() + 'static, on_finished: impl FnOn
             match finished {
                 Some(finished) => {
                     leptos::task::spawn_local(async move {
-                        let _ = JsFuture::from(finished).await;
+                        // A rejected `finished` (transition skipped or aborted)
+                        // still needs the cleanup below.
+                        if let Err(e) = JsFuture::from(finished).await {
+                            leptos::logging::debug_warn!("view transition did not finish: {e:?}");
+                        }
                         on_finished();
                     });
                 }
@@ -556,9 +564,11 @@ fn HomePage() -> impl IntoView {
         // other cards), so the id is fixed while the modal is mounted.
         <Show when=move || selected.get().is_some() fallback=|| ()>
             {move || {
-                let id = selected.get_untracked().expect("selected is Some");
+                // `None` only if `selected` was cleared between `when` and this
+                // closure running; render nothing rather than panic.
+                let id = selected.get_untracked()?;
                 let name = vt_name(&id);
-                view! {
+                Some(view! {
                     <WorkspaceModal
                         id
                         workspaces
@@ -591,7 +601,7 @@ fn HomePage() -> impl IntoView {
                             );
                         })
                     />
-                }
+                })
             }}
         </Show>
 
@@ -1421,7 +1431,7 @@ fn FolderBrowser(on_added: Callback<()>) -> impl IntoView {
     );
 
     let add_current = move |_| {
-        let path = listing.get().and_then(|r| r.ok()).map(|l| l.path);
+        let path = listing.get().and_then(Result::ok).map(|l| l.path);
         if let Some(path) = path {
             leptos::task::spawn_local(async move {
                 if let Err(e) = add_workspace(path).await {

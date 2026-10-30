@@ -12,12 +12,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 
 /// Session cookie name checked by every guarded route.
@@ -169,8 +169,7 @@ pub async fn require_session(
     }
 
     let authenticated = cookie_value(req.headers(), SESSION_COOKIE_NAME)
-        .map(|value| constant_time_eq(&value, &expected))
-        .unwrap_or(false);
+        .is_some_and(|value| constant_time_eq(&value, &expected));
     if authenticated {
         return next.run(req).await;
     }
@@ -190,13 +189,6 @@ mod tests {
     use tower::ServiceExt;
 
     /// Scratch dir unique per PID + counter so parallel tests don't collide.
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("gavmo-auth-test-{tag}-{}-{n}", std::process::id()))
-    }
-
     // --- cookie_value ---
 
     #[test]
@@ -282,44 +274,35 @@ mod tests {
 
     #[test]
     fn load_or_create_token_at_mints_and_persists_a_token_on_first_call() {
-        let dir = unique_temp_dir("create");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ui_token");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui_token");
 
         let token = load_or_create_token_at(&path).unwrap();
 
         assert!(!token.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn load_or_create_token_at_reuses_an_existing_token() {
-        let dir = unique_temp_dir("reuse");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ui_token");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui_token");
         std::fs::write(&path, "existing-token").unwrap();
 
         let token = load_or_create_token_at(&path).unwrap();
 
         assert_eq!(token, "existing-token");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn load_or_create_token_at_treats_a_blank_file_as_absent() {
-        let dir = unique_temp_dir("blank");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ui_token");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui_token");
         std::fs::write(&path, "   \n").unwrap();
 
         let token = load_or_create_token_at(&path).unwrap();
 
         assert!(!token.trim().is_empty());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- require_session / login_router ---
@@ -330,7 +313,7 @@ mod tests {
         Router::new()
             .route("/api/test", get(|| async { "ok" }))
             .route("/", get(|| async { "home" }))
-            .merge(login_router(token.clone()))
+            .merge(login_router(Arc::clone(&token)))
             .layer(axum::middleware::from_fn_with_state(token, require_session))
     }
 

@@ -1,0 +1,7 @@
+# Panicking is the correct failure mode inside tests; the panic-family lints
+# in [workspace.lints.clippy] target production code only.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true

@@ -23,13 +23,10 @@ pub struct ProcSample {
 /// Reads one [`ProcSample`] for `pid` from `/proc`. Errors if the process
 /// is gone or `/proc` is unparseable; treat as "no stats this tick".
 pub fn sample(pid: u32) -> io::Result<ProcSample> {
-    let proc_jiffies = parse_pid_stat_jiffies(&std::fs::read_to_string(format!(
-        "/proc/{pid}/stat"
-    ))?)?;
+    let proc_jiffies =
+        parse_pid_stat_jiffies(&std::fs::read_to_string(format!("/proc/{pid}/stat"))?)?;
     let (total_jiffies, ncpu) = parse_stat_total_and_ncpu(&std::fs::read_to_string("/proc/stat")?)?;
-    let rss_bytes = parse_vmrss_bytes(&std::fs::read_to_string(format!(
-        "/proc/{pid}/status"
-    ))?)?;
+    let rss_bytes = parse_vmrss_bytes(&std::fs::read_to_string(format!("/proc/{pid}/status"))?)?;
 
     Ok(ProcSample {
         proc_jiffies,
@@ -44,13 +41,17 @@ pub fn sample(pid: u32) -> io::Result<ProcSample> {
 ///
 /// Both deltas share the kernel's tick unit, so the tick rate cancels out.
 /// Returns `0.0` if `total_jiffies` didn't advance.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a display percentage in [0, ncpu*100]; f32 is ample"
+)]
 pub fn cpu_percent_per_core(prev: ProcSample, cur: ProcSample) -> f32 {
     let total_delta = cur.total_jiffies.saturating_sub(prev.total_jiffies);
     if total_delta == 0 {
         return 0.0;
     }
     let proc_delta = cur.proc_jiffies.saturating_sub(prev.proc_jiffies);
-    (proc_delta as f64 / total_delta as f64 * cur.ncpu as f64 * 100.0) as f32
+    (proc_delta as f64 / total_delta as f64 * f64::from(cur.ncpu) * 100.0) as f32
 }
 
 /// Parses `utime` (field 14) + `stime` (field 15) from `/proc/<pid>/stat`.
@@ -71,14 +72,19 @@ fn parse_pid_stat_jiffies(contents: &str) -> io::Result<u64> {
     let stime = fields
         .get(12)
         .ok_or_else(|| invalid_data("/proc/<pid>/stat: missing stime field"))?;
-    let utime: u64 = utime
-        .parse()
-        .map_err(|_| invalid_data("/proc/<pid>/stat: utime not a number"))?;
-    let stime: u64 = stime
-        .parse()
-        .map_err(|_| invalid_data("/proc/<pid>/stat: stime not a number"))?;
-    Ok(utime + stime)
+    let utime = parse_u64(utime, "/proc/<pid>/stat: utime")?;
+    let stime = parse_u64(stime, "/proc/<pid>/stat: stime")?;
+    utime
+        .checked_add(stime)
+        .ok_or_else(|| invalid_data("/proc/<pid>/stat: utime + stime overflows"))
 }
+
+/// Columns of the aggregate `cpu` line that partition total CPU time:
+/// user, nice, system, idle, iowait, irq, softirq, steal. The trailing
+/// `guest`/`guest_nice` columns are already counted inside user/nice
+/// (see proc(5)), so summing them would double-count guest time - which on
+/// a KVM host is exactly the time we're measuring.
+const STAT_TIME_COLUMNS: usize = 8;
 
 /// Parses the aggregate `cpu` line total and the number of `cpuN` lines
 /// from `/proc/stat`.
@@ -87,13 +93,20 @@ fn parse_stat_total_and_ncpu(contents: &str) -> io::Result<(u64, u32)> {
     let mut ncpu = 0u32;
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("cpu ") {
-            let sum: u64 = rest
-                .split_whitespace()
-                .map(|f| f.parse::<u64>().unwrap_or(0))
-                .sum();
+            let mut sum = 0u64;
+            for field in rest.split_whitespace().take(STAT_TIME_COLUMNS) {
+                sum = sum
+                    .checked_add(parse_u64(field, "/proc/stat: cpu column")?)
+                    .ok_or_else(|| invalid_data("/proc/stat: cpu total overflows"))?;
+            }
             total = Some(sum);
-        } else if line.starts_with("cpu") && line[3..].starts_with(|c: char| c.is_ascii_digit()) {
-            ncpu += 1;
+        } else if line
+            .strip_prefix("cpu")
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            ncpu = ncpu
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("/proc/stat: too many cpu lines"))?;
         }
     }
     let total = total.ok_or_else(|| invalid_data("/proc/stat: missing aggregate 'cpu' line"))?;
@@ -107,17 +120,27 @@ fn parse_stat_total_and_ncpu(contents: &str) -> io::Result<(u64, u32)> {
 fn parse_vmrss_bytes(contents: &str) -> io::Result<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb: u64 = rest
-                .trim()
-                .strip_suffix("kB")
-                .unwrap_or(rest.trim())
-                .trim()
-                .parse()
-                .map_err(|_| invalid_data("/proc/<pid>/status: VmRSS not a number"))?;
-            return Ok(kb * 1024);
+            let value = rest.trim();
+            let kb = parse_u64(
+                value.strip_suffix("kB").unwrap_or(value).trim(),
+                "/proc/<pid>/status: VmRSS",
+            )?;
+            return kb
+                .checked_mul(1024)
+                .ok_or_else(|| invalid_data("/proc/<pid>/status: VmRSS overflows"));
         }
     }
     Err(invalid_data("/proc/<pid>/status: missing VmRSS line"))
+}
+
+/// Parses a decimal `u64`, keeping the parse error as the source.
+fn parse_u64(field: &str, what: &str) -> io::Result<u64> {
+    field.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{what} is not a number ({field:?}): {e}"),
+        )
+    })
 }
 
 fn invalid_data(msg: &str) -> io::Error {
@@ -191,6 +214,30 @@ ctxt 98765
         assert_eq!(ncpu, 4);
     }
 
+    /// `guest`/`guest_nice` (columns 9-10) are already inside user/nice and
+    /// must not be added again.
+    #[test]
+    fn parse_stat_total_excludes_guest_columns() {
+        let contents = "\
+cpu  100 10 50 850 5 1 2 3 70 7
+cpu0 100 10 50 850 5 1 2 3 70 7
+";
+        let (total, _) = parse_stat_total_and_ncpu(contents).unwrap();
+        assert_eq!(total, 100 + 10 + 50 + 850 + 5 + 1 + 2 + 3);
+    }
+
+    #[test]
+    fn parse_stat_total_rejects_non_numeric_columns() {
+        let contents = "cpu  100 x 50 850 0 0 0 0\ncpu0 1 0 0 0 0 0 0 0\n";
+        assert!(parse_stat_total_and_ncpu(contents).is_err());
+    }
+
+    #[test]
+    fn parse_vmrss_bytes_errors_on_overflow() {
+        let contents = format!("VmRSS: {} kB\n", u64::MAX);
+        assert!(parse_vmrss_bytes(&contents).is_err());
+    }
+
     #[test]
     fn parse_stat_total_and_ncpu_errors_when_missing() {
         assert!(parse_stat_total_and_ncpu("intr 0\nctxt 0\n").is_err());
@@ -240,32 +287,27 @@ VmSize:   123456 kB
             rss_bytes: 0,
         };
         let same = prev;
-        assert_eq!(cpu_percent_per_core(prev, same), 0.0);
+        assert!(cpu_percent_per_core(prev, same).abs() < f32::EPSILON);
 
         let earlier = ProcSample {
             total_jiffies: 4000,
             ..prev
         };
-        assert_eq!(cpu_percent_per_core(prev, earlier), 0.0);
+        assert!(cpu_percent_per_core(prev, earlier).abs() < f32::EPSILON);
     }
 
     #[test]
     fn file_size_or_zero_is_zero_for_missing_file() {
-        let path = std::env::temp_dir().join("gavmo-stats-test-definitely-missing-file");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing");
         assert_eq!(file_size_or_zero(&path).unwrap(), 0);
     }
 
     #[test]
     fn file_size_or_zero_returns_real_size_for_existing_file() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "gavmo-stats-test-{}-{n}",
-            std::process::id()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
         std::fs::write(&path, b"hello").unwrap();
         assert_eq!(file_size_or_zero(&path).unwrap(), 5);
-        let _ = std::fs::remove_file(&path);
     }
 }

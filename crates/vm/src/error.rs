@@ -19,6 +19,27 @@ pub enum Error {
         source: io::Error,
     },
 
+    #[error("failed to remove stale file {path}: {source}")]
+    RemoveStale {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to stat {path}: {source}")]
+    Stat {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to kill `{program}`: {source}")]
+    Kill {
+        program: &'static str,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("qemu-img failed (exit status {status}): {stderr}")]
     DiskCreateFailed { status: ExitStatus, stderr: String },
 

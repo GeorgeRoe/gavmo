@@ -271,7 +271,13 @@ impl AppState {
                 }
                 Ok(vm) => {
                     drop(running);
-                    let _ = vm.stop().await;
+                    if let Err(e) = vm.stop().await {
+                        tracing::warn!(
+                            workspace = %task_id,
+                            error = %e,
+                            "failed to stop a superseded VM cleanly"
+                        );
+                    }
                 }
                 Err(e) if still_wanted => {
                     let slot = match &e {
@@ -307,10 +313,7 @@ impl AppState {
         match slot {
             Some(VmSlot::Running(vm)) => vm.stop().await.map_err(|e| e.to_string()),
             Some(VmSlot::Booting(handle)) => {
-                handle.abort();
-                // `Err` (cancelled) or `Ok` if the task already finished;
-                // either way qemu is gone.
-                let _ = handle.await;
+                abort_boot_task(id, handle).await;
                 Ok(())
             }
             Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => Ok(()),
@@ -342,13 +345,15 @@ impl AppState {
 
         let slot = self.inner.running.lock().await.remove(id);
         match slot {
+            // The state dir is deleted regardless: qemu has been killed by
+            // `stop` at the latest via SIGKILL, so a failure here is only
+            // worth logging, not blocking the reset the user confirmed.
             Some(VmSlot::Running(vm)) => {
-                let _ = vm.stop().await;
+                if let Err(e) = vm.stop().await {
+                    tracing::warn!(workspace = %id, error = %e, "VM did not stop cleanly during reset");
+                }
             }
-            Some(VmSlot::Booting(handle)) => {
-                handle.abort();
-                let _ = handle.await;
-            }
+            Some(VmSlot::Booting(handle)) => abort_boot_task(id, handle).await,
             Some(VmSlot::Failed(_) | VmSlot::BuildFailed { .. }) | None => {}
         }
 
@@ -361,10 +366,10 @@ impl AppState {
     fn vm_config(&self, id: &str, mcp_dir: PathBuf, host_port: u16) -> VmConfig {
         let repo_dir = PathBuf::from(id);
         let state_dir = Self::state_dir_for(id);
-        let workspace_id = repo_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "workspace".to_string());
+        let workspace_id = repo_dir.file_name().map_or_else(
+            || "workspace".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
 
         VmConfig {
             workspace_id,
@@ -414,16 +419,9 @@ impl AppState {
         tokio::fs::create_dir_all(dir).await?;
         let token = uuid::Uuid::new_v4().to_string();
         let path = dir.join("token.env");
-        tokio::fs::write(&path, format!("GAVMO_MCP_TOKEN={token}\n")).await?;
+        write_owner_only(&path, format!("GAVMO_MCP_TOKEN={token}\n").as_bytes()).await?;
 
-        // Owner-only on the host: cheap insurance against other local users.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
-        }
-
-        let mut tokens = self.inner.mcp_tokens.lock().unwrap();
+        let mut tokens = lock_unpoisoned(&self.inner.mcp_tokens);
         tokens.retain(|_, v| v != id);
         tokens.insert(token, id.to_string());
         Ok(())
@@ -432,7 +430,7 @@ impl AppState {
     /// Invalidates `id`'s MCP token, so a stopped VM can't call the gateway
     /// even if its `token.env` is still on disk.
     fn clear_mcp_token(&self, id: &str) {
-        self.inner.mcp_tokens.lock().unwrap().retain(|_, v| v != id);
+        lock_unpoisoned(&self.inner.mcp_tokens).retain(|_, v| v != id);
     }
 
     /// Resolves the enabled tool integrations for `id`: tools requested in
@@ -462,24 +460,17 @@ impl AppState {
 
     /// Records the resolved integrations for a freshly-booted workspace.
     fn set_integrations(&self, id: &str, integrations: Vec<ResolvedIntegration>) {
-        self.inner
-            .workspace_integrations
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), integrations);
+        lock_unpoisoned(&self.inner.workspace_integrations).insert(id.to_string(), integrations);
     }
 
     /// Forgets a workspace's integrations on stop/reset.
     fn clear_integrations(&self, id: &str) {
-        self.inner.workspace_integrations.lock().unwrap().remove(id);
+        lock_unpoisoned(&self.inner.workspace_integrations).remove(id);
     }
 
     /// The integrations currently resolved for `id` (empty if none/stopped).
     fn integrations_for(&self, id: &str) -> Vec<ResolvedIntegration> {
-        self.inner
-            .workspace_integrations
-            .lock()
-            .unwrap()
+        lock_unpoisoned(&self.inner.workspace_integrations)
             .get(id)
             .cloned()
             .unwrap_or_default()
@@ -508,15 +499,23 @@ impl AppState {
 
     /// Fetches one secret value (`None` if absent or on backend error).
     async fn secret_get(&self, key: String) -> Option<String> {
-        let store = self.inner.secret_store.clone();
-        tokio::task::spawn_blocking(move || store.get(&key).ok().flatten())
-            .await
-            .unwrap_or(None)
+        let store = Arc::clone(&self.inner.secret_store);
+        match tokio::task::spawn_blocking(move || store.get(&key)).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "secret store read failed; treating as unset");
+                None
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "secret store task failed");
+                None
+            }
+        }
     }
 
     /// Stores one secret value.
     async fn secret_set(&self, key: String, value: String) -> Result<(), String> {
-        let store = self.inner.secret_store.clone();
+        let store = Arc::clone(&self.inner.secret_store);
         tokio::task::spawn_blocking(move || store.set(&key, &value))
             .await
             .map_err(|e| format!("secret store task failed: {e}"))?
@@ -525,7 +524,7 @@ impl AppState {
 
     /// Deletes one secret value.
     async fn secret_delete(&self, key: String) -> Result<(), String> {
-        let store = self.inner.secret_store.clone();
+        let store = Arc::clone(&self.inner.secret_store);
         tokio::task::spawn_blocking(move || store.delete(&key))
             .await
             .map_err(|e| format!("secret store task failed: {e}"))?
@@ -535,14 +534,23 @@ impl AppState {
     /// Fetches the values for `keys` in one blocking batch; absent or errored
     /// keys are omitted.
     async fn secrets_fetch_many(&self, keys: Vec<String>) -> HashMap<String, String> {
-        let store = self.inner.secret_store.clone();
-        tokio::task::spawn_blocking(move || {
+        let store = Arc::clone(&self.inner.secret_store);
+        let fetched = tokio::task::spawn_blocking(move || {
             keys.into_iter()
-                .filter_map(|key| store.get(&key).ok().flatten().map(|v| (key, v)))
+                .filter_map(|key| match store.get(&key) {
+                    Ok(value) => value.map(|v| (key, v)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "secret store read failed; treating as unset");
+                        None
+                    }
+                })
                 .collect()
         })
-        .await
-        .unwrap_or_default()
+        .await;
+        fetched.unwrap_or_else(|e| {
+            tracing::error!(error = %e, "secret store task failed");
+            HashMap::new()
+        })
     }
 
     /// The control panel's view of a workspace's requested tools and whether
@@ -734,7 +742,7 @@ impl AppState {
 /// depending on `gavmo`.
 impl TokenAuthority for AppState {
     fn resolve(&self, token: &str) -> Option<WorkspaceScope> {
-        let tokens = self.inner.mcp_tokens.lock().unwrap();
+        let tokens = lock_unpoisoned(&self.inner.mcp_tokens);
         let workspace_id = tokens.get(token)?.clone();
         Some(WorkspaceScope { workspace_id })
     }
@@ -808,9 +816,59 @@ fn ping_descriptor() -> ToolDescriptor {
 }
 
 /// Deterministic, filesystem-safe directory name for a workspace's MCP token
-/// share: the hex-encoded path (no alphabet/padding edge cases).
+/// share: the hex SHA-256 of the workspace path.
+///
+/// SHA-256 rather than the hex-encoded path itself: hex doubles the length, so
+/// any path over 127 bytes exceeded the 255-byte filename limit and that
+/// workspace could never boot. The digest is always 64 chars.
 fn mcp_share_dir_name(id: &str) -> String {
-    id.bytes().map(|b| format!("{b:02x}")).collect()
+    use sha2::Digest as _;
+
+    format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
+}
+
+/// Aborts an in-flight boot task and waits for it to finish, so qemu (owned
+/// by the task, `kill_on_drop`) is gone on return. Cancellation, or the task
+/// having already finished, is the expected outcome; a panic is logged.
+async fn abort_boot_task(id: &str, handle: tokio::task::JoinHandle<()>) {
+    handle.abort();
+    match handle.await {
+        Ok(()) => {}
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => tracing::error!(workspace = %id, error = %e, "boot task panicked"),
+    }
+}
+
+/// Recovers a poisoned `std` mutex. Every map guarded this way (MCP tokens,
+/// resolved integrations) is updated with single, self-contained operations,
+/// so a panic elsewhere can't leave it half-modified; serving it is safer
+/// than turning one panic into a panic on every later request.
+fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Writes `contents` to `path`, truncating any existing file, with mode
+/// `0600` applied at creation on Unix - never briefly readable by other users
+/// as with write-then-chmod. An existing file's mode is forced back to `0600`
+/// too, since `mode` only applies when the file is created.
+async fn write_owner_only(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await?;
+    }
+    file.write_all(contents).await?;
+    file.flush().await
 }
 
 /// Deletes a directory tree, treating "already gone" as success.
@@ -822,14 +880,22 @@ async fn remove_dir_all_idempotent(path: &Path) -> io::Result<()> {
     }
 }
 
-/// `true` only for `rebuild-*.log` names with no separators or `..`, so a
-/// crafted argument can't escape the workspace's state dir.
+/// `true` only for `rebuild-<stem>.log` where `<stem>` is non-empty ASCII
+/// alphanumerics, `-` and `_` (what `gavmo-rebuild` writes:
+/// `rebuild-2026-01-01T00-00-00Z.log`). The name comes from a guest-written
+/// marker, so this is an allowlist rather than a denylist of separators: no
+/// `/`, `\`, `.`, NUL, control or non-ASCII characters can get through, so a
+/// crafted name can't escape the workspace's state dir. Case-sensitive on
+/// purpose.
 fn is_safe_rebuild_log_filename(name: &str) -> bool {
-    name.starts_with("rebuild-")
-        && name.ends_with(".log")
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains("..")
+    name.strip_prefix("rebuild-")
+        .and_then(|rest| rest.strip_suffix(".log"))
+        .is_some_and(|stem| {
+            !stem.is_empty()
+                && stem
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
 }
 
 /// Strips terminal escape sequences from a raw serial-console capture,
@@ -856,7 +922,7 @@ fn sanitize_console(bytes: &[u8]) -> String {
                     }
                     // OSC/DCS/APC/PM string sequences, terminated by BEL or
                     // ST (`ESC \`). GRUB emits DCS in real boot captures.
-                    Some(']') | Some('P') | Some('_') | Some('^') => {
+                    Some(']' | 'P' | '_' | '^') => {
                         chars.next();
                         while let Some(&c) = chars.peek() {
                             if c == '\u{7}' {
@@ -955,11 +1021,11 @@ fn resolve_host_port_in(registry: &mut Registry, id: &str) -> io::Result<(u16, b
     // `changed` means the registry was mutated, which differs from
     // `existing != Some(port)` when `id` has no record.
     let mut changed = false;
-    if existing != Some(port) {
-        if let Some(record) = registry.workspaces.iter_mut().find(|w| w.path == id) {
-            record.host_port = Some(port);
-            changed = true;
-        }
+    if existing != Some(port)
+        && let Some(record) = registry.workspaces.iter_mut().find(|w| w.path == id)
+    {
+        record.host_port = Some(port);
+        changed = true;
     }
 
     Ok((port, changed))
@@ -1054,9 +1120,9 @@ mod tests {
         let bytes = input.as_bytes();
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let b0 = u32::from(chunk[0]);
+            let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+            let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
             let n = (b0 << 16) | (b1 << 8) | b2;
             out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
             out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
@@ -1127,6 +1193,14 @@ mod tests {
         assert!(!is_safe_rebuild_log_filename("not-a-rebuild-log.txt"));
         assert!(!is_safe_rebuild_log_filename("rebuild-no-extension"));
         assert!(!is_safe_rebuild_log_filename(""));
+        assert!(!is_safe_rebuild_log_filename("rebuild-.log"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-x.LOG"));
+
+        // Characters a denylist would miss.
+        assert!(!is_safe_rebuild_log_filename("rebuild-a\0b.log"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-a\nb.log"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-a.b.log"));
+        assert!(!is_safe_rebuild_log_filename("rebuild-a\u{2215}b.log"));
     }
 
     /// With no persisted port, a fresh one is allocated.
@@ -1259,18 +1333,18 @@ mod tests {
         assert!(registry.workspaces.is_empty());
     }
 
-    /// A unique temp dir (PID + counter) so concurrent tests can't collide.
-    fn unique_temp_dir(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("gavmo-test-{tag}-{}-{n}", std::process::id()))
+    /// A not-yet-created path `<tempdir>/<tag>`. Keep the returned `TempDir`
+    /// alive for the test: dropping it deletes the whole tree, even on failure.
+    fn unique_temp_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(tag);
+        (tmp, path)
     }
 
     /// A populated state dir is deleted along with its contents.
     #[tokio::test]
     async fn remove_dir_all_idempotent_deletes_an_existing_tree() {
-        let dir = unique_temp_dir("reset-exists");
+        let (_tmp, dir) = unique_temp_dir("reset-exists");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("disk.qcow2"), b"fake overlay")
             .await
@@ -1284,7 +1358,7 @@ mod tests {
     /// Deleting a missing dir is `Ok(())`, not `NotFound`.
     #[tokio::test]
     async fn remove_dir_all_idempotent_is_a_noop_when_already_gone() {
-        let dir = unique_temp_dir("reset-missing");
+        let (_tmp, dir) = unique_temp_dir("reset-missing");
         assert!(!dir.exists());
 
         remove_dir_all_idempotent(&dir).await.unwrap();
@@ -1305,7 +1379,7 @@ mod tests {
     /// for an in-flight boot.
     fn never_finishing_boot_slot() -> VmSlot {
         VmSlot::Booting(tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            tokio::time::sleep(Duration::from_secs(600)).await;
         }))
     }
 
@@ -1322,7 +1396,7 @@ mod tests {
             .await
             .insert(id.to_string(), never_finishing_boot_slot());
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), state.stop_workspace(id))
+        tokio::time::timeout(Duration::from_secs(5), state.stop_workspace(id))
             .await
             .expect("stop_workspace should abort the in-flight boot promptly, not wait for it")
             .unwrap();
@@ -1333,7 +1407,7 @@ mod tests {
     /// `reset_workspace` aborts an in-flight boot promptly, then deletes the state dir.
     #[tokio::test]
     async fn reset_workspace_aborts_an_in_flight_boot_before_deleting_state() {
-        let repo_dir = unique_temp_dir("reset-abort-repo");
+        let (_tmp, repo_dir) = unique_temp_dir("reset-abort-repo");
         let state_dir = repo_dir.join(".gavmo").join("vm");
         tokio::fs::create_dir_all(&state_dir).await.unwrap();
         tokio::fs::write(state_dir.join("disk.qcow2"), b"fake overlay")
@@ -1349,13 +1423,10 @@ mod tests {
             .await
             .insert(id.clone(), never_finishing_boot_slot());
 
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            state.reset_workspace(&id),
-        )
-        .await
-        .expect("reset_workspace should abort the in-flight boot promptly, not wait for it")
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), state.reset_workspace(&id))
+            .await
+            .expect("reset_workspace should abort the in-flight boot promptly, not wait for it")
+            .unwrap();
 
         assert!(!state_dir.exists());
         assert!(state.inner.running.lock().await.get(&id).is_none());
@@ -1372,12 +1443,39 @@ mod tests {
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// Long workspace paths must still give a usable (<= 255 byte) name.
+    #[test]
+    fn mcp_share_dir_name_has_fixed_length_for_long_paths() {
+        let long = format!("/home/user/{}", "d/".repeat(200));
+        assert_eq!(mcp_share_dir_name(&long).len(), 64);
+        assert_eq!(mcp_share_dir_name("/").len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_owner_only_creates_and_resets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.env");
+
+        write_owner_only(&path, b"a").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // A pre-existing, wider file is narrowed and overwritten.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_owner_only(&path, b"b").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"b");
+    }
+
     /// Minting writes `token.env` and the token resolves to the workspace.
     #[tokio::test]
     async fn mint_mcp_token_writes_env_file_and_resolves_via_token_authority() {
         let state = test_app_state();
         let id = "mint-mcp-token-writes-env-file-and-resolves";
-        let dir = unique_temp_dir("mcp-token-mint");
+        let (_tmp, dir) = unique_temp_dir("mcp-token-mint");
 
         state.mint_mcp_token(id, &dir).await.unwrap();
 
@@ -1404,7 +1502,7 @@ mod tests {
     async fn minting_a_new_token_invalidates_the_previous_one_for_the_same_workspace() {
         let state = test_app_state();
         let id = "minting-a-new-token-invalidates-the-previous-one";
-        let dir = unique_temp_dir("mcp-token-remint");
+        let (_tmp, dir) = unique_temp_dir("mcp-token-remint");
 
         state.mint_mcp_token(id, &dir).await.unwrap();
         let old_token = {
@@ -1426,7 +1524,7 @@ mod tests {
     async fn clear_mcp_token_invalidates_resolution() {
         let state = test_app_state();
         let id = "clear-mcp-token-invalidates-resolution";
-        let dir = unique_temp_dir("mcp-token-clear");
+        let (_tmp, dir) = unique_temp_dir("mcp-token-clear");
 
         state.mint_mcp_token(id, &dir).await.unwrap();
         let token = {

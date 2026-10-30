@@ -86,9 +86,18 @@ impl SecretStore for KeyringStore {
 }
 
 /// In-process backend for tests. Not persisted and not encrypted.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryStore {
     map: Mutex<HashMap<String, String>>,
+}
+
+/// Redacting: lists keys only, never values, so `{:?}` can't leak secrets.
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryStore")
+            .field("keys", &self.lock().keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryStore {
@@ -116,7 +125,9 @@ impl SecretStore for MemoryStore {
 impl MemoryStore {
     /// Recovers from poisoning: the map has no cross-entry invariant to protect.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
-        self.map.lock().unwrap_or_else(|e| e.into_inner())
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -168,9 +179,7 @@ impl KeyProvider for KeyringKeyProvider {
                 entry
                     .set_password(&encoded)
                     .map_err(|e| SecretError::Backend(e.to_string()))?;
-                let mut out = [0u8; KEY_LEN];
-                out.copy_from_slice(key.as_slice());
-                Ok(out)
+                Ok(key.into())
             }
             Err(e) => Err(SecretError::Backend(e.to_string())),
         }
@@ -203,7 +212,10 @@ pub struct VaultStore {
 impl VaultStore {
     /// Opens the vault at `path`. Errors if the key is unavailable or the file
     /// is unreadable or tampered; only a missing file starts an empty vault.
-    pub fn open(path: impl Into<PathBuf>, key_provider: &dyn KeyProvider) -> Result<Self, SecretError> {
+    pub fn open(
+        path: impl Into<PathBuf>,
+        key_provider: &dyn KeyProvider,
+    ) -> Result<Self, SecretError> {
         let path = path.into();
         let key_bytes = key_provider.load_or_create_key()?;
         let cipher = XChaCha20Poly1305::new(&Key::from(key_bytes));
@@ -232,30 +244,64 @@ impl VaultStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
-        self.map.lock().unwrap_or_else(|e| e.into_inner())
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Writes the encrypted map via temp file + rename so a crash leaves either
-    /// the old or the new vault, never a truncated one.
+    /// Durably replaces the vault file with the encrypted `map`, so a crash
+    /// leaves either the old or the new vault, never a truncated one:
+    ///
+    /// 1. a uniquely named temp file is created `O_EXCL` with mode `0600`
+    ///    from the start (never briefly world-readable, never follows a
+    ///    planted symlink) in the *same* dir, so the rename stays on one
+    ///    filesystem;
+    /// 2. its contents are fsynced before the rename;
+    /// 3. the directory is fsynced after it, so the rename itself survives.
+    ///
+    /// On any error the temp file is removed (by `NamedTempFile`'s drop).
     fn flush(&self, map: &HashMap<String, String>) -> Result<(), SecretError> {
+        use std::io::Write as _;
+
         let payload = encrypt_vault(&self.cipher, map)?;
 
         let dir = self.path.parent().ok_or_else(|| {
             SecretError::Backend(format!("vault path {} has no parent", self.path.display()))
         })?;
-        std::fs::create_dir_all(dir)
-            .map_err(|e| SecretError::Backend(format!("creating {}: {e}", dir.display())))?;
+        create_private_dir_all(dir)?;
 
-        // Temp file in the *same* dir so the rename stays on one filesystem.
-        let tmp = self.path.with_extension("vault.tmp");
-        std::fs::write(&tmp, &payload)
-            .map_err(|e| SecretError::Backend(format!("writing {}: {e}", tmp.display())))?;
-        set_owner_only_perms(&tmp)?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            // Best-effort cleanup so a failed rename doesn't litter a temp file.
-            let _ = std::fs::remove_file(&tmp);
-            SecretError::Backend(format!("replacing {}: {e}", self.path.display()))
-        })?;
+        let io_err = |what: &str, e: std::io::Error| {
+            SecretError::Backend(format!("{what} {}: {e}", self.path.display()))
+        };
+        let mut tmp = private_tempfile_builder()
+            .tempfile_in(dir)
+            .map_err(|e| io_err("creating temp file for", e))?;
+        tmp.write_all(&payload)
+            .map_err(|e| io_err("writing temp file for", e))?;
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| io_err("syncing temp file for", e))?;
+        tmp.persist(&self.path)
+            .map_err(|e| io_err("replacing", e.error))?;
+        sync_dir(dir)
+    }
+
+    /// Applies `mutate` to a copy of the map, persists the copy, and only then
+    /// publishes it in memory. A failed write therefore leaves memory and disk
+    /// agreeing on the old contents, instead of `get` serving a value that
+    /// would vanish on restart.
+    fn update(
+        &self,
+        mutate: impl FnOnce(&mut HashMap<String, String>) -> bool,
+    ) -> Result<(), SecretError> {
+        let mut map = self.lock();
+        let mut next = map.clone();
+        if !mutate(&mut next) {
+            // Nothing changed, so skip the rewrite.
+            return Ok(());
+        }
+        self.flush(&next)?;
+        *map = next;
         Ok(())
     }
 }
@@ -266,18 +312,14 @@ impl SecretStore for VaultStore {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
-        let mut map = self.lock();
-        map.insert(key.to_string(), value.to_string());
-        self.flush(&map)
+        self.update(|map| {
+            map.insert(key.to_owned(), value.to_owned());
+            true
+        })
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretError> {
-        let mut map = self.lock();
-        // Nothing changed, so skip the rewrite.
-        if map.remove(key).is_none() {
-            return Ok(());
-        }
-        self.flush(&map)
+        self.update(|map| map.remove(key).is_some())
     }
 }
 
@@ -309,11 +351,18 @@ impl LazyVaultStore {
         &self,
         f: impl FnOnce(&VaultStore) -> Result<T, SecretError>,
     ) -> Result<T, SecretError> {
-        let mut guard = self.opened.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(VaultStore::open(self.path.clone(), self.key_provider.as_ref())?);
-        }
-        f(guard.as_ref().expect("just opened"))
+        let mut guard = self
+            .opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vault = match &mut *guard {
+            Some(vault) => vault,
+            empty @ None => empty.insert(VaultStore::open(
+                self.path.clone(),
+                self.key_provider.as_ref(),
+            )?),
+        };
+        f(vault)
     }
 }
 
@@ -358,47 +407,79 @@ fn decrypt_vault(
     cipher: &XChaCha20Poly1305,
     bytes: &[u8],
 ) -> Result<HashMap<String, String>, SecretError> {
-    const HEADER: usize = 3; // magic(2) + version(1)
     const NONCE_LEN: usize = 24;
-    if bytes.len() < HEADER + NONCE_LEN {
-        return Err(SecretError::Backend("vault file is truncated".to_string()));
-    }
-    if bytes[0..2] != VAULT_MAGIC {
+    let truncated = || SecretError::Backend("vault file is truncated".to_owned());
+
+    let (magic, rest) = bytes.split_first_chunk::<2>().ok_or_else(truncated)?;
+    if *magic != VAULT_MAGIC {
         return Err(SecretError::Backend(
-            "not a GAVMO vault file (bad magic)".to_string(),
+            "not a GAVMO vault file (bad magic)".to_owned(),
         ));
     }
-    if bytes[2] != VAULT_VERSION {
+    let (&version, rest) = rest.split_first().ok_or_else(truncated)?;
+    if version != VAULT_VERSION {
         return Err(SecretError::Backend(format!(
-            "unsupported vault version {} (this build understands {VAULT_VERSION})",
-            bytes[2]
+            "unsupported vault version {version} (this build understands {VAULT_VERSION})"
         )));
     }
+    let (nonce, ciphertext) = rest
+        .split_first_chunk::<NONCE_LEN>()
+        .ok_or_else(truncated)?;
+    let nonce = XNonce::from(*nonce);
 
-    let nonce = XNonce::try_from(&bytes[HEADER..HEADER + NONCE_LEN])
-        .map_err(|_| SecretError::Backend("vault nonce is malformed".to_string()))?;
-    let ciphertext = &bytes[HEADER + NONCE_LEN..];
-    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
-        // Wrong key and tampering are indistinguishable here.
-        SecretError::Backend(
-            "vault could not be decrypted (wrong key or the file was tampered with/corrupted)"
-                .to_string(),
-        )
-    })?;
+    // `aead::Error` is deliberately opaque: wrong key and tampering are
+    // indistinguishable, so there is no detail to keep.
+    let plaintext =
+        cipher
+            .decrypt(&nonce, ciphertext)
+            .map_err(|chacha20poly1305::aead::Error| {
+                SecretError::Backend(
+                "vault could not be decrypted (wrong key or the file was tampered with/corrupted)"
+                    .to_owned(),
+            )
+            })?;
     serde_json::from_slice(&plaintext)
         .map_err(|e| SecretError::Backend(format!("vault contents are not valid JSON: {e}")))
 }
 
-/// `0600` on Unix. No-op elsewhere: Windows inherits ACLs from the profile dir.
+/// A temp-file builder for vault writes: `0600` on Unix, applied at creation
+/// (also `tempfile`'s default, but this must never silently regress).
+/// Elsewhere the platform default applies (`tempfile` rejects explicit
+/// permissions there); Windows inherits ACLs from the per-user profile dir.
+fn private_tempfile_builder() -> tempfile::Builder<'static, 'static> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".secrets.vault.").suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    builder
+}
+
+/// Creates `dir` (and parents) with mode `0700` on Unix where they don't yet
+/// exist. Existing directories are left as they are.
+fn create_private_dir_all(dir: &Path) -> Result<(), SecretError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(dir)
+        .map_err(|e| SecretError::Backend(format!("creating {}: {e}", dir.display())))
+}
+
+/// Fsyncs a directory so a rename inside it is durable. Unix only: Windows
+/// can't open directories this way and `MoveFileEx` semantics differ.
 #[cfg(unix)]
-fn set_owner_only_perms(path: &Path) -> Result<(), SecretError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| SecretError::Backend(format!("chmod {}: {e}", path.display())))
+fn sync_dir(dir: &Path) -> Result<(), SecretError> {
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| SecretError::Backend(format!("syncing {}: {e}", dir.display())))
 }
 
 #[cfg(not(unix))]
-fn set_owner_only_perms(_path: &Path) -> Result<(), SecretError> {
+fn sync_dir(_dir: &Path) -> Result<(), SecretError> {
     Ok(())
 }
 
@@ -588,7 +669,10 @@ mod tests {
         let first = std::fs::read(&path).unwrap();
         store.set("k", "v").unwrap();
         let second = std::fs::read(&path).unwrap();
-        assert_ne!(first, second, "nonce (and thus ciphertext) must change per write");
+        assert_ne!(
+            first, second,
+            "nonce (and thus ciphertext) must change per write"
+        );
     }
 
     #[cfg(unix)]
@@ -601,6 +685,102 @@ mod tests {
         store.set("k", "v").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "vault must be chmod 0600");
+    }
+
+    /// A failed write must not leave memory ahead of disk: `get` would serve a
+    /// value that silently disappears on restart.
+    #[test]
+    fn vault_failed_write_leaves_memory_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        let store = VaultStore::open(sub.join("secrets.vault"), &fixed(1)).unwrap();
+        // A *file* where the vault's directory should be makes every flush fail.
+        std::fs::write(&sub, b"").unwrap();
+
+        assert!(store.set("k", "v").is_err());
+        assert_eq!(store.get("k").unwrap(), None);
+    }
+
+    #[test]
+    fn vault_failed_delete_keeps_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        let store = VaultStore::open(sub.join("secrets.vault"), &fixed(1)).unwrap();
+        store.set("k", "v").unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, b"").unwrap();
+
+        assert!(store.delete("k").is_err());
+        assert_eq!(store.get("k").unwrap(), Some("v".to_owned()));
+    }
+
+    #[test]
+    fn vault_write_leaves_no_temp_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VaultStore::open(vault_path(&dir), &fixed(1)).unwrap();
+        store.set("a", "1").unwrap();
+        store.set("b", "2").unwrap();
+        store.delete("a").unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["secrets.vault"]);
+    }
+
+    #[test]
+    fn vault_rejects_truncated_files_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(&dir);
+        for len in 0..=(3 + 24) {
+            let mut bytes = vec![0u8; len];
+            if len >= 2 {
+                bytes[..2].copy_from_slice(&VAULT_MAGIC);
+            }
+            if len >= 3 {
+                bytes[2] = VAULT_VERSION;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                VaultStore::open(&path, &fixed(1)).is_err(),
+                "a {len}-byte vault must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn vault_rejects_an_unknown_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(&dir);
+        let mut bytes = vec![0u8; 64];
+        bytes[..2].copy_from_slice(&VAULT_MAGIC);
+        bytes[2] = VAULT_VERSION + 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let Err(SecretError::Backend(msg)) = VaultStore::open(&path, &fixed(1)) else {
+            panic!("expected an error");
+        };
+        assert!(msg.contains("unsupported vault version"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_creates_its_directory_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("new-dir");
+        let store = VaultStore::open(sub.join("secrets.vault"), &fixed(1)).unwrap();
+        store.set("k", "v").unwrap();
+        let mode = std::fs::metadata(&sub).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn memory_store_debug_does_not_print_values() {
+        let store = MemoryStore::new();
+        store.set("name", "hunter2").unwrap();
+        let debug = format!("{store:?}");
+        assert!(debug.contains("name"), "{debug}");
+        assert!(!debug.contains("hunter2"), "{debug}");
     }
 
     #[test]

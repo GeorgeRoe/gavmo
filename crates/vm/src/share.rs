@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::{Child, Command};
 
 use crate::error::{Error, Result};
+use crate::fsutil::remove_if_exists;
 
 /// A single host directory exposed to the guest.
 #[derive(Debug, Clone)]
@@ -78,11 +79,12 @@ impl ShareBackend for VirtiofsShare {
         let socket_path = Self::socket_path(state_dir, spec.mount_tag);
 
         // A stale socket from a crashed boot would make virtiofsd fail to
-        // bind.
-        let _ = std::fs::remove_file(&socket_path);
+        // bind. Absent is the normal case; anything else would only resurface
+        // later as an opaque virtiofsd/qemu failure, so report it now.
+        remove_if_exists(&socket_path)?;
 
-        let meta = std::fs::metadata(&spec.host_path).map_err(|source| Error::Spawn {
-            program: format!("virtiofsd (stat {})", spec.host_path.display()),
+        let meta = std::fs::metadata(&spec.host_path).map_err(|source| Error::Stat {
+            path: spec.host_path.clone(),
             source,
         })?;
 
@@ -102,6 +104,7 @@ impl ShareBackend for VirtiofsShare {
 
 /// Builds the `virtiofsd` argument list for one share. Pure (host owner
 /// passed in rather than stat'd) for unit testing.
+#[expect(clippy::similar_names, reason = "uid/gid are the conventional names")]
 fn build_virtiofsd_args(
     socket_path: &Path,
     spec: &ShareSpec,

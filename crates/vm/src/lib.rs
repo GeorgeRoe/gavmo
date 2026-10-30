@@ -8,6 +8,7 @@
 mod config;
 mod disk;
 mod error;
+mod fsutil;
 mod handle;
 mod health;
 mod qemu;

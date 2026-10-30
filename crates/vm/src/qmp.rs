@@ -13,20 +13,20 @@ use qapi::qmp;
 use crate::error::{Error, Result};
 
 /// Query VM execution status (e.g. whether it's running or still booting).
-pub async fn query_status(socket_path: &Path) -> Result<qmp::StatusInfo> {
+pub(crate) async fn query_status(socket_path: &Path) -> Result<qmp::StatusInfo> {
     execute(socket_path, qmp::query_status {}).await
 }
 
 /// Requests a graceful ACPI shutdown. Does not wait for the guest to
 /// actually power off; callers should poll the qemu process and/or
 /// `query_status` afterwards.
-pub async fn system_powerdown(socket_path: &Path) -> Result<()> {
+pub(crate) async fn system_powerdown(socket_path: &Path) -> Result<()> {
     execute(socket_path, qmp::system_powerdown {}).await?;
     Ok(())
 }
 
 /// Forces QEMU to exit immediately, bypassing any guest shutdown sequence.
-pub async fn quit(socket_path: &Path) -> Result<()> {
+pub(crate) async fn quit(socket_path: &Path) -> Result<()> {
     execute(socket_path, qmp::quit {}).await?;
     Ok(())
 }
@@ -39,7 +39,10 @@ fn balloon_qom_path() -> String {
 
 /// Sets how often (in seconds) the guest's balloon driver reports memory
 /// stats to qemu. Until this is set, [`guest_memory`] never has readings.
-pub async fn set_balloon_stats_interval(socket_path: &Path, interval_secs: u32) -> Result<()> {
+pub(crate) async fn set_balloon_stats_interval(
+    socket_path: &Path,
+    interval_secs: u32,
+) -> Result<()> {
     execute(
         socket_path,
         qmp::qom_set {

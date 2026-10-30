@@ -299,7 +299,9 @@ pub async fn forward(
 
     let method = match reqwest::Method::from_bytes(method_str.as_bytes()) {
         Ok(method) => method,
-        Err(_) => return mcp::ToolOutcome::Error(format!("invalid HTTP method: {method_str}")),
+        Err(e) => {
+            return mcp::ToolOutcome::Error(format!("invalid HTTP method {method_str:?}: {e}"));
+        }
     };
 
     let Some(secret_value) = secret_value else {
@@ -380,9 +382,13 @@ fn apply_auth(
 ) -> Result<reqwest::RequestBuilder, String> {
     match scheme {
         AuthScheme::Basic => {
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "serde_json errors can quote the input, i.e. the secret; never surface it"
+            )]
             let cred: BasicCredential = serde_json::from_str(secret_value).map_err(|_| {
                 "stored credential for basic auth must be JSON {\"username\",\"password\"}"
-                    .to_string()
+                    .to_owned()
             })?;
             Ok(request.basic_auth(cred.username, Some(cred.password)))
         }
@@ -407,16 +413,12 @@ fn token_from_secret(secret_value: &str) -> String {
 /// Truncates to [`MAX_RESPONSE_BYTES`] on a char boundary, with a notice.
 fn cap_response(text: &str) -> String {
     if text.len() <= MAX_RESPONSE_BYTES {
-        return text.to_string();
+        return text.to_owned();
     }
-    let mut end = MAX_RESPONSE_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n\n[... response truncated at {MAX_RESPONSE_BYTES} bytes ...]",
-        &text[..end]
-    )
+    let end = text.floor_char_boundary(MAX_RESPONSE_BYTES);
+    // `end` is a char boundary within `text`, so `get` always succeeds.
+    let head = text.get(..end).unwrap_or_default();
+    format!("{head}\n\n[... response truncated at {MAX_RESPONSE_BYTES} bytes ...]")
 }
 
 #[cfg(test)]
@@ -424,20 +426,20 @@ mod tests {
     use super::*;
     use secrets::{MemoryStore, SecretStore};
 
-    const JIRA_CONFIG: &str = r#"
+    const JIRA_CONFIG: &str = r"
 tools:
   dafni-jira:
     type: http
     base_url: https://dafni.atlassian.net
     auth: basic
     secret: jira-cred
-"#;
+";
 
     fn jira_config() -> GavmoConfig {
         toolspec::parse_config(JIRA_CONFIG).unwrap()
     }
 
-    /// A MemoryStore with the jira secret configured for `workspace_id`.
+    /// A `MemoryStore` with the jira secret configured for `workspace_id`.
     fn store_with_secret(workspace_id: &str) -> MemoryStore {
         let store = MemoryStore::new();
         let key = secrets::secret_key(workspace_id, "jira-cred");
@@ -535,7 +537,7 @@ tools:
         }
     }
 
-    fn args(json: serde_json::Value) -> Map<String, Value> {
+    fn args(json: Value) -> Map<String, Value> {
         serde_json::from_value(json).unwrap()
     }
 
@@ -588,13 +590,13 @@ tools:
         .await;
         match outcome {
             mcp::ToolOutcome::Error(text) => assert!(text.contains("no credential"), "{text}"),
-            other => panic!("expected error, got {other:?}"),
+            other @ mcp::ToolOutcome::Success(_) => panic!("expected error, got {other:?}"),
         }
     }
 
     // --- URL binding ---
 
-    /// A properly-bound Basic credential for the jira integration's own base_url.
+    /// A properly-bound Basic credential for the jira integration's own `base_url`.
     fn bound_jira_secret() -> String {
         let url = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
         wrap_stored_secret(&url, r#"{"username":"a@b.c","password":"t"}"#)
@@ -654,7 +656,7 @@ tools:
         .await;
         match outcome {
             mcp::ToolOutcome::Error(text) => assert!(text.contains("re-confirm"), "{text}"),
-            other => panic!("expected binding error, got {other:?}"),
+            other @ mcp::ToolOutcome::Success(_) => panic!("expected binding error, got {other:?}"),
         }
     }
 
@@ -670,7 +672,7 @@ tools:
         .await;
         match outcome {
             mcp::ToolOutcome::Error(text) => assert!(text.contains("not bound"), "{text}"),
-            other => panic!("expected binding error, got {other:?}"),
+            other @ mcp::ToolOutcome::Success(_) => panic!("expected binding error, got {other:?}"),
         }
     }
 
@@ -687,12 +689,19 @@ tools:
         );
 
         assert_eq!(classify_binding(base, None), BindingState::NotConfigured);
-        assert_eq!(classify_binding(base, Some(&good)), BindingState::Configured);
+        assert_eq!(
+            classify_binding(base, Some(&good)),
+            BindingState::Configured
+        );
         match classify_binding(base, Some(&bad)) {
             BindingState::DestinationChanged { bound_url } => {
                 assert_eq!(
                     bound_url.as_deref(),
-                    Some(toolspec::canonical_base_url("https://evil.com").unwrap().as_str())
+                    Some(
+                        toolspec::canonical_base_url("https://evil.com")
+                            .unwrap()
+                            .as_str()
+                    )
                 );
             }
             other => panic!("expected DestinationChanged, got {other:?}"),

@@ -104,7 +104,7 @@ pub enum ValidationError {
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("YAML parse error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yaml_ng::Error),
     #[error(transparent)]
     Validation(#[from] ValidationError),
 }
@@ -128,7 +128,7 @@ pub enum HostLockError {
 
 /// Parses and validates a `gavmo.yaml` document.
 pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
-    let config: GavmoConfig = serde_yaml::from_str(yaml)?;
+    let config: GavmoConfig = serde_yaml_ng::from_str(yaml)?;
     for (id, def) in &config.tools {
         def.validate(id)?;
     }
@@ -159,10 +159,9 @@ pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
 
     // A single leading `/` means "under the base", not "from the host root".
     // `//host` is left intact so the origin check rejects it.
-    let relative_path = if path.starts_with('/') && !path.starts_with("//") {
-        &path[1..]
-    } else {
-        path
+    let relative_path = match path.strip_prefix('/') {
+        Some(rest) if !rest.starts_with('/') => rest,
+        _ => path,
     };
 
     let resolved = base
@@ -250,14 +249,14 @@ tools:
 
     #[test]
     fn rejects_header_auth_without_header_name() {
-        let yaml = r#"
+        let yaml = r"
 tools:
   t:
     type: http
     base_url: https://a.example.com
     auth: header
     secret: s
-"#;
+";
         let err = parse_config(yaml).unwrap_err();
         assert!(matches!(
             err,
@@ -284,14 +283,14 @@ tools:
 
     #[test]
     fn rejects_unknown_tool_type() {
-        let yaml = r#"
+        let yaml = r"
 tools:
   t:
     type: smtp
     base_url: https://a.example.com
     auth: bearer
     secret: s
-"#;
+";
         assert!(matches!(parse_config(yaml), Err(ParseError::Yaml(_))));
     }
 
@@ -440,8 +439,14 @@ tools:
     #[test]
     fn canonical_base_url_distinguishes_host_port_and_scheme() {
         let base = canonical_base_url("https://h.example.com").unwrap();
-        assert_ne!(base, canonical_base_url("https://evil.example.com").unwrap());
-        assert_ne!(base, canonical_base_url("https://h.example.com:8443").unwrap());
+        assert_ne!(
+            base,
+            canonical_base_url("https://evil.example.com").unwrap()
+        );
+        assert_ne!(
+            base,
+            canonical_base_url("https://h.example.com:8443").unwrap()
+        );
         assert_ne!(base, canonical_base_url("http://h.example.com").unwrap());
     }
 

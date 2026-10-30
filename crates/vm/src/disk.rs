@@ -12,7 +12,7 @@ const OVERLAY_DISK_SIZE: &str = "32G";
 /// Builds the `qemu-img create` argument list for a copy-on-write overlay
 /// backed by a read-only base image. Pure, for unit testing without
 /// `qemu-img` installed.
-pub fn build_overlay_args(base_image: &Path, overlay_path: &Path) -> Vec<String> {
+pub(crate) fn build_overlay_args(base_image: &Path, overlay_path: &Path) -> Vec<String> {
     vec![
         "create".to_string(),
         "-f".to_string(),
@@ -29,9 +29,9 @@ pub fn build_overlay_args(base_image: &Path, overlay_path: &Path) -> Vec<String>
 /// Ensures the per-workspace overlay disk exists, creating it backed by
 /// `base_image` if missing. The base image is never modified.
 ///
-/// An existing overlay is left untouched so `/nix` and OpenCode session
+/// An existing overlay is left untouched so `/nix` and `OpenCode` session
 /// state persist across restarts.
-pub async fn ensure_overlay(base_image: &Path, overlay_path: &Path) -> Result<()> {
+pub(crate) async fn ensure_overlay(base_image: &Path, overlay_path: &Path) -> Result<()> {
     if overlay_path.exists() {
         return Ok(());
     }

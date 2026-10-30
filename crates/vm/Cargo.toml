@@ -1,12 +1,23 @@
 [package]
 name = "vm"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["process", "net", "rt-multi-thread", "macros", "time", "io-util", "fs", "sync", "signal"] }
+tokio = { workspace = true, features = ["process", "net", "rt", "time", "io-util", "fs", "sync"] }
 qapi = { version = "0.15", features = ["qmp"] }
-thiserror = "2"
+thiserror.workspace = true
 # Direct dep: `qapi_spec::Any` (QOM property values, e.g. balloon stats)
 # is `serde_json::Value`.
-serde_json = "1"
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Runtime flavours/macros/signal handling are only needed by tests and the
+# `boot` example, not by the library.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tempfile.workspace = true
