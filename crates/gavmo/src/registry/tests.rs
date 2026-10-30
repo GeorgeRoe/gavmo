@@ -913,14 +913,21 @@ async fn a_dead_vm_becomes_failed_and_can_be_reopened() {
     open_and_run(&state, &script, &id).await;
     let token = current_token(&state, &id).unwrap();
 
-    script.set_status(VmStatus::Failed {
-        reason: "qemu exited: signal 9".to_owned(),
-    });
+    script.set_status(VmStatus::Failed(vm::VmFailure::QemuExited(
+        std::os::unix::process::ExitStatusExt::from_raw(9),
+    )));
     // Noticed by the monitor, not by the status read.
     eventually("Failed", async || {
         matches!(state.status(&id).await, WorkspaceStatus::Failed { .. })
     })
     .await;
+    // The reason is readable (Display, not `ExitStatus(unix_wait_status(9))`).
+    assert_eq!(
+        state.status(&id).await,
+        WorkspaceStatus::Failed {
+            reason: "qemu exited (signal: 9 (SIGKILL))".to_owned()
+        }
+    );
     assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Failed(_)))).await);
     assert_eq!(TokenAuthority::resolve(&state, &token), None);
     eventually("dead VM reaped", async || script.stops() == 1).await;

@@ -531,8 +531,8 @@ impl AppState {
                 };
                 // The `vm` crate reports `Failed` only for an exited (or
                 // unwaitable) qemu.
-                if let VmStatus::Failed { reason } = status {
-                    if state.mark_dead(&id, reason).await {
+                if let VmStatus::Failed(failure) = status {
+                    if state.mark_dead(&id, failure.to_string()).await {
                         return;
                     }
                     continue;
@@ -641,11 +641,12 @@ pub(super) fn slot_status(slot: &VmSlot) -> WorkspaceStatus {
 /// the browser.
 pub(super) fn to_status(status: VmStatus) -> WorkspaceStatus {
     match status {
-        VmStatus::Stopped => WorkspaceStatus::Stopped,
         VmStatus::Booting => WorkspaceStatus::Booting,
         VmStatus::Running { url } => WorkspaceStatus::Running {
             url: format!("{url}{OPENCODE_WORKSPACE_SESSION_PATH}"),
         },
-        VmStatus::Failed { reason } => WorkspaceStatus::Failed { reason },
+        VmStatus::Failed(failure) => WorkspaceStatus::Failed {
+            reason: failure.to_string(),
+        },
     }
 }

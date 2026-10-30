@@ -27,16 +27,27 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// control panel's Memory stat is only as fresh as this.
 const BALLOON_STATS_INTERVAL_SECS: u32 = 2;
 
+/// A booted VM's state, from [`RunningVm::status`]. A VM that isn't running
+/// has no [`RunningVm`], so there is no "stopped" state here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmStatus {
-    /// Not running (either never booted, or cleanly stopped).
-    Stopped,
     /// The qemu process is alive but `opencode web` isn't answering yet.
     Booting,
     /// `opencode web` is reachable at `url`.
     Running { url: String },
-    /// The qemu process exited unexpectedly or a health check failed hard.
-    Failed { reason: String },
+    /// The VM is gone; the daemon should treat it as dead.
+    Failed(VmFailure),
+}
+
+/// Why a booted VM is [`VmStatus::Failed`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VmFailure {
+    /// qemu exited (crashed, was killed, or the guest powered off).
+    #[error("qemu exited ({0})")]
+    QemuExited(std::process::ExitStatus),
+    /// qemu's state couldn't be read, so it can't be trusted to be alive.
+    #[error("failed to check the qemu process: {0}")]
+    Unwaitable(String),
 }
 
 /// A booted VM: owns the qemu process, its `virtiofsd` helpers, and the
@@ -161,15 +172,11 @@ impl RunningVm {
     pub async fn status(&mut self) -> VmStatus {
         match self.qemu.try_wait() {
             Ok(Some(exit)) => {
-                return VmStatus::Failed {
-                    reason: format!("qemu exited: {exit:?}"),
-                };
+                return VmStatus::Failed(VmFailure::QemuExited(exit));
             }
             Ok(None) => {}
             Err(e) => {
-                return VmStatus::Failed {
-                    reason: format!("failed to check qemu process: {e}"),
-                };
+                return VmStatus::Failed(VmFailure::Unwaitable(e.to_string()));
             }
         }
 

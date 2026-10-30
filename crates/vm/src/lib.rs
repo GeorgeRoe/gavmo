@@ -20,6 +20,6 @@ pub mod stats;
 pub use config::{GUEST_OPENCODE_PORT, VmConfig};
 pub use error::{Error, Result};
 pub use fsutil::create_private_dir_all;
-pub use handle::{RunningVm, VmStatus};
+pub use handle::{RunningVm, VmFailure, VmStatus};
 pub use process::reap_stale;
 pub use qmp::{GuestMemory, guest_memory};
