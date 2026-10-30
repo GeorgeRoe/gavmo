@@ -10,8 +10,30 @@ use serde_json::{Map, Value};
 use toolspec::{AuthScheme, GavmoConfig, ToolDef};
 
 /// Cap on a tool response returned to the agent, so one call cannot flood
-/// the model's context.
+/// the model's context. Also the most the daemon ever buffers per response:
+/// the body is streamed and reading stops here.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Upper bound on a whole forwarded request, so a hung upstream can't pin a
+/// tool call (and its gateway task) forever.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The HTTP client every forwarded tool call must go through.
+///
+/// Redirects are **never** followed: `reqwest` strips `Authorization` and
+/// `Cookie` on a cross-host redirect, but not custom headers (`auth: header`,
+/// e.g. `X-API-Key`), so an open redirect on the approved origin would hand
+/// the credential to any host. Even same-origin redirects could leave the
+/// approved path prefix. A 3xx is returned to the agent instead, with its
+/// `Location`, so it can re-issue the request through the host-lock.
+pub fn forwarding_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+}
 
 /// Shape of a stored Basic-auth credential (e.g. Jira Cloud: `email` as
 /// `username` + API token as `password`).
@@ -338,12 +360,24 @@ pub async fn forward(
         Err(e) => return mcp::ToolOutcome::Error(format!("request failed: {e}")),
     };
     let status = response.status();
-    let text = match response.text().await {
-        Ok(text) => text,
+    // Surfaced so the agent can follow a redirect itself, through the
+    // host-lock; the client never follows one (see `forwarding_client`).
+    let location = status
+        .is_redirection()
+        .then(|| response.headers().get(reqwest::header::LOCATION))
+        .flatten()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    let body = match read_capped(response, MAX_RESPONSE_BYTES).await {
+        Ok(body) => body,
         Err(e) => return mcp::ToolOutcome::Error(format!("failed to read response body: {e}")),
     };
 
-    let payload = format!("HTTP {}\n\n{}", status.as_u16(), cap_response(&text));
+    let redirect_note = location.map_or_else(String::new, |location| {
+        format!(
+            "Location: {location}\n(redirects are not followed; request that path explicitly if it is on this integration)\n"
+        )
+    });
+    let payload = format!("HTTP {}\n{redirect_note}\n{body}", status.as_u16());
     if status.is_success() {
         mcp::ToolOutcome::Success(payload)
     } else {
@@ -410,15 +444,39 @@ fn token_from_secret(secret_value: &str) -> String {
     }
 }
 
-/// Truncates to [`MAX_RESPONSE_BYTES`] on a char boundary, with a notice.
-fn cap_response(text: &str) -> String {
-    if text.len() <= MAX_RESPONSE_BYTES {
-        return text.to_owned();
+/// Streams at most `limit` bytes of the body - never buffering more, however
+/// large the upstream response - and decodes it lossily, with a notice if
+/// anything was cut off.
+async fn read_capped(mut response: reqwest::Response, limit: usize) -> reqwest::Result<String> {
+    let mut buf = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = response.chunk().await? {
+        let room = limit.saturating_sub(buf.len());
+        if chunk.len() > room {
+            buf.extend_from_slice(chunk.get(..room).unwrap_or_default());
+            truncated = true;
+            break;
+        }
+        buf.extend_from_slice(&chunk);
     }
-    let end = text.floor_char_boundary(MAX_RESPONSE_BYTES);
-    // `end` is a char boundary within `text`, so `get` always succeeds.
-    let head = text.get(..end).unwrap_or_default();
-    format!("{head}\n\n[... response truncated at {MAX_RESPONSE_BYTES} bytes ...]")
+    Ok(decode_capped(&buf, truncated, limit))
+}
+
+/// Decodes a (possibly cut-off) body. A cut can land inside a multi-byte
+/// character; that incomplete tail is dropped rather than shown as `�`.
+fn decode_capped(buf: &[u8], truncated: bool, limit: usize) -> String {
+    let text = match std::str::from_utf8(buf) {
+        Ok(text) => text.to_owned(),
+        Err(e) if truncated && e.error_len().is_none() => {
+            String::from_utf8_lossy(buf.get(..e.valid_up_to()).unwrap_or_default()).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(buf).into_owned(),
+    };
+    if truncated {
+        format!("{text}\n\n[... response truncated at {limit} bytes ...]")
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
@@ -786,23 +844,146 @@ tools:
     }
 
     #[test]
-    fn cap_response_passes_small_bodies_through_unchanged() {
-        assert_eq!(cap_response("hello"), "hello");
+    fn decode_capped_passes_small_bodies_through_unchanged() {
+        assert_eq!(decode_capped(b"hello", false, 10), "hello");
     }
 
     #[test]
-    fn cap_response_truncates_oversized_bodies_on_a_char_boundary() {
-        let big = "a".repeat(MAX_RESPONSE_BYTES + 100);
-        let capped = cap_response(&big);
-        assert!(capped.len() < big.len());
-        assert!(capped.contains("truncated"));
+    fn decode_capped_drops_a_split_multibyte_tail() {
+        // "é" is 0xC3 0xA9; cut after the first byte.
+        let capped = decode_capped(b"ab\xC3", true, 3);
+        assert_eq!(capped, "ab\n\n[... response truncated at 3 bytes ...]");
     }
 
     #[test]
-    fn cap_response_truncation_never_splits_a_multibyte_char() {
-        // Slicing off a char boundary would panic.
-        let big = "é".repeat(MAX_RESPONSE_BYTES); // 2 bytes each
-        let capped = cap_response(&big);
-        assert!(capped.contains("truncated"));
+    fn decode_capped_keeps_invalid_utf8_visible_when_not_truncated() {
+        assert_eq!(decode_capped(b"a\xFFb", false, 10), "a\u{FFFD}b");
+    }
+
+    // --- forward() against a real local server ---
+
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+
+    /// Serves `router` on an ephemeral loopback port; returns its base URL.
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A header-auth integration at `base_url`, plus a correctly bound secret.
+    fn header_integration(base_url: &str) -> (ResolvedIntegration, String) {
+        let yaml = format!(
+            "tools:\n  t:\n    type: http\n    base_url: {base_url}\n    auth: header\n    header_name: X-API-Key\n    secret: s\n"
+        );
+        let mut config = toolspec::parse_config(&yaml).unwrap();
+        let integration = ResolvedIntegration {
+            id: "t".to_owned(),
+            def: config.tools.remove("t").unwrap(),
+            secret_key: "k".to_owned(),
+        };
+        let secret = wrap_stored_secret(
+            &toolspec::canonical_base_url(base_url).unwrap(),
+            r#"{"token":"SUPER-SECRET"}"#,
+        );
+        (integration, secret)
+    }
+
+    /// The credential must never reach another origin via a redirect: custom
+    /// headers are not stripped by reqwest on cross-host redirects.
+    #[tokio::test]
+    async fn forward_never_follows_a_redirect_to_another_origin() {
+        let seen: Arc<Mutex<Vec<HeaderMap>>> = Arc::default();
+        let seen_by_evil = Arc::clone(&seen);
+        let evil = serve(Router::new().route(
+            "/steal",
+            get(move |headers: HeaderMap| async move {
+                seen_by_evil.lock().unwrap().push(headers);
+                "stolen"
+            }),
+        ))
+        .await;
+        let target = format!("{evil}/steal");
+        let origin = serve(Router::new().route(
+            "/go",
+            get(move || async move { axum::response::Redirect::temporary(&target) }),
+        ))
+        .await;
+
+        let (integration, secret) = header_integration(&origin);
+        let outcome = forward(
+            &integration,
+            Some(secret),
+            &args(serde_json::json!({"method": "GET", "path": "/go"})),
+            &forwarding_client().unwrap(),
+        )
+        .await;
+
+        match outcome {
+            mcp::ToolOutcome::Error(text) => {
+                assert!(text.starts_with("HTTP 307"), "{text}");
+                assert!(text.contains("Location: "), "{text}");
+            }
+            other @ mcp::ToolOutcome::Success(_) => panic!("expected a 3xx error, got {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_sends_the_credential_to_the_approved_origin() {
+        let origin = serve(Router::new().route(
+            "/me",
+            get(|headers: HeaderMap| async move {
+                headers
+                    .get("x-api-key")
+                    .map(|v| v.to_str().unwrap().to_owned())
+                    .unwrap_or_default()
+            }),
+        ))
+        .await;
+        let (integration, secret) = header_integration(&origin);
+        let outcome = forward(
+            &integration,
+            Some(secret),
+            &args(serde_json::json!({"method": "GET", "path": "/me"})),
+            &forwarding_client().unwrap(),
+        )
+        .await;
+        match outcome {
+            mcp::ToolOutcome::Success(text) => assert_eq!(text, "HTTP 200\n\nSUPER-SECRET"),
+            other @ mcp::ToolOutcome::Error(_) => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    /// A huge response is cut at the cap while streaming.
+    #[tokio::test]
+    async fn forward_caps_oversized_responses() {
+        let origin = serve(Router::new().route(
+            "/big",
+            get(|| async { "a".repeat(4 * MAX_RESPONSE_BYTES).into_response() }),
+        ))
+        .await;
+        let (integration, secret) = header_integration(&origin);
+        let outcome = forward(
+            &integration,
+            Some(secret),
+            &args(serde_json::json!({"method": "GET", "path": "/big"})),
+            &forwarding_client().unwrap(),
+        )
+        .await;
+        let mcp::ToolOutcome::Success(text) = outcome else {
+            panic!("expected success, got {outcome:?}");
+        };
+        assert!(text.ends_with("[... response truncated at 262144 bytes ...]"));
+        assert!(text.len() < MAX_RESPONSE_BYTES + 200, "{}", text.len());
     }
 }

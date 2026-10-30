@@ -149,7 +149,7 @@ impl AppState {
                 mcp_tokens: std::sync::Mutex::new(HashMap::new()),
                 secret_store,
                 workspace_integrations: std::sync::Mutex::new(HashMap::new()),
-                http_client: reqwest::Client::new(),
+                http_client: crate::integrations::forwarding_client().map_err(io::Error::other)?,
             }),
         })
     }
