@@ -136,7 +136,7 @@ impl AppState {
 
     /// [`Self::new`] with an explicit data dir and secret store, so tests
     /// never touch the user's real `~/.local/share/gavmo` or keyring.
-    fn with_data_dir(
+    pub(crate) fn with_data_dir(
         base_image: PathBuf,
         gcloud_dir: PathBuf,
         gavmo_data_dir: &Path,

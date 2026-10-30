@@ -7,18 +7,11 @@ mod daemon {
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::process::ExitCode;
-    use std::sync::Arc;
 
     use anyhow::{Context as _, Result, anyhow, bail};
-    use axum::Router;
-    use axum::body::Body;
-    use axum::extract::Request;
-    use axum::routing::post;
-    use gavmo::app::{App, shell};
     use gavmo::auth;
     use gavmo::registry::AppState;
-    use leptos::prelude::*;
-    use leptos_axum::{LeptosRoutes, generate_route_list, handle_server_fns_with_context};
+    use leptos::prelude::get_configuration;
 
     /// Startup configuration from the CLI and environment.
     struct Config {
@@ -96,11 +89,11 @@ mod daemon {
 
         let conf = get_configuration(None).context("failed to load Leptos configuration")?;
         let ui_addr = conf.leptos_options.site_addr;
-        let ui_router = build_ui_router(conf.leptos_options, &app_state, &auth);
+        let ui_router = gavmo::daemon::ui_router(conf.leptos_options, &app_state, &auth);
 
         // Separate port from the UI: guests must reach the bearer-authenticated
         // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
-        let mcp_router = Router::new().nest_service("/mcp", mcp::service(app_state.clone()));
+        let mcp_router = gavmo::daemon::mcp_router(&app_state);
         let mcp_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, mcp::GAVMO_MCP_PORT));
 
         // Bind both before announcing anything, so a port clash fails fast.
@@ -159,50 +152,6 @@ mod daemon {
         tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind the {what} to {addr}"))
-    }
-
-    fn build_ui_router(
-        leptos_options: LeptosOptions,
-        app_state: &AppState,
-        auth: &Arc<auth::Auth>,
-    ) -> Router {
-        let routes = generate_route_list(App);
-
-        let server_fn_route = {
-            let state = app_state.clone();
-            move |req: Request<Body>| {
-                let state = state.clone();
-                async move {
-                    handle_server_fns_with_context(move || provide_context(state.clone()), req)
-                        .await
-                }
-            }
-        };
-
-        Router::new()
-            // POST only; `auth::require_session` also refuses other methods.
-            .route("/api/{*fn_name}", post(server_fn_route))
-            .leptos_routes_with_context(
-                &leptos_options,
-                routes,
-                {
-                    let state = app_state.clone();
-                    move || provide_context(state.clone())
-                },
-                {
-                    let leptos_options = leptos_options.clone();
-                    move || shell(leptos_options.clone())
-                },
-            )
-            .fallback(leptos_axum::file_and_error_handler(shell))
-            .with_state(leptos_options)
-            // `/login` sits behind the auth layer too; it stays reachable only
-            // because `auth::is_public_path` allowlists it, not via layer order.
-            .merge(auth::login_router(Arc::clone(auth)))
-            .layer(axum::middleware::from_fn_with_state(
-                Arc::clone(auth),
-                auth::require_session,
-            ))
     }
 
     /// Prints the login URL to stdout (deliberately not via `tracing`, so the
