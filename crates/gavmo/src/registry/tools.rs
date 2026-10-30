@@ -128,7 +128,7 @@ impl AppState {
                         .description
                         .clone()
                         .unwrap_or_else(|| format!("HTTP access to {}", tool.def.base_url)),
-                    base_url: tool.def.base_url,
+                    base_url: tool.def.base_url.to_string(),
                     auth: tool.def.auth.as_str().to_owned(),
                     secret_name: tool.def.secret,
                     instructions: tool.def.instructions,
@@ -172,11 +172,12 @@ impl AppState {
         // approved, so a later `base_url` or `auth`/`header_name` change in the
         // untrusted `gavmo.yaml` fails closed instead of silently redirecting
         // or re-routing the token.
-        let canonical = toolspec::canonical_base_url(&tool.def.base_url).map_err(|e| {
-            RegistryError::InvalidInput(format!("tool base_url could not be canonicalized: {e}"))
-        })?;
-        let bound = crate::integrations::wrap_stored_secret(&canonical, delivery, credential)
-            .map_err(RegistryError::InvalidInput)?;
+        let bound = crate::integrations::wrap_stored_secret(
+            &tool.def.base_url.canonical(),
+            delivery,
+            credential,
+        )
+        .map_err(RegistryError::InvalidInput)?;
 
         self.secret_set(tool.secret_key, bound).await
     }

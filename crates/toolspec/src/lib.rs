@@ -1,6 +1,6 @@
 //! Parsing and validation of the per-repo `gavmo.yaml` tool config, plus the
-//! URL math that keeps credentials on their integration's origin: [`lock_url`]
-//! (host-locking) and [`canonical_base_url`] (URL-binding).
+//! URL math that keeps credentials on their integration's origin
+//! ([`BaseUrl::lock`], host-locking) and URL-binding ([`BaseUrl::canonical`]).
 //!
 //! `gavmo.yaml` is untrusted: a repo can request a tool and name a secret, but
 //! never supply a credential.
@@ -87,8 +87,8 @@ const FORBIDDEN_HEADERS: &[&str] = &[
 pub struct ToolDef {
     #[serde(rename = "type")]
     pub kind: ToolKind,
-    /// Every forwarded request is host-locked to this URL's origin.
-    pub base_url: String,
+    /// Every forwarded request is host-locked to this URL's origin and path.
+    pub base_url: BaseUrl,
     pub auth: AuthScheme,
     /// Name of the secret the user must supply (a reference, not a value).
     pub secret: String,
@@ -108,30 +108,14 @@ pub struct ToolDef {
 }
 
 impl ToolDef {
-    /// Checks everything that isn't structural:
+    /// Checks everything that isn't structural (`base_url` is already validated:
+    /// it is a [`BaseUrl`]):
     /// - `id`: 1-64 of `[A-Za-z0-9_-]`, not starting with `gavmo_`;
-    /// - `base_url`: http(s) with a host, and no userinfo, query or fragment
-    ///   (none of which can be part of a destination a credential is bound
-    ///   to);
     /// - `secret`: 1-128 of `[A-Za-z0-9_.-]`;
     /// - `header_name`: required for, and only allowed with, `auth: header`;
     ///   a valid header name that isn't framing/routing/credential-related.
     pub fn validate(&self, id: &str) -> Result<(), ValidationError> {
         validate_tool_id(id)?;
-        let bad_url = |reason: &str| ValidationError::BadBaseUrl {
-            id: id.to_owned(),
-            reason: reason.to_owned(),
-        };
-        let url = Url::parse(&self.base_url).map_err(|e| bad_url(&e.to_string()))?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err(bad_url("base_url must be an http(s) URL with a host"));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(bad_url("base_url must not contain user:password@"));
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(bad_url("base_url must not have a query or fragment"));
-        }
         if !is_name(&self.secret, MAX_SECRET_NAME_LEN, |c| {
             c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
         }) {
@@ -199,8 +183,6 @@ pub struct GavmoConfig {
 /// Problems found after a YAML document parses structurally.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
-    #[error("tool {id:?} has an invalid base_url: {reason}")]
-    BadBaseUrl { id: String, reason: String },
     #[error("tool {id:?} uses auth: header but has no header_name")]
     MissingHeaderName { id: String },
     #[error("tool {id:?} sets header_name but doesn't use auth: header")]
@@ -230,10 +212,6 @@ pub enum ParseError {
 /// Why a request couldn't be host-locked. Every variant means "refuse to send".
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum HostLockError {
-    #[error("integration base_url is not a valid URL: {0}")]
-    InvalidBaseUrl(String),
-    #[error("integration base_url has no host: {0}")]
-    BaseUrlHasNoHost(String),
     #[error("requested path produced an invalid URL: {0}")]
     InvalidResult(String),
     #[error(
@@ -271,101 +249,153 @@ pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
 
 // --- Host-lock ---
 
-/// Resolves an agent-supplied `path` under `base_url` and returns it only if it
-/// stays on the same scheme, host and port *and* under the base's path
-/// prefix, so credentials never leave the destination they were approved for.
+/// A tool's validated destination: an http(s) URL with a host and no
+/// userinfo, query or fragment (none of which can be part of a destination
+/// a credential is bound to). Parsed once, when `gavmo.yaml` is read, so the
+/// host-lock ([`Self::lock`]) and URL-binding ([`Self::canonical`]) work on
+/// a URL that is known to be well-formed instead of each re-parsing a string.
 ///
-/// `path` is relative to the base's full path, preserving prefixes such as
-/// `https://api.atlassian.com/ex/jira/<cloudId>`. `//host` and absolute URLs
-/// are deliberately not normalized, so the origin check still rejects them.
-pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
-    let mut base =
-        Url::parse(base_url).map_err(|e| HostLockError::InvalidBaseUrl(e.to_string()))?;
-    if base.host_str().is_none() {
-        return Err(HostLockError::BaseUrlHasNoHost(base_url.to_string()));
-    }
-
-    // Without a trailing `/`, `join` replaces the base's last segment.
-    if !base.path().ends_with('/') {
-        let with_slash = format!("{}/", base.path());
-        base.set_path(&with_slash);
-    }
-
-    // A single leading `/` means "under the base", not "from the host root".
-    // `//host` is left intact so the origin check rejects it.
-    let relative_path = match path.strip_prefix('/') {
-        Some(rest) if !rest.starts_with('/') => rest,
-        _ => path,
-    };
-
-    let resolved = base
-        .join(relative_path)
-        .map_err(|e| HostLockError::InvalidResult(e.to_string()))?;
-
-    // Effective port, so an implicit 443 equals an explicit `:443`.
-    let same_origin = resolved.scheme() == base.scheme()
-        && resolved.host_str() == base.host_str()
-        && resolved.port_or_known_default() == base.port_or_known_default();
-
-    if !same_origin {
-        return Err(HostLockError::HostMismatch {
-            expected: origin_string(&base),
-            requested: origin_string(&resolved),
-        });
-    }
-
-    // Userinfo in the request URL would override (or add) credentials.
-    if !resolved.username().is_empty() || resolved.password().is_some() {
-        return Err(HostLockError::Userinfo);
-    }
-
-    // The path prefix is part of the security boundary too (e.g. one tenant's
-    // `/ex/jira/<cloudId>/` on a shared gateway host). `Url::join` has already
-    // resolved `..`, `%2e%2e` and `\`, so a plain prefix check on the
-    // normalized path is sound. `base.path()` ends in `/`, so `/a/b` can't
-    // match a base of `/a/bc/`.
-    if !resolved.path().starts_with(base.path()) {
-        return Err(HostLockError::PathEscape {
-            base_path: base.path().to_owned(),
-            requested: resolved.path().to_owned(),
-        });
-    }
-
-    // `%2F`/`%5C` survive normalization as literal bytes, but many servers
-    // decode them before routing, which would turn `..%2F` back into a
-    // traversal on the far side.
-    let lower = resolved.path().to_ascii_lowercase();
-    if lower.contains("%2f") || lower.contains("%5c") {
-        return Err(HostLockError::EncodedSeparator(resolved.path().to_owned()));
-    }
-
-    Ok(resolved)
+/// Displays as written in `gavmo.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseUrl {
+    /// As written, for display.
+    raw: String,
+    /// Parsed, with the path ending in `/` (so `join` keeps the last segment
+    /// and the path-prefix check can't match `/a/bc/` for `/a/b`).
+    url: Url,
 }
 
-/// Canonical form of a `base_url` (scheme, host, effective port, path prefix)
-/// that a stored credential is bound to. Normalized like [`lock_url`] so the two
-/// agree on "same destination"; other fields are excluded to avoid re-prompts.
-pub fn canonical_base_url(base_url: &str) -> Result<String, HostLockError> {
-    let mut url = Url::parse(base_url).map_err(|e| HostLockError::InvalidBaseUrl(e.to_string()))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| HostLockError::BaseUrlHasNoHost(base_url.to_string()))?
-        .to_ascii_lowercase();
+/// Why a `base_url` was rejected.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BaseUrlError {
+    #[error("base_url is not a valid URL: {0}")]
+    Invalid(String),
+    #[error("base_url must be an http(s) URL with a host")]
+    NotHttpWithHost,
+    #[error("base_url must not contain user:password@")]
+    Userinfo,
+    #[error("base_url must not have a query or fragment")]
+    QueryOrFragment,
+}
 
-    // Same trailing-slash treatment as `lock_url`.
-    if !url.path().ends_with('/') {
-        let with_slash = format!("{}/", url.path());
-        url.set_path(&with_slash);
+impl BaseUrl {
+    /// Parses and validates a `base_url`.
+    pub fn parse(raw: &str) -> Result<Self, BaseUrlError> {
+        let mut url = Url::parse(raw).map_err(|e| BaseUrlError::Invalid(e.to_string()))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(BaseUrlError::NotHttpWithHost);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(BaseUrlError::Userinfo);
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(BaseUrlError::QueryOrFragment);
+        }
+        if !url.path().ends_with('/') {
+            let with_slash = format!("{}/", url.path());
+            url.set_path(&with_slash);
+        }
+        Ok(Self {
+            raw: raw.to_owned(),
+            url,
+        })
     }
 
-    let scheme = url.scheme().to_ascii_lowercase();
-    let port = url.port_or_known_default();
-    let path = url.path();
+    /// The URL as written in `gavmo.yaml`.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
 
-    Ok(match port {
-        Some(p) => format!("{scheme}://{host}:{p}{path}"),
-        None => format!("{scheme}://{host}{path}"),
-    })
+    /// Resolves an agent-supplied `path` under this base and returns it only
+    /// if it stays on the same scheme, host and port *and* under the base's
+    /// path prefix, so credentials never leave the destination they were
+    /// approved for.
+    ///
+    /// `path` is relative to the base's full path, preserving prefixes such
+    /// as `https://api.atlassian.com/ex/jira/<cloudId>`. `//host` and
+    /// absolute URLs are deliberately not normalized, so the origin check
+    /// still rejects them.
+    pub fn lock(&self, path: &str) -> Result<Url, HostLockError> {
+        let base = &self.url;
+
+        // A single leading `/` means "under the base", not "from the host
+        // root". `//host` is left intact so the origin check rejects it.
+        let relative_path = match path.strip_prefix('/') {
+            Some(rest) if !rest.starts_with('/') => rest,
+            _ => path,
+        };
+
+        let resolved = base
+            .join(relative_path)
+            .map_err(|e| HostLockError::InvalidResult(e.to_string()))?;
+
+        // Effective port, so an implicit 443 equals an explicit `:443`.
+        let same_origin = resolved.scheme() == base.scheme()
+            && resolved.host_str() == base.host_str()
+            && resolved.port_or_known_default() == base.port_or_known_default();
+
+        if !same_origin {
+            return Err(HostLockError::HostMismatch {
+                expected: origin_string(base),
+                requested: origin_string(&resolved),
+            });
+        }
+
+        // Userinfo in the request URL would override (or add) credentials.
+        if !resolved.username().is_empty() || resolved.password().is_some() {
+            return Err(HostLockError::Userinfo);
+        }
+
+        // The path prefix is part of the security boundary too (e.g. one
+        // tenant's `/ex/jira/<cloudId>/` on a shared gateway host).
+        // `Url::join` has already resolved `..`, `%2e%2e` and `\`, so a plain
+        // prefix check on the normalized path is sound.
+        if !resolved.path().starts_with(base.path()) {
+            return Err(HostLockError::PathEscape {
+                base_path: base.path().to_owned(),
+                requested: resolved.path().to_owned(),
+            });
+        }
+
+        // `%2F`/`%5C` survive normalization as literal bytes, but many
+        // servers decode them before routing, which would turn `..%2F` back
+        // into a traversal on the far side.
+        let lower = resolved.path().to_ascii_lowercase();
+        if lower.contains("%2f") || lower.contains("%5c") {
+            return Err(HostLockError::EncodedSeparator(resolved.path().to_owned()));
+        }
+
+        Ok(resolved)
+    }
+
+    /// The canonical destination (scheme, host, effective port, path prefix)
+    /// a stored credential is bound to. Normalized like [`Self::lock`] so the
+    /// two agree on "same destination"; nothing else is included, to avoid
+    /// needless re-prompts.
+    pub fn canonical(&self) -> String {
+        let url = &self.url;
+        let scheme = url.scheme().to_ascii_lowercase();
+        // `parse` guarantees a host.
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let path = url.path();
+        match url.port_or_known_default() {
+            Some(p) => format!("{scheme}://{host}:{p}{path}"),
+            None => format!("{scheme}://{host}{path}"),
+        }
+    }
+}
+
+impl fmt::Display for BaseUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for BaseUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
 }
 
 fn origin_string(u: &Url) -> String {
@@ -379,6 +409,21 @@ fn origin_string(u: &Url) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host-lock tests predate [`BaseUrl`]; these keep them readable.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "an invalid test base URL is a bug in the test"
+    )]
+    fn lock_url(base: &str, path: &str) -> Result<Url, HostLockError> {
+        BaseUrl::parse(base)
+            .expect("test base URLs are valid")
+            .lock(path)
+    }
+
+    fn canonical_base_url(base: &str) -> Result<String, BaseUrlError> {
+        BaseUrl::parse(base).map(|b| b.canonical())
+    }
 
     #[test]
     fn parses_gavmo_config_with_inline_tools() {
@@ -401,7 +446,7 @@ tools:
         let jira = config.tools.get("dafni-jira").expect("jira tool");
         assert_eq!(jira.kind, ToolKind::Http);
         assert_eq!(jira.auth, AuthScheme::Basic);
-        assert_eq!(jira.base_url, "https://dafni.atlassian.net");
+        assert_eq!(jira.base_url.as_str(), "https://dafni.atlassian.net");
         assert_eq!(jira.secret, "jira-cred");
         let proj = config.tools.get("project-docs").expect("inline tool");
         assert_eq!(proj.auth, AuthScheme::Bearer);
@@ -434,11 +479,12 @@ tools:
     auth: bearer
     secret: s
 "#;
-        let err = parse_config(yaml).unwrap_err();
-        assert!(matches!(
-            err,
-            ParseError::Validation(ValidationError::BadBaseUrl { .. })
-        ));
+        let err = parse_config(yaml).unwrap_err().to_string();
+        // Reported with the tool's location in the file.
+        assert!(
+            err.contains("tools.t") && err.contains("must be an http(s) URL with a host"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -682,10 +728,26 @@ tools:
     }
 
     #[test]
-    fn canonical_base_url_drops_query_and_fragment() {
+    fn base_url_parse_rejects_what_cannot_be_a_destination() {
+        for (url, want) in [
+            ("ftp://h.example.com", BaseUrlError::NotHttpWithHost),
+            ("https://u:p@h.example.com", BaseUrlError::Userinfo),
+            (
+                "https://h.example.com/base?x=1",
+                BaseUrlError::QueryOrFragment,
+            ),
+            (
+                "https://h.example.com/base#frag",
+                BaseUrlError::QueryOrFragment,
+            ),
+        ] {
+            assert_eq!(BaseUrl::parse(url), Err(want), "{url}");
+        }
+        let base = BaseUrl::parse("https://H.example.com/base").unwrap();
         assert_eq!(
-            canonical_base_url("https://h.example.com/base?x=1#frag").unwrap(),
-            canonical_base_url("https://h.example.com/base").unwrap()
+            base.to_string(),
+            "https://H.example.com/base",
+            "displays as written"
         );
     }
 
@@ -693,7 +755,7 @@ tools:
     fn canonical_base_url_rejects_a_non_url() {
         assert!(matches!(
             canonical_base_url("not a url"),
-            Err(HostLockError::InvalidBaseUrl(_))
+            Err(BaseUrlError::Invalid(_))
         ));
     }
 
@@ -792,12 +854,10 @@ tools:
             let yaml = format!(
                 "tools:\n  t:\n    type: http\n    base_url: \"{url}\"\n    auth: bearer\n    secret: s\n"
             );
+            let err = parse_config(&yaml).unwrap_err();
             assert!(
-                matches!(
-                    parse_config(&yaml),
-                    Err(ParseError::Validation(ValidationError::BadBaseUrl { .. }))
-                ),
-                "{url}"
+                matches!(err, ParseError::Yaml(_)) && err.to_string().contains("base_url must not"),
+                "{url}: {err}"
             );
         }
     }

@@ -133,7 +133,7 @@ const STORED_SECRET_VERSION: u8 = 2;
 #[serde(deny_unknown_fields)]
 struct StoredSecret {
     v: u8,
-    /// Canonical base URL (see [`toolspec::canonical_base_url`]).
+    /// Canonical base URL (see [`toolspec::BaseUrl::canonical`]).
     bound_url: String,
     delivery: Delivery,
     credential: Credential,
@@ -233,12 +233,7 @@ fn release<'a>(
 ) -> Result<(&'a Delivery, &'a Credential), (BindingState, String)> {
     const FIX: &str = "re-confirm it in the GAVMO control panel";
 
-    let current_url = toolspec::canonical_base_url(&def.base_url).map_err(|e| {
-        (
-            BindingState::DestinationChanged { bound_url: None },
-            format!("integration base_url could not be canonicalized for binding check: {e}"),
-        )
-    })?;
+    let current_url = def.base_url.canonical();
     let current_delivery =
         Delivery::of(def).map_err(|e| (BindingState::DeliveryChanged { approved: None }, e))?;
 
@@ -521,7 +516,7 @@ pub async fn forward(
     let body = args.get("body").and_then(Value::as_str).map(str::to_string);
 
     // Never send the credential anywhere but the integration's own origin.
-    let url = match toolspec::lock_url(&integration.def.base_url, path) {
+    let url = match integration.def.base_url.lock(path) {
         Ok(url) => url,
         Err(e) => return mcp::ToolOutcome::Error(format!("request blocked by host-lock: {e}")),
     };
@@ -683,7 +678,10 @@ tools:
         let resolved = select_with_store("/ws", &config, &store);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, "dafni-jira");
-        assert_eq!(resolved[0].def.base_url, "https://dafni.atlassian.net");
+        assert_eq!(
+            resolved[0].def.base_url.as_str(),
+            "https://dafni.atlassian.net"
+        );
     }
 
     #[test]
@@ -854,7 +852,7 @@ tools:
 
     fn bound(base_url: &str, delivery: Delivery, credential: Credential) -> String {
         wrap_stored_secret(
-            &toolspec::canonical_base_url(base_url).unwrap(),
+            &toolspec::BaseUrl::parse(base_url).unwrap().canonical(),
             delivery,
             credential,
         )
