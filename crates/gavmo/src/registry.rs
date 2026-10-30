@@ -123,18 +123,30 @@ impl AppState {
     /// `base_image` is the read-only NixOS qcow2 (from `GAVMO_BASE_IMAGE`);
     /// `gcloud_dir` is the ADC config dir mounted read-only into every VM.
     pub fn new(base_image: PathBuf, gcloud_dir: PathBuf) -> io::Result<Self> {
-        let registry_path = registry_path()?;
-        let registry = load_registry(&registry_path)?;
         let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
             .join("gavmo");
-        let mcp_base_dir = gavmo_data_dir.join("mcp");
         // Opened lazily so a host with a broken/absent OS keystore can still
         // run the daemon and manage VMs; only secret operations fail (closed).
         // There is no plaintext fallback.
         let secret_store: Arc<dyn SecretStore> = Arc::new(secrets::LazyVaultStore::keyring_backed(
             gavmo_data_dir.join("secrets.vault"),
         ));
+        Self::with_data_dir(base_image, gcloud_dir, &gavmo_data_dir, secret_store)
+    }
+
+    /// [`Self::new`] with an explicit data dir and secret store, so tests
+    /// never touch the user's real `~/.local/share/gavmo` or keyring.
+    fn with_data_dir(
+        base_image: PathBuf,
+        gcloud_dir: PathBuf,
+        gavmo_data_dir: &Path,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> io::Result<Self> {
+        std::fs::create_dir_all(gavmo_data_dir)?;
+        let registry_path = gavmo_data_dir.join("workspaces.json");
+        let registry = load_registry(&registry_path)?;
+        let mcp_base_dir = gavmo_data_dir.join("mcp");
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -190,8 +202,37 @@ impl AppState {
         Ok(())
     }
 
+    /// Whether `id` is exactly the id of a registered workspace.
+    ///
+    /// Ids arrive from the browser and double as host paths (`<id>/.gavmo/vm`
+    /// is deleted on reset, `<id>` is mounted read-write into a VM on open),
+    /// so every entry point that touches the filesystem or boots a VM must
+    /// check this first. Exact match against the stored canonical path also
+    /// rules out aliases such as `/a/../a` or a trailing slash.
+    async fn is_known(&self, id: &str) -> bool {
+        self.inner
+            .registry
+            .lock()
+            .await
+            .workspaces
+            .iter()
+            .any(|w| w.path == id)
+    }
+
+    /// [`Self::is_known`] as a `Result` for `?`.
+    async fn require_known(&self, id: &str) -> Result<(), String> {
+        if self.is_known(id).await {
+            Ok(())
+        } else {
+            Err(format!("unknown workspace: {id}"))
+        }
+    }
+
     /// Current status of a single workspace.
     pub async fn status(&self, id: &str) -> WorkspaceStatus {
+        if !self.is_known(id).await {
+            return WorkspaceStatus::Stopped;
+        }
         let mut running = self.inner.running.lock().await;
         match running.get_mut(id) {
             Some(slot) => slot_status(slot).await,
@@ -203,6 +244,10 @@ impl AppState {
     /// already booting/running) and returns immediately without waiting for
     /// the boot. Callers poll `status`/`list` to observe the transition.
     pub async fn open_workspace(&self, id: &str) -> Result<(), String> {
+        // Otherwise any host directory could be booted with `id` mounted
+        // read-write into the guest.
+        self.require_known(id).await?;
+
         // Bail early if already up: our own live VM holds the persisted port,
         // so `resolve_host_port` would see it as taken and needlessly
         // reallocate it.
@@ -340,6 +385,8 @@ impl AppState {
     /// must have obtained user confirmation. An in-flight boot is aborted and
     /// awaited first, so qemu can't still be writing the overlay.
     pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
+        // The state dir is derived from `id` and deleted below.
+        self.require_known(id).await.map_err(unknown_workspace_io)?;
         self.clear_mcp_token(id);
         self.clear_integrations(id);
 
@@ -479,12 +526,17 @@ impl AppState {
     /// Every tool this workspace's `gavmo.yaml` requests, read live (no secret
     /// access) so the control panel reflects config changes immediately.
     async fn candidates_for(&self, id: &str) -> Vec<CandidateTool> {
+        // Reads `<id>/gavmo.yaml`.
+        if !self.is_known(id).await {
+            return Vec::new();
+        }
         let config = crate::integrations::read_config(id).await;
         crate::integrations::resolve_candidates(id, &config)
     }
 
     /// Finds a single requested tool by id (structural; no secret-store access).
     async fn candidate(&self, id: &str, tool_id: &str) -> Result<CandidateTool, String> {
+        self.require_known(id).await?;
         self.candidates_for(id)
             .await
             .into_iter()
@@ -690,6 +742,7 @@ impl AppState {
     /// Reads a `gavmo.nix` build-failure log for the UI. `log` is
     /// client-supplied and becomes part of a path, so it is validated strictly.
     pub async fn read_build_log(&self, id: &str, log: &str) -> io::Result<String> {
+        self.require_known(id).await.map_err(unknown_workspace_io)?;
         if !is_safe_rebuild_log_filename(log) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -702,6 +755,7 @@ impl AppState {
     /// Reads and sanitizes the guest's boot console log for the live panel.
     /// A missing file (qemu not spawned yet) is an empty log, not an error.
     pub async fn read_console_log(&self, id: &str) -> io::Result<String> {
+        self.require_known(id).await.map_err(unknown_workspace_io)?;
         let path = Self::state_dir_for(id).join("console.log");
         match tokio::fs::read(&path).await {
             Ok(bytes) => Ok(sanitize_console(&bytes)),
@@ -842,6 +896,12 @@ fn mcp_share_dir_name(id: &str) -> String {
     use sha2::Digest as _;
 
     format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
+}
+
+/// Maps a [`AppState::require_known`] failure into the `io::Error` some
+/// entry points return.
+fn unknown_workspace_io(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, message)
 }
 
 /// Aborts an in-flight boot task and waits for it to finish, so qemu (owned
@@ -1049,14 +1109,6 @@ fn resolve_host_port_in(registry: &mut Registry, id: &str) -> io::Result<(u16, b
 }
 
 /// `~/.local/share/gavmo/workspaces.json` (or platform equivalent).
-fn registry_path() -> io::Result<PathBuf> {
-    let dir = dirs::data_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
-        .join("gavmo");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("workspaces.json"))
-}
-
 fn load_registry(path: &Path) -> io::Result<Registry> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1381,15 +1433,19 @@ mod tests {
         remove_dir_all_idempotent(&dir).await.unwrap();
     }
 
-    /// A throwaway [`AppState`] with placeholder image paths. Safe because
-    /// `AppState::new` only reads the real registry; tests using it must not
-    /// call methods that save it (e.g. `add_workspace`).
-    fn test_app_state() -> AppState {
-        AppState::new(
+    /// A throwaway [`AppState`] with placeholder image paths, an in-memory
+    /// secret store, and its own temp data dir (kept alive by the returned
+    /// `TempDir`), so tests never read or write the user's real registry.
+    fn test_app_state() -> (tempfile::TempDir, AppState) {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir(
             PathBuf::from("/nonexistent/gavmo-test-base.qcow2"),
             PathBuf::from("/nonexistent/gavmo-test-gcloud"),
+            data.path(),
+            Arc::new(secrets::MemoryStore::new()),
         )
-        .expect("AppState::new only touches the real registry file, which is harmless to read")
+        .unwrap();
+        (data, state)
     }
 
     /// A `Booting` slot whose task never finishes in test time, standing in
@@ -1404,7 +1460,7 @@ mod tests {
     /// (bounded by a timeout so a regression fails instead of hanging).
     #[tokio::test]
     async fn stop_workspace_aborts_an_in_flight_boot_promptly() {
-        let state = test_app_state();
+        let (_data, state) = test_app_state();
         let id = "stop-workspace-aborts-an-in-flight-boot-promptly";
         state
             .inner
@@ -1432,7 +1488,8 @@ mod tests {
             .unwrap();
         let id = repo_dir.to_string_lossy().into_owned();
 
-        let state = test_app_state();
+        let (_data, state) = test_app_state();
+        register(&state, &id).await;
         state
             .inner
             .running
@@ -1447,6 +1504,77 @@ mod tests {
 
         assert!(!state_dir.exists());
         assert!(state.inner.running.lock().await.get(&id).is_none());
+    }
+
+    /// Registers `id` in memory only (as `add_workspace` would, minus the
+    /// canonicalization), for tests of id-gated entry points.
+    async fn register(state: &AppState, id: &str) {
+        state
+            .inner
+            .registry
+            .lock()
+            .await
+            .workspaces
+            .push(WorkspaceRecord {
+                path: id.to_owned(),
+                host_port: None,
+            });
+    }
+
+    /// Unknown ids must never reach the filesystem or boot a VM: they come
+    /// from the browser and double as host paths.
+    #[tokio::test]
+    async fn id_gated_entry_points_reject_unknown_workspaces() {
+        let (_tmp, repo_dir) = unique_temp_dir("unknown-repo");
+        let state_dir = repo_dir.join(".gavmo").join("vm");
+        tokio::fs::create_dir_all(&state_dir).await.unwrap();
+        tokio::fs::write(state_dir.join("console.log"), b"secret console")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            repo_dir.join("gavmo.yaml"),
+            "tools:\n  t:\n    type: http\n    base_url: https://h.example.com\n    auth: bearer\n    secret: s\n",
+        )
+        .await
+        .unwrap();
+        let id = repo_dir.to_string_lossy().into_owned();
+        let (_data, state) = test_app_state();
+
+        assert!(state.open_workspace(&id).await.is_err());
+        assert!(state.inner.running.lock().await.is_empty(), "no boot task");
+        assert!(state.reset_workspace(&id).await.is_err());
+        assert!(state_dir.exists(), "reset must not delete an unknown dir");
+        assert!(state.read_console_log(&id).await.is_err());
+        assert!(
+            state
+                .read_build_log(&id, "rebuild-2026-01-01T00-00-00Z.log")
+                .await
+                .is_err()
+        );
+        assert!(state.list_tool_configs(&id).await.is_empty());
+        assert!(
+            state
+                .set_tool_secret(&id, "t", None, "tok".to_owned())
+                .await
+                .is_err()
+        );
+        assert_eq!(state.status(&id).await, WorkspaceStatus::Stopped);
+
+        // The same directory, once registered, is reachable.
+        register(&state, &id).await;
+        assert_eq!(state.read_console_log(&id).await.unwrap(), "secret console");
+        assert_eq!(state.list_tool_configs(&id).await.len(), 1);
+    }
+
+    /// An alias of a registered path is not the registered workspace.
+    #[tokio::test]
+    async fn aliases_of_a_registered_id_are_unknown() {
+        let (_data, state) = test_app_state();
+        register(&state, "/srv/repo").await;
+        for alias in ["/srv/repo/", "/srv/../srv/repo", "/srv/./repo", "/SRV/repo"] {
+            assert!(!state.is_known(alias).await, "{alias}");
+        }
+        assert!(state.is_known("/srv/repo").await);
     }
 
     /// Share dir names are deterministic, hex-only, and distinct per workspace.
@@ -1490,7 +1618,7 @@ mod tests {
     /// Minting writes `token.env` and the token resolves to the workspace.
     #[tokio::test]
     async fn mint_mcp_token_writes_env_file_and_resolves_via_token_authority() {
-        let state = test_app_state();
+        let (_data, state) = test_app_state();
         let id = "mint-mcp-token-writes-env-file-and-resolves";
         let (_tmp, dir) = unique_temp_dir("mcp-token-mint");
 
@@ -1517,7 +1645,7 @@ mod tests {
     /// Re-minting invalidates the workspace's previous token.
     #[tokio::test]
     async fn minting_a_new_token_invalidates_the_previous_one_for_the_same_workspace() {
-        let state = test_app_state();
+        let (_data, state) = test_app_state();
         let id = "minting-a-new-token-invalidates-the-previous-one";
         let (_tmp, dir) = unique_temp_dir("mcp-token-remint");
 
@@ -1539,7 +1667,7 @@ mod tests {
     /// `clear_mcp_token` makes the workspace's token stop resolving.
     #[tokio::test]
     async fn clear_mcp_token_invalidates_resolution() {
-        let state = test_app_state();
+        let (_data, state) = test_app_state();
         let id = "clear-mcp-token-invalidates-resolution";
         let (_tmp, dir) = unique_temp_dir("mcp-token-clear");
 
@@ -1562,7 +1690,7 @@ mod tests {
     /// An unknown token resolves to nothing.
     #[test]
     fn resolve_returns_none_for_an_unknown_token() {
-        let state = test_app_state();
+        let (_data, state) = test_app_state();
         assert_eq!(TokenAuthority::resolve(&state, "never-minted"), None);
     }
 }
