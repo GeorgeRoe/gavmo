@@ -19,7 +19,7 @@ use crate::api::{
     open_workspace, poll_vm_stats, read_build_log, read_console_log, remove_workspace,
     reset_workspace, stop_workspace,
 };
-use crate::types::{AppError, VmStats, WorkspaceInfo, WorkspaceStatus};
+use crate::types::{AppError, ConsoleChunk, VmStats, WorkspaceInfo, WorkspaceStatus};
 
 /// Most console text kept in the browser; older output is dropped.
 const MAX_CONSOLE_CHARS: usize = 1024 * 1024;
@@ -253,15 +253,9 @@ fn ConsolePanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl 
             let from = offset.get_value();
             async move { read_console_log(id, from).await.ok() }
         },
-        move |chunk| {
+        move |chunk: ConsoleChunk| {
             offset.set_value(chunk.next_offset);
-            text.update(|t| {
-                if chunk.replace {
-                    t.clear();
-                }
-                t.push_str(&chunk.text);
-                trim_front(t, MAX_CONSOLE_CHARS);
-            });
+            text.update(|t| merge_console_chunk(t, &chunk, MAX_CONSOLE_CHARS));
         },
         || {},
         true,
@@ -294,6 +288,16 @@ fn ConsolePanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl 
     }
 }
 
+/// Applies a console chunk to the text shown: replaces or appends it, then
+/// keeps at most about `max` bytes of the newest output.
+fn merge_console_chunk(text: &mut String, chunk: &ConsoleChunk, max: usize) {
+    if chunk.replace {
+        text.clear();
+    }
+    text.push_str(&chunk.text);
+    trim_front(text, max);
+}
+
 /// Drops text from the front so at most about `max` bytes remain, cutting at
 /// a line start where possible.
 fn trim_front(text: &mut String, max: usize) {
@@ -304,7 +308,11 @@ fn trim_front(text: &mut String, max: usize) {
     while !text.is_char_boundary(cut) {
         cut += 1;
     }
-    if let Some(newline) = text.get(cut..).and_then(|rest| rest.find('\n')) {
+    // Never past the last newline: a line longer than `max` is cut
+    // mid-line rather than dropped entirely.
+    if let Some(newline) = text.get(cut..).and_then(|rest| rest.find('\n'))
+        && cut + newline + 1 < text.len()
+    {
         cut += newline + 1;
     }
     text.replace_range(..cut, "");
@@ -450,5 +458,47 @@ mod tests {
         let mut wide = "ééééé".to_owned();
         trim_front(&mut wide, 3);
         assert!(wide.len() <= 4 && wide.chars().all(|c| c == 'é'));
+    }
+
+    /// One line longer than the limit is cut mid-line, not dropped whole.
+    #[test]
+    fn trim_front_never_empties_the_text() {
+        let mut long_line = "aaaaaaaaaa\n".to_owned();
+        trim_front(&mut long_line, 5);
+        assert_eq!(long_line, "aaaa\n");
+        let mut no_newline = "abcdefghij".to_owned();
+        trim_front(&mut no_newline, 4);
+        assert_eq!(no_newline, "ghij");
+    }
+
+    fn chunk(text: &str, replace: bool) -> ConsoleChunk {
+        ConsoleChunk {
+            text: text.to_owned(),
+            replace,
+            next_offset: 0,
+        }
+    }
+
+    #[test]
+    fn console_chunks_append_unless_they_replace() {
+        let mut text = String::new();
+        merge_console_chunk(&mut text, &chunk("boot\n", true), 100);
+        merge_console_chunk(&mut text, &chunk("ok\n", false), 100);
+        assert_eq!(text, "boot\nok\n");
+        // The log restarted (or we fell behind): start over.
+        merge_console_chunk(&mut text, &chunk("again\n", true), 100);
+        assert_eq!(text, "again\n");
+        merge_console_chunk(&mut text, &chunk("", false), 100);
+        assert_eq!(text, "again\n");
+    }
+
+    #[test]
+    fn console_merging_keeps_the_newest_output_within_the_limit() {
+        let mut text = "old one\nold two\n".to_owned();
+        merge_console_chunk(&mut text, &chunk("new line\n", false), 12);
+        assert_eq!(text, "new line\n");
+        let mut text = String::new();
+        merge_console_chunk(&mut text, &chunk("l1\nl2\nl3\nl4\n", true), 6);
+        assert_eq!(text, "l4\n");
     }
 }

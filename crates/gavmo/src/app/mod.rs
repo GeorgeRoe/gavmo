@@ -8,6 +8,7 @@ mod format;
 mod home;
 mod hooks;
 mod modal;
+mod polling;
 mod tools;
 mod transitions;
 mod workspace_modal;
