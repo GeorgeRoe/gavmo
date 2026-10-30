@@ -89,7 +89,92 @@ actually booting VMs from inside that VM is nested virtualization and needs
 the outer VM to expose KVM to be usable. The `wasm-bindgen` CLI comes from
 nixpkgs and must match the `wasm-bindgen` crate version in `Cargo.lock`
 exactly; `gavmo.nix` reads the lock and warns in the rebuild log if they
-drift.
+drift. TESTING.md describes the test levels and how to run each.
+
+## Logging in to the control panel
+
+On start the daemon prints a login URL,
+`http://localhost:3000/login?token=<token>`. The token is persisted in
+`~/.local/share/gavmo/ui_token` and never leaves the host.
+
+- Open the panel at **`localhost`**, not `127.0.0.1`. Every VM's opencode UI
+  is served at `127.0.0.1:<port>`, and browsers share cookies across ports,
+  so a session cookie set for `127.0.0.1` would be sent to every guest. A
+  login at `127.0.0.1` is redirected to `localhost`; other host names are
+  refused.
+- Logging in creates a session: the cookie holds a random session id (never
+  the token) and lasts 30 days. Sessions are kept in
+  `~/.local/share/gavmo/sessions.json`, so they survive daemon restarts.
+- "Log out everywhere" ends every session, in every browser.
+- To replace the token, delete `ui_token` and restart; a new one is minted
+  and printed. Existing sessions don't depend on it: also "Log out
+  everywhere".
+
+## Tool integrations (`gavmo.yaml`)
+
+A repo can ask for host-side HTTP tools, which the agent calls through the
+MCP gateway. The repo only names the tool and where it sends requests; you
+enter the credential in the control panel (Tools, in the workspace's
+modal), and it never enters the VM.
+
+```yaml
+# gavmo.yaml
+tools:
+  jira:
+    type: http
+    base_url: https://example.atlassian.net
+    auth: basic            # basic | bearer | header
+    secret: jira-token     # names the credential; not the credential
+    description: Jira Cloud REST API
+    instructions: Create an API token at id.atlassian.com.
+    test_path: /rest/api/3/myself   # what the panel's "Test" button GETs
+  search:
+    type: http
+    base_url: https://api.example.com
+    auth: header
+    header_name: X-Api-Key
+    secret: search-key
+```
+
+`gavmo.yaml` is untrusted (the agent can edit it), so it is checked
+strictly, and a file that fails any check is ignored entirely, with the
+reason shown in the panel:
+
+- Unknown keys are errors, so a typo doesn't silently disable something.
+- Tool ids are 1-64 of `[A-Za-z0-9_-]` and can't start with `gavmo_`; at
+  most 64 tools.
+- `base_url` must be http(s) with a host and no `user:pass@`, query or
+  fragment.
+- `secret` is 1-128 of `[A-Za-z0-9_.-]`.
+- `header_name` is required with `auth: header` and allowed only there. It
+  must be a valid header name, and not one that controls framing, routing or
+  connections or carries other credentials (`Host`, `Content-Length`,
+  `Cookie`, `Proxy-*`, ...).
+
+Saving a credential approves both its destination (`base_url`) and how it
+is sent (`auth`/`header_name`). If either later changes in `gavmo.yaml`,
+the credential is withheld until you re-enter it: a VM started after the
+change doesn't offer the tool, a running VM's calls are refused, and the
+panel says what changed. Every request is locked
+to the approved origin, and redirects are never followed: the agent gets
+the status and `Location` and can request that path itself, if it's on the
+same integration. Which tools a VM offers is fixed when it starts; the
+credential itself is read fresh on every call.
+
+## Upgrading from earlier versions
+
+One-time changes when moving to this version:
+
+- **VM state moved out of the repo** to `~/.local/share/gavmo/vms/`, so
+  each workspace's first boot builds a fresh disk. Afterwards delete the old
+  `<repo>/.gavmo/vm/disk.qcow2` (tens of GB).
+- **The control-panel token is rotated** on the first start, because
+  earlier versions put it in the cookie. Use the newly printed URL.
+- **Tool credentials must be re-entered once.** Credentials saved before
+  destination and delivery binding are withheld until you confirm them.
+- **The vault is upgraded to v2** (its header is now authenticated)
+  automatically on first use; the original is kept as
+  `secrets.vault.v1.bak`, which can be deleted once everything works.
 
 ## Customizing your repo's VM with `gavmo.nix`
 
