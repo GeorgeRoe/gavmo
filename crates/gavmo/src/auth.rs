@@ -69,21 +69,26 @@ fn load_or_create_token_at(path: &Path) -> io::Result<String> {
 
 // --- Helpers ---
 
-/// Extracts cookie `name` from the request, checking every `Cookie` header
-/// since some clients split them. Non-UTF-8 headers are skipped.
-fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    for header in headers.get_all(header::COOKIE) {
-        let Ok(value) = header.to_str() else { continue };
-        for pair in value.split(';') {
-            let Some((k, v)) = pair.split_once('=') else {
-                continue;
-            };
-            if k.trim() == name {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
+/// Every value of cookie `name` in the request, across all `Cookie` headers
+/// (some clients split them). Non-UTF-8 headers are skipped.
+///
+/// All values, not just the first: cookies are not port-isolated, so another
+/// local page can plant its own `gavmo_session` that sorts first ("cookie
+/// tossing"). Accepting any matching value keeps that from locking the user
+/// out, and a planted value can never match the token anyway.
+fn cookie_values<'a>(
+    headers: &'a axum::http::HeaderMap,
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    headers
+        .get_all(header::COOKIE)
+        .into_iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(move |pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k.trim() == name).then(|| v.trim())
+        })
 }
 
 /// Constant-time comparison so token checks leak no timing information.
@@ -153,32 +158,75 @@ pub fn login_router(token: Arc<String>) -> Router {
         .with_state(token)
 }
 
+// --- Cross-site request check ---
+
+/// Whether a state-changing `/api/*` request demonstrably comes from the
+/// control panel's own pages.
+///
+/// The session cookie alone is not enough: `SameSite` is about *sites*, and
+/// every port on `localhost` / `127.0.0.1` is the same site. Any other local
+/// page - a dev server, or a page a guest VM serves on its forwarded port -
+/// could otherwise POST a form to `/api/*` with the cookie attached.
+///
+/// Browsers send `Sec-Fetch-Site` on every request (Chrome 76+, Firefox 90+,
+/// Safari 16.4+); it must be `same-origin`. Where it is missing, `Origin`
+/// must name exactly this host. A request with neither is refused, so the
+/// check fails closed.
+fn is_same_origin_request(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return site.as_bytes() == b"same-origin";
+    }
+    let (Some(origin), Some(host)) = (headers.get(header::ORIGIN), headers.get(header::HOST))
+    else {
+        return false;
+    };
+    let (Ok(origin), Ok(host)) = (origin.to_str(), host.to_str()) else {
+        return false;
+    };
+    // The control panel is served over plain HTTP on loopback.
+    origin
+        .strip_prefix("http://")
+        .is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host))
+}
+
 // --- Auth gate ---
 
 /// Middleware for the whole app router: non-public requests need a valid
 /// session cookie. `/api/*` gets a bare 401 (it is called via `fetch`);
-/// page routes redirect to [`LOGIN_PATH`].
+/// page routes redirect to [`LOGIN_PATH`]. `/api/*` additionally accepts
+/// only same-origin `POST`s (see [`is_same_origin_request`]).
 pub async fn require_session(
     State(expected): State<Arc<String>>,
     req: Request,
     next: Next,
 ) -> Response {
-    let path = req.uri().path().to_string();
-    if is_public_path(&path) {
+    let path = req.uri().path();
+    if is_public_path(path) {
         return next.run(req).await;
     }
+    let is_api = path.starts_with("/api/");
 
-    let authenticated = cookie_value(req.headers(), SESSION_COOKIE_NAME)
-        .is_some_and(|value| constant_time_eq(&value, &expected));
-    if authenticated {
-        return next.run(req).await;
+    let authenticated = cookie_values(req.headers(), SESSION_COOKIE_NAME)
+        .any(|value| constant_time_eq(value, &expected));
+    if !authenticated {
+        return if is_api {
+            StatusCode::UNAUTHORIZED.into_response()
+        } else {
+            Redirect::to(LOGIN_PATH).into_response()
+        };
     }
 
-    if path.starts_with("/api/") {
-        StatusCode::UNAUTHORIZED.into_response()
-    } else {
-        Redirect::to(LOGIN_PATH).into_response()
+    if is_api {
+        // Server functions are all POST; refusing GET keeps navigations and
+        // `<img src>` from ever reaching them.
+        if req.method() != axum::http::Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        if !is_same_origin_request(req.headers()) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
     }
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -188,46 +236,46 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
-    /// Scratch dir unique per PID + counter so parallel tests don't collide.
-    // --- cookie_value ---
+    // --- cookie_values ---
+
+    fn session_values(cookie_headers: &[&'static str]) -> Vec<String> {
+        let mut headers = axum::http::HeaderMap::new();
+        for value in cookie_headers {
+            headers.append(header::COOKIE, HeaderValue::from_static(value));
+        }
+        cookie_values(&headers, SESSION_COOKIE_NAME)
+            .map(str::to_owned)
+            .collect()
+    }
 
     #[test]
-    fn cookie_value_extracts_named_cookie_among_several() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            HeaderValue::from_static("foo=bar; gavmo_session=abc123; baz=qux"),
-        );
+    fn cookie_values_extracts_named_cookie_among_several() {
         assert_eq!(
-            cookie_value(&headers, SESSION_COOKIE_NAME),
-            Some("abc123".to_string())
+            session_values(&["foo=bar; gavmo_session=abc123; baz=qux"]),
+            ["abc123"]
         );
     }
 
     #[test]
-    fn cookie_value_handles_missing_header() {
-        let headers = axum::http::HeaderMap::new();
-        assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), None);
+    fn cookie_values_handles_missing_header_and_absent_cookie() {
+        assert!(session_values(&[]).is_empty());
+        assert!(session_values(&["foo=bar"]).is_empty());
     }
 
     #[test]
-    fn cookie_value_handles_whitespace_around_pairs() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            HeaderValue::from_static(" foo=bar ;  gavmo_session=abc123 "),
-        );
+    fn cookie_values_handles_whitespace_around_pairs() {
         assert_eq!(
-            cookie_value(&headers, SESSION_COOKIE_NAME),
-            Some("abc123".to_string())
+            session_values(&[" foo=bar ;  gavmo_session=abc123 "]),
+            ["abc123"]
         );
     }
 
     #[test]
-    fn cookie_value_returns_none_when_named_cookie_absent() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(header::COOKIE, HeaderValue::from_static("foo=bar"));
-        assert_eq!(cookie_value(&headers, SESSION_COOKIE_NAME), None);
+    fn cookie_values_returns_every_duplicate_across_headers() {
+        assert_eq!(
+            session_values(&["gavmo_session=planted", "x=1; gavmo_session=real"]),
+            ["planted", "real"]
+        );
     }
 
     // --- constant_time_eq ---
@@ -311,7 +359,7 @@ mod tests {
     /// route, and the real `/login`.
     fn test_router(token: Arc<String>) -> Router {
         Router::new()
-            .route("/api/test", get(|| async { "ok" }))
+            .route("/api/test", axum::routing::post(|| async { "ok" }))
             .route("/", get(|| async { "home" }))
             .merge(login_router(Arc::clone(&token)))
             .layer(axum::middleware::from_fn_with_state(token, require_session))
@@ -324,7 +372,9 @@ mod tests {
         let res = app
             .oneshot(
                 HttpRequest::builder()
+                    .method("POST")
                     .uri("/api/test")
+                    .header("sec-fetch-site", "same-origin")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -341,7 +391,9 @@ mod tests {
         let res = app
             .oneshot(
                 HttpRequest::builder()
+                    .method("POST")
                     .uri("/api/test")
+                    .header("sec-fetch-site", "same-origin")
                     .header(header::COOKIE, "gavmo_session=expected-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -359,7 +411,9 @@ mod tests {
         let res = app
             .oneshot(
                 HttpRequest::builder()
+                    .method("POST")
                     .uri("/api/test")
+                    .header("sec-fetch-site", "same-origin")
                     .header(header::COOKIE, "gavmo_session=wrong-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -449,5 +503,94 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    // --- Cross-site protection on /api ---
+
+    /// Sends an authenticated request to `/api/test` with extra headers.
+    async fn api_status(method: &str, headers: &[(&str, &str)]) -> StatusCode {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri("/api/test")
+            .header(header::HOST, "localhost:3000")
+            .header(header::COOKIE, "gavmo_session=expected-token");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        test_router(Arc::new("expected-token".to_owned()))
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn api_accepts_same_origin_fetches() {
+        assert_eq!(
+            api_status("POST", &[("sec-fetch-site", "same-origin")]).await,
+            StatusCode::OK
+        );
+        // Older browsers: no Sec-Fetch-Site, but a matching Origin.
+        assert_eq!(
+            api_status("POST", &[("origin", "http://localhost:3000")]).await,
+            StatusCode::OK
+        );
+    }
+
+    /// A page on another port of the same host is same-*site*, so the cookie
+    /// is attached; the origin check is what stops it.
+    #[tokio::test]
+    async fn api_rejects_cross_origin_posts_even_with_a_valid_cookie() {
+        for headers in [
+            &[("sec-fetch-site", "same-site")][..],
+            &[("sec-fetch-site", "cross-site")],
+            &[("sec-fetch-site", "none")],
+            // Sec-Fetch-Site takes precedence over a matching Origin.
+            &[
+                ("sec-fetch-site", "same-site"),
+                ("origin", "http://localhost:3000"),
+            ],
+            &[("origin", "http://localhost:8080")],
+            &[("origin", "http://127.0.0.1:3000")],
+            &[("origin", "https://localhost:3000")],
+            &[("origin", "null")],
+            // Neither header: fail closed.
+            &[],
+        ] {
+            assert_eq!(
+                api_status("POST", headers).await,
+                StatusCode::FORBIDDEN,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_rejects_non_post_methods() {
+        assert_eq!(
+            api_status("GET", &[("sec-fetch-site", "same-origin")]).await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+
+    /// A planted cookie sorting first must not lock the real session out.
+    #[tokio::test]
+    async fn a_planted_session_cookie_does_not_shadow_the_real_one() {
+        let res = test_router(Arc::new("expected-token".to_owned()))
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/test")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(
+                        header::COOKIE,
+                        "gavmo_session=planted; gavmo_session=expected-token",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }

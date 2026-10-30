@@ -149,10 +149,8 @@ mod daemon {
         };
 
         Router::new()
-            .route(
-                "/api/{*fn_name}",
-                post(server_fn_route.clone()).get(server_fn_route),
-            )
+            // POST only; `auth::require_session` also refuses other methods.
+            .route("/api/{*fn_name}", post(server_fn_route))
             .leptos_routes_with_context(
                 &leptos_options,
                 routes,
