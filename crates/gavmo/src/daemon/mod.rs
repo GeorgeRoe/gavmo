@@ -15,6 +15,8 @@ use crate::auth;
 use crate::registry::AppState;
 
 #[cfg(test)]
+mod boot_tests;
+#[cfg(test)]
 mod mcp_tests;
 #[cfg(test)]
 mod tests;
