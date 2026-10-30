@@ -67,6 +67,7 @@ web-sys = { version = "0.3", optional = true, features = [
 # `ServiceExt::oneshot` for auth router tests. Already a transitive dep of
 # axum; this only enables the `util` feature.
 tower = { workspace = true, features = ["util"] }
+secrets = { workspace = true, features = ["test-util"] }
 
 [features]
 hydrate = [
