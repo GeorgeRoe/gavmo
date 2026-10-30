@@ -49,22 +49,60 @@ pub fn load_or_create_token() -> io::Result<String> {
 }
 
 /// [`load_or_create_token`] with an explicit path, for tests.
+///
+/// Only a missing or blank file mints a new token. Any other read error
+/// (permissions, I/O, a directory in the way) is returned: silently replacing
+/// the token would log out every session and mask the real problem.
 fn load_or_create_token_at(path: &Path) -> io::Result<String> {
     match std::fs::read_to_string(path) {
-        Ok(existing) if !existing.trim().is_empty() => Ok(existing.trim().to_string()),
-        _ => {
-            // Two UUIDv4s (~244 random bits) avoids a dedicated CSPRNG dep.
-            let token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            std::fs::write(path, &token)?;
-            // Owner-only, against other local users on a shared host.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
+        Ok(existing) if !existing.trim().is_empty() => Ok(existing.trim().to_owned()),
+        Ok(_) => {
+            // Blank: replace in place (the file already exists).
+            let token = new_token();
+            write_token(path, &token, false)?;
             Ok(token)
         }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let token = new_token();
+            match write_token(path, &token, true) {
+                Ok(()) => Ok(token),
+                // Another process created it first; use theirs.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => load_or_create_token_at(path),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
     }
+}
+
+/// Two `UUIDv4`s (~244 random bits) avoids a dedicated CSPRNG dep.
+fn new_token() -> String {
+    format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+}
+
+/// Writes the token owner-only (`0600` at creation on Unix, never briefly
+/// world-readable). `create_new` refuses to follow or clobber anything
+/// already at `path`.
+fn write_token(path: &Path, token: &str, create_new: bool) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.truncate(true);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(token.as_bytes())?;
+    file.sync_all()
 }
 
 // --- Helpers ---
@@ -136,19 +174,35 @@ async fn login_handler(
     State(expected): State<Arc<String>>,
     Query(query): Query<LoginQuery>,
 ) -> Response {
-    match query.token {
+    let mut response = match query.token {
         Some(token) if constant_time_eq(&token, &expected) => {
             let cookie = format!(
                 "{SESSION_COOKIE_NAME}={expected}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECS}"
             );
-            let mut response = Redirect::to("/").into_response();
-            if let Ok(value) = HeaderValue::from_str(&cookie) {
-                response.headers_mut().insert(header::SET_COOKIE, value);
+            match HeaderValue::from_str(&cookie) {
+                Ok(value) => {
+                    let mut response = Redirect::to("/").into_response();
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                    response
+                }
+                // Redirecting without the cookie would loop back to /login.
+                Err(e) => {
+                    tracing::error!(error = %e, "session token is not a valid cookie value");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
-            response
         }
         _ => Html(LOGIN_FALLBACK_HTML).into_response(),
-    }
+    };
+    // The URL carries the master token: keep it out of caches and out of the
+    // Referer of anything the next page loads.
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 /// The `/login` route as a stateful sub-router to merge into the app.
@@ -353,6 +407,36 @@ mod tests {
         assert!(!token.trim().is_empty());
     }
 
+    /// A read error other than "missing" must not mint (and persist) a new
+    /// token, which would silently log out every session.
+    #[test]
+    fn load_or_create_token_at_propagates_other_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: read fails with EISDIR.
+        let path = dir.path().join("ui_token");
+        std::fs::create_dir(&path).unwrap();
+        assert!(load_or_create_token_at(&path).is_err());
+        assert!(path.is_dir(), "nothing may be written over it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_or_create_token_at_writes_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui_token");
+        load_or_create_token_at(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // A blank, wider file is narrowed when it is refilled.
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_or_create_token_at(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     // --- require_session / login_router ---
 
     /// Minimal stand-in for the real app router: one API route, one page
@@ -485,6 +569,14 @@ mod tests {
             .unwrap();
         assert!(set_cookie.starts_with("gavmo_session=expected-token"));
         assert!(set_cookie.contains("HttpOnly"));
+        assert_eq!(
+            res.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            res.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
     }
 
     #[tokio::test]
