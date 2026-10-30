@@ -98,7 +98,7 @@ are exempt from the panic-family lints through `clippy.toml`.
 
 The VM has about 4 GB of RAM and no swap, and two `rustc` processes on the
 `gavmo` crate with debug info can exhaust it, which stalls the whole VM.
-Build with:
+This repo's `gavmo.nix` sets these for the agent; elsewhere, build with:
 
 ```sh
 export CARGO_TARGET_DIR=$HOME/.cache/cargo-target  # keep it off /workspace

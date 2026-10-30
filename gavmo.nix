@@ -1,28 +1,29 @@
 # This repo's own `gavmo.nix`: everything the agent needs to build, test, and
 # run GAVMO inside its own VM. See README.md ("Running the daemon locally",
-# "Customizing your repo's VM with `gavmo.nix`"); smaller recipes live in
-# `examples/`.
+# "Customizing your repo's VM with `gavmo.nix`") and TESTING.md; smaller
+# recipes live in `examples/`.
 #
 # Once booted:
-#   cargo test -p toolspec
-#   cargo build -p gavmo --features ssr --no-default-features
+#   cargo test -p gavmo --features ssr
 #   cargo leptos build
 
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 
 let
-  # Must equal the `wasm-bindgen` crate version in `Cargo.lock` exactly; bump
-  # together. nixpkgs' `wasm-bindgen-cli` lags behind, hence `cargo install`.
-  wasmBindgenVersion = "0.2.129";
-
-  # Wrapper instead of a `PATH` session var, which `/etc/profile` discards
-  # (README: "Installing tools from outside Nix").
-  cargoBinDir = "/home/agent/.cargo/bin";
-  wasmBindgenWrapper = pkgs.writeShellScriptBin "wasm-bindgen" ''
-    exec "${cargoBinDir}/wasm-bindgen" "$@"
-  '';
+  # `wasm-bindgen` CLI and crate must match exactly. The pinned nixpkgs ships
+  # the CLI, so the check is just a warning in the rebuild log if a
+  # `Cargo.lock` bump ever outpaces it (then pin a CLI build here).
+  cargoLock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
+  wasmBindgenCrate =
+    (lib.findFirst (p: p.name == "wasm-bindgen") { version = "none"; } cargoLock.package).version;
+  wasmBindgenCli = pkgs.wasm-bindgen-cli;
 in
 {
+  warnings = lib.optional (wasmBindgenCli.version != wasmBindgenCrate) ''
+    gavmo.nix: nixpkgs' wasm-bindgen-cli is ${wasmBindgenCli.version} but Cargo.lock
+    uses wasm-bindgen ${wasmBindgenCrate}; `cargo leptos build` will refuse to run.
+  '';
+
   environment.systemPackages = with pkgs; [
     # Version tracks this VM's nixpkgs, not `rust-toolchain.toml`. nixpkgs'
     # rustc already ships wasm32 std for the Leptos hydrate build.
@@ -40,7 +41,14 @@ in
     lld
 
     cargo-leptos
-    wasmBindgenWrapper
+    # Also provides `wasm-bindgen-test-runner` for the browser tests.
+    wasmBindgenCli
+    # `wasm-opt`, for `cargo leptos build --release`.
+    binaryen
+
+    # Headless browser tests (wasm-bindgen-test, see TESTING.md).
+    firefox
+    geckodriver
 
     # To run the GAVMO daemon itself.
     qemu
@@ -51,14 +59,16 @@ in
     git
   ];
 
-  # One-time ~90s compile on first boot, a version check after. Only
-  # `cargo leptos build` needs it; `|| true` keeps opencode starting offline.
-  systemd.services.gavmo-opencode.preStart = ''
-    installed="$(${cargoBinDir}/wasm-bindgen --version 2>/dev/null || true)"
-    if [ "$installed" != "wasm-bindgen ${wasmBindgenVersion}" ]; then
-      HOME=/home/agent \
-        ${pkgs.cargo}/bin/cargo install wasm-bindgen-cli \
-          --version "${wasmBindgenVersion}" || true
-    fi
-  '';
+  # Builds that fit the VM: about 4 GB of RAM and no swap, where two rustc
+  # processes on the `gavmo` crate with debug info exhaust memory and stall
+  # the whole VM (agent included). The target dir stays on the VM's own disk,
+  # off the virtiofs share (which is slow and would put gigabytes in the
+  # user's repo).
+  environment.sessionVariables = {
+    CARGO_TARGET_DIR = "/home/agent/.cache/cargo-target";
+    CARGO_BUILD_JOBS = "1";
+    CARGO_INCREMENTAL = "0";
+    CARGO_PROFILE_DEV_DEBUG = "0";
+    CARGO_PROFILE_TEST_DEBUG = "0";
+  };
 }

@@ -82,12 +82,14 @@ Forgetting `virtiofsd` fails a VM boot immediately with `failed to spawn
 almost certainly why.
 
 This repo's own `gavmo.nix` sets up a GAVMO VM for developing GAVMO itself
-(Rust toolchain, `cargo-leptos`, `qemu`, `virtiofsd`). Builds and `cargo test`
-work anywhere; actually booting VMs from inside that VM is nested
-virtualization and needs the outer VM to expose KVM to be usable. The
-`wasm-bindgen` CLI it installs must match the `wasm-bindgen` crate version in
-`Cargo.lock` exactly, so bump `wasmBindgenVersion` in `gavmo.nix` whenever
-the lock changes.
+(Rust toolchain, `cargo-leptos`, `wasm-bindgen-cli`, `binaryen`, headless
+Firefox for the browser tests, `qemu`, `virtiofsd`) and cargo settings that fit
+the VM's memory (see TESTING.md). Builds and `cargo test` work anywhere;
+actually booting VMs from inside that VM is nested virtualization and needs
+the outer VM to expose KVM to be usable. The `wasm-bindgen` CLI comes from
+nixpkgs and must match the `wasm-bindgen` crate version in `Cargo.lock`
+exactly; `gavmo.nix` reads the lock and warns in the rebuild log if they
+drift.
 
 ## Customizing your repo's VM with `gavmo.nix`
 
