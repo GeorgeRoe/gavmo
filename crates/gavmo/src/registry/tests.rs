@@ -468,7 +468,10 @@ async fn id_gated_entry_points_reject_unknown_workspaces() {
             .await
             .is_err()
     );
-    assert!(state.list_tool_configs(&id).await.is_empty());
+    assert!(matches!(
+        state.list_tool_configs(&id).await,
+        Err(RegistryError::UnknownWorkspace(_))
+    ));
     assert!(
         state
             .set_tool_secret(&id, "t", None, "tok".to_owned())
@@ -486,7 +489,7 @@ async fn id_gated_entry_points_reject_unknown_workspaces() {
             .unwrap(),
         "secret log"
     );
-    assert_eq!(state.list_tool_configs(&id).await.len(), 1);
+    assert_eq!(state.list_tool_configs(&id).await.unwrap().len(), 1);
 }
 
 /// An alias of a registered path is not the registered workspace.
@@ -795,7 +798,7 @@ async fn open_is_refused_while_a_stop_is_in_progress() {
     .await;
     assert_eq!(state.status(&id).await, WorkspaceStatus::Stopping);
     let refused = state.open_workspace(&id).await.unwrap_err();
-    assert!(refused.contains("busy"), "{refused}");
+    assert!(matches!(refused, RegistryError::Busy), "{refused}");
 
     script.stop_gate.add_permits(1);
     stopping.await.unwrap().unwrap();
@@ -1122,4 +1125,51 @@ async fn replace_slot_keeps_tokens_in_step_with_the_slot() {
 fn resolve_returns_none_for_an_unknown_token() {
     let (_data, state) = test_app_state();
     assert_eq!(TokenAuthority::resolve(&state, "never-minted"), None);
+}
+
+/// A secret store that can't be read is reported as such, not as "no
+/// tools configured".
+#[tokio::test]
+async fn an_unreadable_secret_store_is_an_error_not_unconfigured() {
+    struct Broken;
+    impl SecretStore for Broken {
+        fn get(&self, _: &str) -> Result<Option<String>, secrets::SecretError> {
+            Err(secrets::SecretError::Backend("keyring locked".to_owned()))
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), secrets::SecretError> {
+            Err(secrets::SecretError::Backend("keyring locked".to_owned()))
+        }
+        fn delete(&self, _: &str) -> Result<(), secrets::SecretError> {
+            Err(secrets::SecretError::Backend("keyring locked".to_owned()))
+        }
+    }
+    let data = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir(
+        PathBuf::from("/nonexistent/base.qcow2"),
+        PathBuf::from("/nonexistent/gcloud"),
+        data.path(),
+        Some(Path::new("/nonexistent/home")),
+        &data.path().join("run"),
+        Arc::new(Broken),
+        Arc::new(crate::vm_handle::fake::FakeLauncher(
+            crate::vm_handle::fake::Script::new(),
+        )),
+    )
+    .unwrap();
+    let (_repo, id) = registered_repo(&state).await;
+    tokio::fs::write(
+        Path::new(&id).join("gavmo.yaml"),
+        "tools:\n  t:\n    type: http\n    base_url: https://h.example.com\n    auth: bearer\n    secret: s\n",
+    )
+    .await
+    .unwrap();
+
+    let err = state.list_tool_configs(&id).await.unwrap_err();
+    assert!(matches!(err, RegistryError::SecretStore(_)), "{err}");
+    assert!(matches!(
+        crate::app::AppError::from(err),
+        crate::app::AppError::SecretStore(msg) if msg.contains("keyring locked")
+    ));
+    // Booting still works, just without tools.
+    assert!(state.resolve_integrations_for(&id).await.is_empty());
 }

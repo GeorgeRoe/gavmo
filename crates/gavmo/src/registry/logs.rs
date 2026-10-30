@@ -1,10 +1,10 @@
 //! Console and build-log reads for the control panel (bounded, no-follow).
 
+use super::error::{RegistryError, Result, io_ctx};
 use std::io;
 use std::path::Path;
 
 use super::AppState;
-use super::util::unknown_workspace_io;
 
 /// Most of the console log returned per poll (the newest output).
 pub(super) const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
@@ -32,17 +32,17 @@ pub(super) async fn read_guest_output_file(
 impl AppState {
     /// Reads a `gavmo.nix` build-failure log for the UI. `log` is
     /// client-supplied and becomes part of a path, so it is validated strictly.
-    pub async fn read_build_log(&self, id: &str, log: &str) -> io::Result<String> {
-        self.require_known(id).await.map_err(unknown_workspace_io)?;
+    pub async fn read_build_log(&self, id: &str, log: &str) -> Result<String> {
+        self.require_known(id).await?;
         if !is_safe_rebuild_log_filename(log) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid build log filename",
+            return Err(RegistryError::InvalidInput(
+                "invalid build log filename".to_owned(),
             ));
         }
         let file = read_guest_output_file(id, log, MAX_BUILD_LOG_BYTES)
-            .await?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "build log not found"))?;
+            .await
+            .map_err(io_ctx("reading the build log"))?
+            .ok_or_else(|| RegistryError::NotFound("build log".to_owned()))?;
         let mut text = String::from_utf8_lossy(&file.bytes).into_owned();
         if file.truncated {
             text.insert_str(
@@ -56,8 +56,8 @@ impl AppState {
     /// Reads and sanitizes the guest's boot console log for the live panel.
     /// A missing file (qemu not spawned yet) is an empty log, not an error.
     /// Only the newest [`MAX_CONSOLE_LOG_BYTES`] are returned.
-    pub async fn read_console_log(&self, id: &str) -> io::Result<String> {
-        self.require_known(id).await.map_err(unknown_workspace_io)?;
+    pub async fn read_console_log(&self, id: &str) -> Result<String> {
+        self.require_known(id).await?;
         // Host-only now, but read the same bounded, no-follow way regardless:
         // it is still mostly guest-produced text.
         let path = self.host_state_dir_for(id).join("console.log");
@@ -67,7 +67,8 @@ impl AppState {
             MAX_CONSOLE_LOG_BYTES,
             crate::guest_files::Keep::Tail,
         )
-        .await?
+        .await
+        .map_err(io_ctx("reading the console log"))?
         .map(|file| sanitize_console(&file.bytes))
         .unwrap_or_default())
     }

@@ -5,6 +5,7 @@
 //! only place that touches the `vm` crate, keeping all VM-management
 //! mechanism behind the daemon's server functions.
 
+mod error;
 mod lifecycle;
 mod logs;
 mod paths;
@@ -16,6 +17,9 @@ mod store;
 mod tests;
 mod tools;
 mod util;
+
+pub use self::error::RegistryError;
+use self::error::{Result, io_ctx};
 
 use std::collections::HashMap;
 use std::io;
@@ -208,28 +212,30 @@ impl AppState {
     /// The directory is later mounted **read-write** into a VM, so paths that
     /// would expose the daemon's own secrets or the user's whole home are
     /// refused (see [`check_workspace_path`]).
-    pub async fn add_workspace(&self, path: String) -> io::Result<()> {
+    pub async fn add_workspace(&self, path: String) -> Result<()> {
         // Canonical: symlinks resolved, so the checks see the real target.
-        let canonical = tokio::fs::canonicalize(&path).await?;
-        if !tokio::fs::metadata(&canonical).await?.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not a directory", canonical.display()),
-            ));
+        let canonical = tokio::fs::canonicalize(&path)
+            .await
+            .map_err(|e| RegistryError::InvalidInput(format!("{path}: {e}")))?;
+        let meta = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(io_ctx(format!("reading {}", canonical.display())))?;
+        if !meta.is_dir() {
+            return Err(RegistryError::InvalidInput(format!(
+                "{} is not a directory",
+                canonical.display()
+            )));
         }
         check_workspace_path(
             &canonical,
             &self.inner.protected_dirs,
             self.inner.home_dir.as_deref(),
         )
-        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        .map_err(RegistryError::InvalidInput)?;
         // Ids are UTF-8 strings; a lossy conversion would register a path
         // that doesn't exist.
         let canonical = canonical.into_os_string().into_string().map_err(|p| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} is not valid UTF-8", Path::new(&p).display()),
-            )
+            RegistryError::InvalidInput(format!("{} is not valid UTF-8", Path::new(&p).display()))
         })?;
 
         let mut registry = self.inner.registry.lock().await;
@@ -239,7 +245,9 @@ impl AppState {
                 path: canonical,
                 host_port: None,
             });
-            save_registry(&self.inner.registry_path, &registry).await?;
+            save_registry(&self.inner.registry_path, &registry)
+                .await
+                .map_err(io_ctx("saving the workspace registry"))?;
         }
         Ok(())
     }
@@ -262,11 +270,11 @@ impl AppState {
     }
 
     /// [`Self::is_known`] as a `Result` for `?`.
-    async fn require_known(&self, id: &str) -> Result<(), String> {
+    async fn require_known(&self, id: &str) -> Result<()> {
         if self.is_known(id).await {
             Ok(())
         } else {
-            Err(format!("unknown workspace: {id}"))
+            Err(RegistryError::UnknownWorkspace(id.to_owned()))
         }
     }
 

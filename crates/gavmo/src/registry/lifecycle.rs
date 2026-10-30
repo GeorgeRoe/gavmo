@@ -1,5 +1,6 @@
 //! VM lifecycle: the per-workspace slot state machine, open/stop/reset/remove, boot completion, the per-VM monitor and daemon shutdown.
 
+use super::error::{RegistryError, Result, io_ctx};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,9 +12,7 @@ use vm::{Error as VmError, VmConfig, VmStatus};
 
 use super::AppState;
 use super::store::save_registry;
-use super::util::{
-    lock_unpoisoned, remove_dir_all_idempotent, unknown_workspace_io, write_owner_only,
-};
+use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
 use crate::app::WorkspaceStatus;
 use crate::integrations::ResolvedIntegration;
 use crate::vm_handle::{VmHandle, VmInfo};
@@ -179,7 +178,7 @@ impl AppState {
     ///
     /// Refused while another lifecycle operation (stop, reset, remove) on the
     /// same workspace is in progress.
-    pub async fn open_workspace(&self, id: &str) -> Result<(), String> {
+    pub async fn open_workspace(&self, id: &str) -> Result<()> {
         // Otherwise any host directory could be booted with `id` mounted
         // read-write into the guest.
         self.require_known(id).await?;
@@ -188,14 +187,10 @@ impl AppState {
             .shutting_down
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            return Err("GAVMO is shutting down".to_owned());
+            return Err(RegistryError::ShuttingDown);
         }
         let Ok(_lifecycle) = self.lifecycle_lock(id).try_lock_owned() else {
-            return Err(
-                "this workspace is busy (stopping, resetting or being removed); \
-                        try again in a moment"
-                    .to_owned(),
-            );
+            return Err(RegistryError::Busy);
         };
         // Re-checked under the lifecycle lock: a remove that just finished
         // has dropped it from the registry.
@@ -220,7 +215,7 @@ impl AppState {
         let host_port = self
             .resolve_host_port(id)
             .await
-            .map_err(|e| format!("failed to resolve a host port: {e}"))?;
+            .map_err(io_ctx("allocating a host port"))?;
 
         // Mint the per-boot MCP token only on a real new boot: rotating a
         // running VM's token would break its already-loaded `gavmo-opencode`.
@@ -228,10 +223,10 @@ impl AppState {
         let token = match mint_mcp_token(&mcp_dir).await {
             Ok(token) => token,
             Err(e) => {
-                let reason = format!("failed to write MCP token: {e}");
+                let e = RegistryError::io("writing the MCP token", e);
                 let mut running = self.inner.running.lock().await;
-                self.replace_slot(&mut running, id, Some(VmSlot::Failed(reason.clone())));
-                return Err(reason);
+                self.replace_slot(&mut running, id, Some(VmSlot::Failed(e.to_string())));
+                return Err(e);
             }
         };
 
@@ -341,10 +336,10 @@ impl AppState {
 
     /// Carries out a [`Teardown`]: stops the VM, or aborts and awaits the boot
     /// task (so qemu is gone on return either way).
-    pub(super) async fn run_teardown(id: &str, teardown: Teardown) -> Result<(), String> {
+    pub(super) async fn run_teardown(id: &str, teardown: Teardown) -> Result<()> {
         match teardown {
             Teardown::Vm(slot) => match slot.take_vm().await {
-                Some(vm) => vm.stop().await.map_err(|e| e.to_string()),
+                Some(vm) => Ok(vm.stop().await?),
                 None => Ok(()),
             },
             Teardown::Boot(task) => {
@@ -372,7 +367,7 @@ impl AppState {
     /// An in-flight boot is aborted and awaited, so qemu is gone on return
     /// (killed on drop, or gracefully stopped by the boot task if it had
     /// just succeeded - rarely blocking up to ~35s).
-    pub async fn stop_workspace(&self, id: &str) -> Result<(), String> {
+    pub async fn stop_workspace(&self, id: &str) -> Result<()> {
         // Unknown ids with nothing running have nothing to stop (and get no
         // lifecycle lock entry).
         if !self.is_known(id).await && !self.inner.running.lock().await.contains_key(id) {
@@ -392,7 +387,7 @@ impl AppState {
     /// A no-op for unknown ids.
     ///
     /// The registry entry goes first, so no `open` can start meanwhile.
-    pub async fn remove_workspace(&self, id: &str) -> Result<(), String> {
+    pub async fn remove_workspace(&self, id: &str) -> Result<()> {
         let lifecycle = self.lifecycle_lock(id);
         let _held = lifecycle.lock().await;
         {
@@ -402,7 +397,7 @@ impl AppState {
             if registry.workspaces.len() != before {
                 save_registry(&self.inner.registry_path, &registry)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(io_ctx("saving the workspace registry"))?;
             }
         }
         let teardown = self.begin_teardown(id).await;
@@ -422,9 +417,9 @@ impl AppState {
     /// confirmation. An in-flight boot is aborted and awaited first, and the
     /// workspace stays `Stopping` (refusing opens) until the files are gone,
     /// so qemu can't be writing the overlay while it is deleted.
-    pub async fn reset_workspace(&self, id: &str) -> io::Result<()> {
+    pub async fn reset_workspace(&self, id: &str) -> Result<()> {
         // The state dir is derived from `id` and deleted below.
-        self.require_known(id).await.map_err(unknown_workspace_io)?;
+        self.require_known(id).await?;
         let lifecycle = self.lifecycle_lock(id);
         let _held = lifecycle.lock().await;
 
@@ -445,7 +440,8 @@ impl AppState {
             remove_dir_all_idempotent(&self.runtime_dir_for(id)).await?;
             remove_dir_all_idempotent(&Self::guest_output_dir_for(id)).await
         }
-        .await;
+        .await
+        .map_err(io_ctx("deleting VM state"));
         let after = match &result {
             Ok(()) => None,
             Err(e) => Some(VmSlot::Failed(format!(

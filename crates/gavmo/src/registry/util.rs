@@ -3,12 +3,6 @@
 use std::io;
 use std::path::Path;
 
-/// Maps a [`AppState::require_known`] failure into the `io::Error` some
-/// entry points return.
-pub(super) fn unknown_workspace_io(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::NotFound, message)
-}
-
 /// Recovers a poisoned `std` mutex. Every map guarded this way (MCP tokens,
 /// resolved integrations) is updated with single, self-contained operations,
 /// so a panic elsewhere can't leave it half-modified; serving it is safer

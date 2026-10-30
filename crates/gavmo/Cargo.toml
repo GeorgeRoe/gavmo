@@ -15,6 +15,7 @@ leptos = { version = "0.8.0" }
 leptos_router = { version = "0.8.0" }
 leptos_meta = { version = "0.8.0" }
 serde.workspace = true
+thiserror.workspace = true
 
 # ssr-only (native server build) dependencies. None of these may ever be
 # pulled into the wasm32 hydrate build.

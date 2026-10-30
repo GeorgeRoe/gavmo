@@ -14,6 +14,48 @@ use serde::{Deserialize, Serialize};
 // Shared view types (serialized across the server-function boundary)
 // ---------------------------------------------------------------------------
 
+/// Errors returned by every server function, shared by server and browser so
+/// the UI can react to the kind of failure (e.g. go back to login), not just
+/// show a string.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum AppError {
+    /// The browser session is missing or expired (HTTP 401 from the auth
+    /// layer, which encodes this variant as its body).
+    #[error("not logged in")]
+    Unauthorized,
+    #[error("unknown workspace: {0}")]
+    UnknownWorkspace(String),
+    /// Another lifecycle operation on the workspace is in progress.
+    #[error("this workspace is busy (stopping, resetting or being removed); try again in a moment")]
+    Busy,
+    #[error("GAVMO is shutting down")]
+    ShuttingDown,
+    /// The request itself was invalid (bad path, unknown tool, missing field).
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// The host secret store (keyring/vault) could not be used.
+    #[error("secret store unavailable: {0}")]
+    SecretStore(String),
+    /// The operation ran but did not succeed (e.g. a tool test got a non-2xx).
+    #[error("{0}")]
+    Failed(String),
+    #[error("internal error: {0}")]
+    Internal(String),
+    /// Transport/encoding failures from the server-function machinery.
+    #[error("request failed: {0}")]
+    ServerFn(ServerFnErrorErr),
+}
+
+impl FromServerFnError for AppError {
+    type Encoder = server_fn::codec::JsonEncoding;
+
+    fn from_server_fn_error(value: ServerFnErrorErr) -> Self {
+        Self::ServerFn(value)
+    }
+}
+
 /// A known workspace plus its current VM status.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
@@ -124,13 +166,13 @@ pub struct ToolConfig {
 // ---------------------------------------------------------------------------
 
 #[server]
-pub async fn list_workspaces() -> Result<Vec<WorkspaceInfo>, ServerFnError> {
+pub async fn list_workspaces() -> Result<Vec<WorkspaceInfo>, AppError> {
     let state = app_state()?;
     Ok(state.list().await)
 }
 
 #[server]
-pub async fn poll_status(id: String) -> Result<WorkspaceStatus, ServerFnError> {
+pub async fn poll_status(id: String) -> Result<WorkspaceStatus, AppError> {
     let state = app_state()?;
     Ok(state.status(&id).await)
 }
@@ -139,97 +181,87 @@ pub async fn poll_status(id: String) -> Result<WorkspaceStatus, ServerFnError> {
 /// [`WorkspaceStatus::BuildFailed`] workspace. `log` must be the filename that
 /// status reported; the server validates it strictly before reading.
 #[server]
-pub async fn read_build_log(id: String, log: String) -> Result<String, ServerFnError> {
+pub async fn read_build_log(id: String, log: String) -> Result<String, AppError> {
     let state = app_state()?;
     state
         .read_build_log(&id, &log)
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))
+        .map_err(AppError::from)
 }
 
 /// Fetches the guest's boot console (kernel + systemd output), sanitized for
 /// display. The log lives at a fixed path, so there is no client-controlled
 /// filename to validate.
 #[server]
-pub async fn read_console_log(id: String) -> Result<String, ServerFnError> {
+pub async fn read_console_log(id: String) -> Result<String, AppError> {
     let state = app_state()?;
-    state
-        .read_console_log(&id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))
+    state.read_console_log(&id).await.map_err(AppError::from)
 }
 
 /// Fetches resource usage for a workspace's VM. `Ok(None)` means nothing to
 /// show right now (not `Running`, or qemu just exited); `Err` means the
 /// request failed.
 #[server]
-pub async fn poll_vm_stats(id: String) -> Result<Option<VmStats>, ServerFnError> {
+pub async fn poll_vm_stats(id: String) -> Result<Option<VmStats>, AppError> {
     let state = app_state()?;
     Ok(state.vm_stats(&id).await)
 }
 
 #[server]
-pub async fn add_workspace(path: String) -> Result<(), ServerFnError> {
+pub async fn add_workspace(path: String) -> Result<(), AppError> {
     let state = app_state()?;
-    state
-        .add_workspace(path)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))
+    state.add_workspace(path).await.map_err(AppError::from)
 }
 
 /// Starts booting the workspace's VM (no-op if already booting/running) and
 /// returns immediately; the client follows progress via the polled list so
 /// the UI never blocks for the whole boot.
 #[server]
-pub async fn open_workspace(id: String) -> Result<(), ServerFnError> {
+pub async fn open_workspace(id: String) -> Result<(), AppError> {
     let state = app_state()?;
-    state.open_workspace(&id).await.map_err(ServerFnError::new)
+    state.open_workspace(&id).await.map_err(AppError::from)
 }
 
 #[server]
-pub async fn stop_workspace(id: String) -> Result<(), ServerFnError> {
+pub async fn stop_workspace(id: String) -> Result<(), AppError> {
     let state = app_state()?;
-    state.stop_workspace(&id).await.map_err(ServerFnError::new)
+    state.stop_workspace(&id).await.map_err(AppError::from)
 }
 
 /// Stops (if needed) and wipes a workspace's VM state, e.g. to recover from
 /// an overlay built on a stale base image. **Destructive**: the client must
 /// confirm with the user first; this function does not.
 #[server]
-pub async fn reset_workspace(id: String) -> Result<(), ServerFnError> {
+pub async fn reset_workspace(id: String) -> Result<(), AppError> {
     let state = app_state()?;
-    state
-        .reset_workspace(&id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))
+    state.reset_workspace(&id).await.map_err(AppError::from)
 }
 
 /// Stops (if needed) and drops a workspace from the registry. Its VM disk
 /// and `.gavmo/` are kept, so re-adding the path restores its state. The
 /// client must confirm with the user first.
 #[server]
-pub async fn remove_workspace(id: String) -> Result<(), ServerFnError> {
+pub async fn remove_workspace(id: String) -> Result<(), AppError> {
     let state = app_state()?;
-    state
-        .remove_workspace(&id)
-        .await
-        .map_err(ServerFnError::new)
+    state.remove_workspace(&id).await.map_err(AppError::from)
 }
 
 #[server]
-pub async fn browse_dir(path: Option<String>) -> Result<DirListing, ServerFnError> {
+pub async fn browse_dir(path: Option<String>) -> Result<DirListing, AppError> {
     use std::path::PathBuf;
 
     let dir = match path {
         Some(p) => PathBuf::from(p),
-        None => dirs::home_dir().ok_or_else(|| ServerFnError::new("no home directory"))?,
+        None => {
+            dirs::home_dir().ok_or_else(|| AppError::Internal("no home directory".to_owned()))?
+        }
     };
     let dir = std::fs::canonicalize(&dir)
-        .map_err(|e| ServerFnError::new(format!("{}: {e}", dir.display())))?;
+        .map_err(|e| AppError::InvalidInput(format!("{}: {e}", dir.display())))?;
 
     let mut entries = Vec::new();
     let read = std::fs::read_dir(&dir)
-        .map_err(|e| ServerFnError::new(format!("{}: {e}", dir.display())))?;
+        .map_err(|e| AppError::InvalidInput(format!("{}: {e}", dir.display())))?;
     for entry in read.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
         if !ft.is_dir() {
@@ -256,9 +288,9 @@ pub async fn browse_dir(path: Option<String>) -> Result<DirListing, ServerFnErro
 /// Lists the tools a workspace's `gavmo.yaml` requests, with their configured
 /// status. Read live, so config/secret changes show without a restart.
 #[server]
-pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, ServerFnError> {
+pub async fn list_tool_configs(id: String) -> Result<Vec<ToolConfig>, AppError> {
     let state = app_state()?;
-    Ok(state.list_tool_configs(&id).await)
+    Ok(state.list_tool_configs(&id).await?)
 }
 
 /// Stores (or replaces) a tool's credential on the host. `username` is only used
@@ -270,41 +302,38 @@ pub async fn set_tool_secret(
     tool_id: String,
     username: Option<String>,
     token: String,
-) -> Result<(), ServerFnError> {
+) -> Result<(), AppError> {
     let state = app_state()?;
     state
         .set_tool_secret(&id, &tool_id, username, token)
         .await
-        .map_err(ServerFnError::new)
+        .map_err(AppError::from)
 }
 
 /// Removes a tool's stored credential (disabling it on the workspace's next open).
 #[server]
-pub async fn clear_tool_secret(id: String, tool_id: String) -> Result<(), ServerFnError> {
+pub async fn clear_tool_secret(id: String, tool_id: String) -> Result<(), AppError> {
     let state = app_state()?;
     state
         .clear_tool_secret(&id, &tool_id)
         .await
-        .map_err(ServerFnError::new)
+        .map_err(AppError::from)
 }
 
 /// Live connectivity/credential test for a configured tool: forwards a `GET /`
 /// with the stored credential and returns the status + body. `Err` is returned
 /// for a non-2xx (or transport failure) so the UI can show a red result.
 #[server]
-pub async fn test_tool(id: String, tool_id: String) -> Result<String, ServerFnError> {
+pub async fn test_tool(id: String, tool_id: String) -> Result<String, AppError> {
     let state = app_state()?;
-    state
-        .test_tool(&id, &tool_id)
-        .await
-        .map_err(ServerFnError::new)
+    state.test_tool(&id, &tool_id).await.map_err(AppError::from)
 }
 
 /// Fetches the injected [`registry::AppState`] from Leptos context.
 #[cfg(feature = "ssr")]
-fn app_state() -> Result<crate::registry::AppState, ServerFnError> {
+fn app_state() -> Result<crate::registry::AppState, AppError> {
     use_context::<crate::registry::AppState>()
-        .ok_or_else(|| ServerFnError::new("app state not available"))
+        .ok_or_else(|| AppError::Internal("app state not available".to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +387,17 @@ fn vt_name(id: &str) -> String {
     id.hash(&mut hasher);
     // Prefixed because a CSS ident must not start with a digit.
     format!("ws-vt-{:x}", hasher.finish())
+}
+
+/// Sends the browser to `/login` (whose page explains how to get a fresh
+/// login link). No-op under `ssr`.
+fn go_to_login() {
+    #[cfg(feature = "hydrate")]
+    {
+        if let Err(e) = window().location().set_href("/login") {
+            leptos::logging::warn!("could not redirect to /login: {e:?}");
+        }
+    }
 }
 
 /// The element a click listener is attached to (`current_target`, so clicks
@@ -508,6 +548,8 @@ fn HomePage() -> impl IntoView {
                     workspaces.set(list);
                     fetch_error.set(None);
                 }
+                // An expired session would fail every poll: go log in again.
+                Err(AppError::Unauthorized) => go_to_login(),
                 // Keep the last-known list so one flaky poll doesn't blank the grid.
                 Err(e) => fetch_error.set(Some(e.to_string())),
             }

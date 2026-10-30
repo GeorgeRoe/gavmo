@@ -373,6 +373,20 @@ fn is_same_origin_request(headers: &HeaderMap) -> bool {
         .is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host))
 }
 
+/// A 401 whose body is a JSON-encoded [`crate::app::AppError::Unauthorized`],
+/// the same encoding server functions use for errors, so the browser can
+/// tell "logged out" from other failures and send the user to log in.
+fn unauthorized_api_response() -> Response {
+    let body = serde_json::to_string(&crate::app::AppError::Unauthorized)
+        .unwrap_or_else(|_| "\"Unauthorized\"".to_owned());
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
 // --- Auth gate ---
 
 /// Middleware for the whole app router: non-public requests need a valid
@@ -393,7 +407,7 @@ pub async fn require_session(State(auth): State<Arc<Auth>>, req: Request, next: 
             .any(|id| auth.sessions.is_valid(id, host));
     if !authenticated {
         return if is_api {
-            StatusCode::UNAUTHORIZED.into_response()
+            unauthorized_api_response()
         } else {
             Redirect::to(LOGIN_PATH).into_response()
         };
@@ -909,5 +923,27 @@ mod tests {
         let cookie = panel.session_cookie().await;
         let both = format!("gavmo_session=planted; {cookie}");
         assert_eq!(panel.api("POST", &both, SAME_ORIGIN).await, StatusCode::OK);
+    }
+
+    /// The 401 body decodes as `AppError::Unauthorized`, which the browser
+    /// uses to send the user back to log in.
+    #[tokio::test]
+    async fn api_401_body_is_an_encoded_unauthorized_error() {
+        let panel = panel().await;
+        let res = panel
+            .send(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/test")
+                    .header(header::HOST, PANEL)
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        let decoded: crate::app::AppError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded, crate::app::AppError::Unauthorized);
     }
 }

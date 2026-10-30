@@ -5,6 +5,7 @@ use std::sync::Arc;
 use mcp::{TokenAuthority, ToolDescriptor, ToolExecutor, ToolOutcome, WorkspaceScope};
 
 use super::AppState;
+use super::error::{RegistryError, Result};
 use super::util::lock_unpoisoned;
 use crate::app::ToolConfig;
 use crate::integrations::{BindingState, CandidateTool, Credential, Delivery, ResolvedIntegration};
@@ -17,9 +18,17 @@ impl AppState {
         // Values, not just presence: a credential bound to a different
         // destination than the current `base_url` isn't advertised at all
         // (defense in depth over the forwarder's own check).
-        let values = self
+        let values = match self
             .secrets_fetch_many(candidates.iter().map(|c| c.secret_key.clone()).collect())
-            .await;
+            .await
+        {
+            Ok(values) => values,
+            Err(e) => {
+                // The VM still boots, just without tools; the panel shows why.
+                tracing::warn!(workspace = %id, error = %e, "no tools enabled: secret store unavailable");
+                return Vec::new();
+            }
+        };
         candidates
             .into_iter()
             .filter(|candidate| {
@@ -55,25 +64,28 @@ impl AppState {
     }
 
     /// Finds a single requested tool by id (structural; no secret-store access).
-    pub(super) async fn candidate(&self, id: &str, tool_id: &str) -> Result<CandidateTool, String> {
+    pub(super) async fn candidate(&self, id: &str, tool_id: &str) -> Result<CandidateTool> {
         self.require_known(id).await?;
         self.candidates_for(id)
             .await
             .into_iter()
             .find(|candidate| candidate.id == tool_id)
-            .ok_or_else(|| format!("unknown tool: {tool_id}"))
+            .ok_or_else(|| RegistryError::InvalidInput(format!("unknown tool: {tool_id}")))
     }
 
     /// The control panel's view of a workspace's requested tools and whether
-    /// each has its credential configured.
-    pub async fn list_tool_configs(&self, id: &str) -> Vec<ToolConfig> {
+    /// each has its credential configured. Fails with
+    /// [`RegistryError::SecretStore`] if the store can't be read, rather than
+    /// reporting every tool as unconfigured.
+    pub async fn list_tool_configs(&self, id: &str) -> Result<Vec<ToolConfig>> {
+        self.require_known(id).await?;
         let candidates = self.candidates_for(id).await;
         // Values are needed to detect a changed destination, not just presence.
         let values = self
             .secrets_fetch_many(candidates.iter().map(|c| c.secret_key.clone()).collect())
-            .await;
+            .await?;
 
-        candidates
+        Ok(candidates
             .into_iter()
             .map(|tool| {
                 let state = crate::integrations::classify_binding(
@@ -122,7 +134,7 @@ impl AppState {
                     instructions: tool.def.instructions,
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Stores (or replaces) a tool's credential in the secret store. For Basic
@@ -135,15 +147,15 @@ impl AppState {
         tool_id: &str,
         username: Option<String>,
         token: String,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         let tool = self.candidate(id, tool_id).await?;
 
-        let delivery = Delivery::of(&tool.def)?;
+        let delivery = Delivery::of(&tool.def).map_err(RegistryError::InvalidInput)?;
         let credential = match delivery {
             Delivery::Basic => {
-                let username = username
-                    .filter(|u| !u.is_empty())
-                    .ok_or_else(|| "basic auth requires a username/email".to_owned())?;
+                let username = username.filter(|u| !u.is_empty()).ok_or_else(|| {
+                    RegistryError::InvalidInput("basic auth requires a username/email".to_owned())
+                })?;
                 Credential::Basic {
                     username,
                     password: token,
@@ -156,15 +168,17 @@ impl AppState {
         // approved, so a later `base_url` or `auth`/`header_name` change in the
         // untrusted `gavmo.yaml` fails closed instead of silently redirecting
         // or re-routing the token.
-        let canonical = toolspec::canonical_base_url(&tool.def.base_url)
-            .map_err(|e| format!("tool base_url could not be canonicalized: {e}"))?;
-        let bound = crate::integrations::wrap_stored_secret(&canonical, delivery, credential)?;
+        let canonical = toolspec::canonical_base_url(&tool.def.base_url).map_err(|e| {
+            RegistryError::InvalidInput(format!("tool base_url could not be canonicalized: {e}"))
+        })?;
+        let bound = crate::integrations::wrap_stored_secret(&canonical, delivery, credential)
+            .map_err(RegistryError::InvalidInput)?;
 
         self.secret_set(tool.secret_key, bound).await
     }
 
     /// Removes a tool's stored credential (disabling it on the next open).
-    pub async fn clear_tool_secret(&self, id: &str, tool_id: &str) -> Result<(), String> {
+    pub async fn clear_tool_secret(&self, id: &str, tool_id: &str) -> Result<()> {
         let tool = self.candidate(id, tool_id).await?;
         self.secret_delete(tool.secret_key).await
     }
@@ -172,9 +186,9 @@ impl AppState {
     /// Live credential test: forwards a `GET` to the tool's `test_path` (or
     /// `/`) with the stored credential; `Ok` on 2xx. Without an auth-reflecting
     /// `test_path` this is only a reachability probe.
-    pub async fn test_tool(&self, id: &str, tool_id: &str) -> Result<String, String> {
+    pub async fn test_tool(&self, id: &str, tool_id: &str) -> Result<String> {
         let tool = self.candidate(id, tool_id).await?;
-        let secret_value = self.secret_get(tool.secret_key.clone()).await;
+        let secret_value = self.secret_get(tool.secret_key.clone()).await?;
 
         let test_path = tool
             .def
@@ -194,7 +208,7 @@ impl AppState {
         .await
         {
             ToolOutcome::Success(text) => Ok(text),
-            ToolOutcome::Error(text) => Err(text),
+            ToolOutcome::Error(text) => Err(RegistryError::Failed(text)),
         }
     }
 }
@@ -241,7 +255,10 @@ impl ToolExecutor for AppState {
         {
             Some(integration) => {
                 // Fetched fresh per call; credentials are never cached.
-                let secret_value = self.secret_get(integration.secret_key.clone()).await;
+                let secret_value = match self.secret_get(integration.secret_key.clone()).await {
+                    Ok(value) => value,
+                    Err(e) => return ToolOutcome::Error(e.to_string()),
+                };
                 crate::integrations::forward(
                     &integration,
                     secret_value,
