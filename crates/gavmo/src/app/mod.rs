@@ -2,6 +2,9 @@
 //! [`crate::types`], server functions in [`crate::api`]). Compiled for both
 //! `ssr` and `hydrate`.
 
+#[cfg(test)]
+#[cfg(feature = "hydrate")]
+mod browser_tests;
 mod card;
 mod folder_browser;
 mod format;

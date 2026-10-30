@@ -7,6 +7,7 @@ the full-boot test runs anywhere, including inside a GAVMO VM.
 |---|---|---|---|
 | Unit | every crate, `#[cfg(test)]` modules | nothing | yes |
 | Daemon end-to-end | `crates/gavmo/src/daemon/{tests,mcp_tests}.rs` | nothing | yes |
+| Browser | `crates/gavmo/src/app/browser_tests.rs` | headless Firefox, `geckodriver`, `wasm-bindgen-test-runner` | separate command |
 | Real qemu | `crates/vm` (`#[ignore]`) | `qemu`, `virtiofsd`, `/dev/kvm` | no |
 | Full boot | `crates/gavmo/src/daemon/boot_tests.rs` (`#[ignore]`) | the above plus a built base image | no |
 
@@ -52,6 +53,30 @@ never touch `~/.local/share/gavmo` or the OS keyring.
   server, credentials withheld after a URL or delivery change, redirects not
   followed, old tokens rejected after stop.
 
+## Browser tests
+
+```sh
+cargo test -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
+```
+
+Components are mounted into a real DOM in headless Firefox, with real
+timers and the real server function client. `.cargo/config.toml` makes
+`wasm-bindgen-test-runner` the wasm32 test runner; it finds `firefox` and
+`geckodriver` on `PATH` (this repo's `gavmo.nix` provides all three, and
+`wasm-bindgen-cli` must match the `wasm-bindgen` version in `Cargo.lock`).
+
+The seam is the browser's `fetch`: each test replaces `globalThis.fetch`
+with a Rust handler that answers server function calls by path, so
+requests and replies go through the same encoding as in production and no
+production code has a test hook. Covered: `use_polling` never overlapping
+requests and stopping on stop and unmount, the boot console appending
+chunks (and its final fetch), stats clearing when the VM stops, the modal
+closing once when its workspace disappears, and a tool row keeping
+"Saved" across the list reload.
+
+The plain `#[test]` unit tests are not run in the browser; they already run
+natively.
+
 ## Real-qemu tests
 
 ```sh
@@ -88,6 +113,8 @@ cargo fmt --all --check
 cargo clippy --workspace --exclude gavmo --all-targets
 cargo clippy -p gavmo --features ssr --all-targets
 cargo clippy -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
+cargo clippy -p gavmo --lib --tests --features hydrate --target wasm32-unknown-unknown
+cargo test -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
 cargo leptos build
 ```
 

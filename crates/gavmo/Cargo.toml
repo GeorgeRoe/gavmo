@@ -63,7 +63,9 @@ web-sys = { version = "0.3", optional = true, features = [
     "MouseEvent",
 ] }
 
-[dev-dependencies]
+# Native (ssr) tests only: the wasm browser tests must not pull in the
+# server-side stack (secrets' crypto doesn't build for wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # `ServiceExt::oneshot` for auth router tests. Already a transitive dep of
 # axum; this only enables the `util` feature.
 tower = { workspace = true, features = ["util"] }
@@ -102,6 +104,24 @@ ssr = [
     "leptos_router/ssr",
     "leptos_axum/default",
 ]
+
+# Browser tests (app::browser_tests). Pinned: each wasm-bindgen-test release
+# requires one exact wasm-bindgen, which must match the CLI (see gavmo.nix).
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.79"
+serde_json.workspace = true
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Event",
+    "EventTarget",
+    "Headers",
+    "HtmlInputElement",
+    "Node",
+    "Request",
+    "Response",
+    "ResponseInit",
+    "Window",
+] }
 
 [package.metadata.leptos]
 output-name = "gavmo"

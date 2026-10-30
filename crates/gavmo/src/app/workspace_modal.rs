@@ -239,7 +239,10 @@ fn ConfirmButton(
 /// `Booting`, fetched once more when booting ends, and kept visible after so
 /// the log doesn't vanish mid-read.
 #[component]
-fn ConsolePanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl IntoView {
+pub(super) fn ConsolePanel(
+    id: StoredValue<String>,
+    status: Memo<WorkspaceStatus>,
+) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let offset = StoredValue::new(0u64);
     let console_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
@@ -322,8 +325,8 @@ fn trim_front(text: &mut String, max: usize) {
 /// between two CPU samples, so faster polls would overlap) and cleared when
 /// it stops.
 #[component]
-fn StatsPanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl IntoView {
-    let stats = RwSignal::new(None::<VmStats>);
+pub(super) fn StatsPanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl IntoView {
+    let latest = RwSignal::new(None::<VmStats>);
     use_polling(
         move || matches!(status.get(), WorkspaceStatus::Running { .. }),
         Duration::from_secs(2),
@@ -331,11 +334,11 @@ fn StatsPanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl In
             let id = id.get_value();
             async move { poll_vm_stats(id).await.ok() }
         },
-        move |value| stats.set(value),
-        move || stats.set(None),
+        move |value| latest.set(value),
+        move || latest.set(None),
         false,
     );
-    move || stats.get().map(|s| view! { <StatsView stats=s /> })
+    move || latest.get().map(|s| view! { <StatsView stats=s /> })
 }
 
 #[component]
