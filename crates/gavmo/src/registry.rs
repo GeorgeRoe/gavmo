@@ -20,7 +20,7 @@ use mcp::{TokenAuthority, ToolDescriptor, ToolExecutor, ToolOutcome, WorkspaceSc
 use secrets::SecretStore;
 
 use crate::app::{ToolConfig, VmStats, WorkspaceInfo, WorkspaceStatus};
-use crate::integrations::{CandidateTool, ResolvedIntegration};
+use crate::integrations::{BindingState, CandidateTool, Credential, Delivery, ResolvedIntegration};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
@@ -448,10 +448,10 @@ impl AppState {
             .filter(|candidate| {
                 matches!(
                     crate::integrations::classify_binding(
-                        &candidate.def.base_url,
+                        &candidate.def,
                         values.get(&candidate.secret_key).map(String::as_str),
                     ),
-                    crate::integrations::BindingState::Configured
+                    BindingState::Configured
                 )
             })
             .map(CandidateTool::into_resolved)
@@ -566,20 +566,34 @@ impl AppState {
             .into_iter()
             .map(|tool| {
                 let state = crate::integrations::classify_binding(
-                    &tool.def.base_url,
+                    &tool.def,
                     values.get(&tool.secret_key).map(String::as_str),
                 );
-                let (configured, url_changed, bound_url) = match state {
-                    crate::integrations::BindingState::NotConfigured => (false, false, None),
-                    crate::integrations::BindingState::Configured => (true, false, None),
-                    crate::integrations::BindingState::DestinationChanged { bound_url } => {
-                        (false, true, bound_url)
+                let delivery = Delivery::of(&tool.def)
+                    .map(|d| d.describe())
+                    .unwrap_or_default();
+                let (configured, url_changed, bound_url, approved_delivery) = match state {
+                    BindingState::NotConfigured => (false, false, None, None),
+                    BindingState::Configured => (true, false, None, None),
+                    BindingState::DestinationChanged { bound_url } => {
+                        (false, true, bound_url, None)
                     }
+                    BindingState::DeliveryChanged { approved } => (
+                        false,
+                        false,
+                        None,
+                        Some(approved.map_or_else(
+                            || "an unrecorded method (saved by an older GAVMO)".to_owned(),
+                            |d| d.describe(),
+                        )),
+                    ),
                 };
                 ToolConfig {
                     configured,
                     url_changed,
                     bound_url,
+                    delivery,
+                    approved_delivery,
                     id: tool.id,
                     description: tool
                         .def
@@ -613,24 +627,27 @@ impl AppState {
     ) -> Result<(), String> {
         let tool = self.candidate(id, tool_id).await?;
 
-        let value = match tool.def.auth {
-            toolspec::AuthScheme::Basic => {
+        let delivery = Delivery::of(&tool.def)?;
+        let credential = match delivery {
+            Delivery::Basic => {
                 let username = username
                     .filter(|u| !u.is_empty())
-                    .ok_or_else(|| "basic auth requires a username/email".to_string())?;
-                serde_json::json!({ "username": username, "password": token })
+                    .ok_or_else(|| "basic auth requires a username/email".to_owned())?;
+                Credential::Basic {
+                    username,
+                    password: token,
+                }
             }
-            toolspec::AuthScheme::Bearer | toolspec::AuthScheme::Header => {
-                serde_json::json!({ "token": token })
-            }
+            Delivery::Bearer | Delivery::Header { .. } => Credential::Token { token },
         };
 
-        // Bind the credential to the destination the user approved, so a later
-        // `base_url` change in the untrusted `gavmo.yaml` fails closed instead
-        // of silently redirecting the token.
+        // Bind the credential to the destination and delivery the user
+        // approved, so a later `base_url` or `auth`/`header_name` change in the
+        // untrusted `gavmo.yaml` fails closed instead of silently redirecting
+        // or re-routing the token.
         let canonical = toolspec::canonical_base_url(&tool.def.base_url)
             .map_err(|e| format!("tool base_url could not be canonicalized: {e}"))?;
-        let bound = crate::integrations::wrap_stored_secret(&canonical, &value.to_string());
+        let bound = crate::integrations::wrap_stored_secret(&canonical, delivery, credential)?;
 
         self.secret_set(tool.secret_key, bound).await
     }

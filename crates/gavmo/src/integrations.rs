@@ -35,91 +35,272 @@ pub fn forwarding_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Shape of a stored Basic-auth credential (e.g. Jira Cloud: `email` as
-/// `username` + API token as `password`).
-#[derive(Debug, Deserialize)]
-struct BasicCredential {
-    username: String,
-    password: String,
+/// How a credential is attached to requests. Part of what the user approves
+/// when saving it, alongside the destination: if the untrusted `gavmo.yaml`
+/// later switches e.g. `bearer` to `header: X-Echo-Me` (a header the origin
+/// reflects back, or one that survives redirects), the credential must not be
+/// released until the user re-confirms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "auth", rename_all = "lowercase", deny_unknown_fields)]
+pub enum Delivery {
+    Basic,
+    Bearer,
+    Header { header_name: String },
 }
 
-/// Shape of a stored single-token credential (Bearer / custom header):
-/// `{"token": "..."}`.
-#[derive(Debug, Deserialize)]
-struct TokenCredential {
-    token: String,
-}
+impl Delivery {
+    /// The delivery a tool definition currently declares.
+    pub fn of(def: &ToolDef) -> Result<Self, String> {
+        Ok(match def.auth {
+            AuthScheme::Basic => Self::Basic,
+            AuthScheme::Bearer => Self::Bearer,
+            AuthScheme::Header => Self::Header {
+                header_name: def
+                    .header_name
+                    .clone()
+                    .ok_or_else(|| "header auth is missing its header_name".to_owned())?,
+            },
+        })
+    }
 
-/// Envelope written to the secret store: the credential plus the canonical
-/// `base_url` it was approved for. If the repo's `base_url` changes, the
-/// credential is not released (fails closed).
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredSecret {
-    /// Canonical base URL (see [`toolspec::canonical_base_url`]).
-    bound_url: String,
-    /// Inner credential JSON.
-    credential: String,
-}
+    /// Equality with HTTP's case-insensitive header names.
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Header { header_name: a }, Self::Header { header_name: b }) => {
+                a.eq_ignore_ascii_case(b)
+            }
+            _ => self == other,
+        }
+    }
 
-/// A stored secret with its envelope removed.
-pub struct ParsedSecret {
-    /// The URL the credential was approved for; `None` if the stored value
-    /// has no envelope.
-    pub bound_url: Option<String>,
-    /// The inner credential JSON to hand to [`apply_auth`].
-    pub credential: String,
-}
-
-/// Wraps a credential with the URL it is approved for. Saving a secret is the
-/// user's approval of `canonical_url` (the control panel shows it first).
-pub fn wrap_stored_secret(canonical_url: &str, credential_json: &str) -> String {
-    // Cannot realistically fail; the bare fallback is treated as unbound.
-    serde_json::to_string(&StoredSecret {
-        bound_url: canonical_url.to_string(),
-        credential: credential_json.to_string(),
-    })
-    .unwrap_or_else(|_| credential_json.to_string())
-}
-
-/// Removes the stored envelope. Any other shape is treated as unbound
-/// (`bound_url: None`), which forces re-approval before release.
-pub fn parse_stored_secret(raw: &str) -> ParsedSecret {
-    match serde_json::from_str::<StoredSecret>(raw) {
-        Ok(env) => ParsedSecret {
-            bound_url: Some(env.bound_url),
-            credential: env.credential,
-        },
-        Err(_) => ParsedSecret {
-            bound_url: None,
-            credential: raw.to_string(),
-        },
+    /// Human-readable, for the control panel and error messages.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Basic => "HTTP Basic auth".to_owned(),
+            Self::Bearer => "a Bearer token in the Authorization header".to_owned(),
+            Self::Header { header_name } => format!("the {header_name} header"),
+        }
     }
 }
 
-/// A tool's credential state with respect to URL binding.
+/// A stored credential. `Debug` is redacting so it can't leak via logs.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Credential {
+    /// e.g. Jira Cloud: email as `username`, API token as `password`.
+    Basic { username: String, password: String },
+    /// Bearer or custom-header token.
+    Token { token: String },
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Token { .. } => f
+                .debug_struct("Token")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl Credential {
+    /// Whether this credential's shape is the one `delivery` needs.
+    fn fits(&self, delivery: &Delivery) -> bool {
+        matches!(
+            (self, delivery),
+            (Self::Basic { .. }, Delivery::Basic)
+                | (
+                    Self::Token { .. },
+                    Delivery::Bearer | Delivery::Header { .. }
+                )
+        )
+    }
+}
+
+/// Current envelope version written to the secret store.
+const STORED_SECRET_VERSION: u8 = 2;
+
+/// Envelope written to the secret store: the credential plus everything the
+/// user approved about where and how it is sent. Any difference from the
+/// tool's current definition withholds the credential (fails closed).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredSecret {
+    v: u8,
+    /// Canonical base URL (see [`toolspec::canonical_base_url`]).
+    bound_url: String,
+    delivery: Delivery,
+    credential: Credential,
+}
+
+/// The v1 envelope: bound to a URL only, not to a delivery. Recognized so the
+/// UI can explain why re-approval is needed; its credential is never used.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStoredSecret {
+    bound_url: String,
+    #[expect(dead_code, reason = "parsed only to recognize the shape")]
+    credential: String,
+}
+
+/// A stored value, classified.
+#[derive(Debug)]
+pub enum ParsedSecret {
+    /// Current envelope; usable if it matches the tool's definition.
+    Bound {
+        bound_url: String,
+        delivery: Delivery,
+        credential: Credential,
+    },
+    /// v1 envelope: has a destination but no recorded delivery.
+    LegacyUrlOnly { bound_url: String },
+    /// No recognizable envelope (pre-binding value, or malformed).
+    Unbound,
+}
+
+/// Wraps a credential with the destination and delivery it is approved for.
+/// Saving a secret is the user's approval of both (the control panel shows
+/// them first).
+pub fn wrap_stored_secret(
+    canonical_url: &str,
+    delivery: Delivery,
+    credential: Credential,
+) -> Result<String, String> {
+    if !credential.fits(&delivery) {
+        return Err(format!(
+            "credential shape does not match {}",
+            delivery.describe()
+        ));
+    }
+    serde_json::to_string(&StoredSecret {
+        v: STORED_SECRET_VERSION,
+        bound_url: canonical_url.to_owned(),
+        delivery,
+        credential,
+    })
+    .map_err(|e| format!("failed to encode credential: {e}"))
+}
+
+/// Classifies a raw stored value. Nothing but a well-formed current envelope
+/// whose credential fits its delivery yields a usable credential.
+pub fn parse_stored_secret(raw: &str) -> ParsedSecret {
+    if let Ok(env) = serde_json::from_str::<StoredSecret>(raw)
+        && env.v == STORED_SECRET_VERSION
+        && env.credential.fits(&env.delivery)
+    {
+        return ParsedSecret::Bound {
+            bound_url: env.bound_url,
+            delivery: env.delivery,
+            credential: env.credential,
+        };
+    }
+    match serde_json::from_str::<LegacyStoredSecret>(raw) {
+        Ok(legacy) => ParsedSecret::LegacyUrlOnly {
+            bound_url: legacy.bound_url,
+        },
+        Err(_) => ParsedSecret::Unbound,
+    }
+}
+
+/// A tool's credential state with respect to its approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingState {
     /// No credential stored.
     NotConfigured,
-    /// Credential stored and bound to the tool's current `base_url`.
+    /// Stored, and approved for exactly the tool's current destination and
+    /// delivery.
     Configured,
-    /// Credential bound to a different destination than the tool now declares.
+    /// Approved for a different destination than the tool now declares.
     /// `bound_url` lets the UI show "was X, now Y"; `None` means unbound.
     DestinationChanged { bound_url: Option<String> },
+    /// Same destination, but approved for a different delivery (or, for
+    /// `None`, saved before deliveries were recorded).
+    DeliveryChanged { approved: Option<Delivery> },
 }
 
-/// Classifies a tool's binding state from its current `base_url` and the raw
-/// stored value. Shared by boot-time resolution and the control panel.
-pub fn classify_binding(current_base_url: &str, stored_value: Option<&str>) -> BindingState {
+/// Decides whether `stored_value` may be released for `def`. `Ok` carries the
+/// credential and its (current == approved) delivery; `Err` carries the state
+/// to report and a message for the agent.
+fn release<'a>(
+    def: &ToolDef,
+    parsed: &'a ParsedSecret,
+) -> Result<(&'a Delivery, &'a Credential), (BindingState, String)> {
+    const FIX: &str = "re-confirm it in the GAVMO control panel";
+
+    let current_url = toolspec::canonical_base_url(&def.base_url).map_err(|e| {
+        (
+            BindingState::DestinationChanged { bound_url: None },
+            format!("integration base_url could not be canonicalized for binding check: {e}"),
+        )
+    })?;
+    let current_delivery =
+        Delivery::of(def).map_err(|e| (BindingState::DeliveryChanged { approved: None }, e))?;
+
+    let url_changed = |bound: &str| {
+        (
+            BindingState::DestinationChanged {
+                bound_url: Some(bound.to_owned()),
+            },
+            format!(
+                "credential was approved for {bound} but this tool now points at {current_url}; {FIX}"
+            ),
+        )
+    };
+
+    match parsed {
+        ParsedSecret::Unbound => Err((
+            BindingState::DestinationChanged { bound_url: None },
+            format!(
+                "credential is not bound to a destination (saved before URL-binding, or the \
+                 stored value is malformed); {FIX}"
+            ),
+        )),
+        ParsedSecret::LegacyUrlOnly { bound_url } | ParsedSecret::Bound { bound_url, .. }
+            if *bound_url != current_url =>
+        {
+            Err(url_changed(bound_url))
+        }
+        ParsedSecret::LegacyUrlOnly { .. } => Err((
+            BindingState::DeliveryChanged { approved: None },
+            format!(
+                "credential was saved before GAVMO recorded how it may be sent; {FIX} \
+                 (this tool sends it as {})",
+                current_delivery.describe()
+            ),
+        )),
+        ParsedSecret::Bound { delivery, .. } if !delivery.same_as(&current_delivery) => Err((
+            BindingState::DeliveryChanged {
+                approved: Some(delivery.clone()),
+            },
+            format!(
+                "credential was approved to be sent as {} but this tool now sends it as {}; {FIX}",
+                delivery.describe(),
+                current_delivery.describe()
+            ),
+        )),
+        ParsedSecret::Bound {
+            delivery,
+            credential,
+            ..
+        } => Ok((delivery, credential)),
+    }
+}
+
+/// Classifies a tool's credential state from its current definition and the
+/// raw stored value. Shared by boot-time resolution and the control panel.
+pub fn classify_binding(def: &ToolDef, stored_value: Option<&str>) -> BindingState {
     let Some(raw) = stored_value else {
         return BindingState::NotConfigured;
     };
-    let parsed = parse_stored_secret(raw);
-    match check_binding(current_base_url, parsed.bound_url.as_deref()) {
-        Ok(()) => BindingState::Configured,
-        Err(_) => BindingState::DestinationChanged {
-            bound_url: parsed.bound_url,
-        },
+    match release(def, &parse_stored_secret(raw)) {
+        Ok(_) => BindingState::Configured,
+        Err((state, _)) => state,
     }
 }
 
@@ -334,22 +515,14 @@ pub async fn forward(
     };
 
     // The hard security boundary (the UI warning is only UX): release the
-    // credential only to the destination it was approved for.
+    // credential only to the destination, and in the way, it was approved for.
     let parsed = parse_stored_secret(&secret_value);
-    if let Err(message) = check_binding(&integration.def.base_url, parsed.bound_url.as_deref()) {
-        return mcp::ToolOutcome::Error(message);
-    }
-
-    let request = client.request(method, url);
-    let request = match apply_auth(
-        request,
-        integration.def.auth,
-        integration.def.header_name.as_deref(),
-        &parsed.credential,
-    ) {
-        Ok(request) => request,
-        Err(e) => return mcp::ToolOutcome::Error(e),
+    let (delivery, credential) = match release(&integration.def, &parsed) {
+        Ok(approved) => approved,
+        Err((_, message)) => return mcp::ToolOutcome::Error(message),
     };
+
+    let request = apply_auth(client.request(method, url), delivery, credential);
     let request = match body {
         Some(body) => request.body(body),
         None => request,
@@ -385,62 +558,23 @@ pub async fn forward(
     }
 }
 
-/// Checks that a credential's bound URL matches the integration's current
-/// `base_url`. Fails closed on unbound values, uncanonicalizable URLs and
-/// mismatches; the error names both destinations.
-pub fn check_binding(current_base_url: &str, bound_url: Option<&str>) -> Result<(), String> {
-    let current = toolspec::canonical_base_url(current_base_url).map_err(|e| {
-        format!("integration base_url could not be canonicalized for binding check: {e}")
-    })?;
-    match bound_url {
-        Some(bound) if bound == current => Ok(()),
-        Some(bound) => Err(format!(
-            "credential was approved for {bound} but this tool now points at {current}; \
-             re-confirm it in the GAVMO control panel"
-        )),
-        None => Err(
-            "credential is not bound to a destination (saved before URL-binding, or the stored \
-             value is malformed); re-save it in the GAVMO control panel to confirm its destination"
-                .to_string(),
-        ),
-    }
-}
-
-/// Attaches the credential per its auth scheme. Errs if the secret is not
-/// the shape the scheme expects.
+/// Attaches an approved credential per its delivery. Shapes always fit:
+/// [`parse_stored_secret`] rejects envelopes where they don't.
 fn apply_auth(
     request: reqwest::RequestBuilder,
-    scheme: AuthScheme,
-    header_name: Option<&str>,
-    secret_value: &str,
-) -> Result<reqwest::RequestBuilder, String> {
-    match scheme {
-        AuthScheme::Basic => {
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "serde_json errors can quote the input, i.e. the secret; never surface it"
-            )]
-            let cred: BasicCredential = serde_json::from_str(secret_value).map_err(|_| {
-                "stored credential for basic auth must be JSON {\"username\",\"password\"}"
-                    .to_owned()
-            })?;
-            Ok(request.basic_auth(cred.username, Some(cred.password)))
+    delivery: &Delivery,
+    credential: &Credential,
+) -> reqwest::RequestBuilder {
+    match (delivery, credential) {
+        (Delivery::Basic, Credential::Basic { username, password }) => {
+            request.basic_auth(username, Some(password))
         }
-        AuthScheme::Bearer => Ok(request.bearer_auth(token_from_secret(secret_value))),
-        AuthScheme::Header => {
-            // Validated at parse time; guard rather than unwrap.
-            let name =
-                header_name.ok_or_else(|| "header auth is missing its header_name".to_string())?;
-            Ok(request.header(name, token_from_secret(secret_value)))
+        (Delivery::Bearer, Credential::Token { token }) => request.bearer_auth(token),
+        (Delivery::Header { header_name }, Credential::Token { token }) => {
+            request.header(header_name.as_str(), token.as_str())
         }
-    }
-}
-
-/// Extracts a token from `{"token":"..."}` JSON or a bare token string.
-fn token_from_secret(secret_value: &str) -> String {
-    match serde_json::from_str::<TokenCredential>(secret_value) {
-        Ok(cred) => cred.token,
-        Err(_) => secret_value.to_string(),
+        // Unreachable by construction; never send a mismatched credential.
+        _ => request,
     }
 }
 
@@ -652,161 +786,269 @@ tools:
         }
     }
 
-    // --- URL binding ---
+    // --- Binding (destination + delivery) ---
 
-    /// A properly-bound Basic credential for the jira integration's own `base_url`.
+    fn jira_basic() -> Credential {
+        Credential::Basic {
+            username: "a@b.c".to_owned(),
+            password: "t".to_owned(),
+        }
+    }
+
+    fn token(t: &str) -> Credential {
+        Credential::Token {
+            token: t.to_owned(),
+        }
+    }
+
+    fn header(name: &str) -> Delivery {
+        Delivery::Header {
+            header_name: name.to_owned(),
+        }
+    }
+
+    /// A tool definition at `base_url` with the given delivery.
+    fn def(base_url: &str, delivery: &Delivery) -> ToolDef {
+        let (auth, header_line) = match delivery {
+            Delivery::Basic => ("basic", String::new()),
+            Delivery::Bearer => ("bearer", String::new()),
+            Delivery::Header { header_name } => {
+                ("header", format!("    header_name: {header_name}\n"))
+            }
+        };
+        let yaml = format!(
+            "tools:\n  t:\n    type: http\n    base_url: {base_url}\n    auth: {auth}\n{header_line}    secret: s\n"
+        );
+        toolspec::parse_config(&yaml)
+            .unwrap()
+            .tools
+            .remove("t")
+            .unwrap()
+    }
+
+    fn bound(base_url: &str, delivery: Delivery, credential: Credential) -> String {
+        wrap_stored_secret(
+            &toolspec::canonical_base_url(base_url).unwrap(),
+            delivery,
+            credential,
+        )
+        .unwrap()
+    }
+
+    /// A properly-bound Basic credential for the jira integration.
     fn bound_jira_secret() -> String {
-        let url = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
-        wrap_stored_secret(&url, r#"{"username":"a@b.c","password":"t"}"#)
+        bound("https://dafni.atlassian.net", Delivery::Basic, jira_basic())
     }
 
     #[test]
     fn stored_secret_envelope_round_trips() {
-        let wrapped = wrap_stored_secret("https://h.example.com/", r#"{"token":"abc"}"#);
-        let parsed = parse_stored_secret(&wrapped);
-        assert_eq!(parsed.bound_url.as_deref(), Some("https://h.example.com/"));
-        assert_eq!(parsed.credential, r#"{"token":"abc"}"#);
+        let wrapped = bound("https://h.example.com", header("X-Key"), token("abc"));
+        match parse_stored_secret(&wrapped) {
+            ParsedSecret::Bound {
+                bound_url,
+                delivery,
+                credential: Credential::Token { token },
+            } => {
+                assert_eq!(bound_url, "https://h.example.com:443/");
+                assert_eq!(delivery, header("X-Key"));
+                assert_eq!(token, "abc");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
-    fn parse_stored_secret_treats_a_bare_credential_as_unbound() {
-        // No envelope -> unbound.
-        let parsed = parse_stored_secret(r#"{"username":"a","password":"b"}"#);
-        assert!(parsed.bound_url.is_none());
-        assert_eq!(parsed.credential, r#"{"username":"a","password":"b"}"#);
+    fn wrap_refuses_a_credential_that_does_not_fit_its_delivery() {
+        assert!(wrap_stored_secret("https://h/", Delivery::Basic, token("t")).is_err());
+        assert!(wrap_stored_secret("https://h/", Delivery::Bearer, jira_basic()).is_err());
     }
 
     #[test]
-    fn check_binding_accepts_a_matching_destination() {
-        let bound = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
-        assert!(check_binding("https://dafni.atlassian.net", Some(&bound)).is_ok());
-        // Cosmetic differences (trailing slash) must still match.
-        assert!(check_binding("https://dafni.atlassian.net/", Some(&bound)).is_ok());
+    fn parse_classifies_bare_legacy_and_malformed_values() {
+        assert!(matches!(
+            parse_stored_secret(r#"{"username":"a","password":"b"}"#),
+            ParsedSecret::Unbound
+        ));
+        assert!(matches!(
+            parse_stored_secret("not json"),
+            ParsedSecret::Unbound
+        ));
+        let v1 = r#"{"bound_url":"https://h.example.com:443/","credential":"{\"token\":\"t\"}"}"#;
+        assert!(matches!(
+            parse_stored_secret(v1),
+            ParsedSecret::LegacyUrlOnly { bound_url } if bound_url == "https://h.example.com:443/"
+        ));
+        // A hand-edited envelope whose credential doesn't fit is not usable.
+        let mismatched = r#"{"v":2,"bound_url":"https://h/","delivery":{"auth":"basic"},"credential":{"token":"t"}}"#;
+        assert!(matches!(
+            parse_stored_secret(mismatched),
+            ParsedSecret::Unbound
+        ));
     }
 
     #[test]
-    fn check_binding_rejects_a_changed_destination() {
-        let bound = toolspec::canonical_base_url("https://dafni.atlassian.net").unwrap();
-        let err = check_binding("https://evil.com", Some(&bound)).unwrap_err();
-        assert!(err.contains("evil.com"), "{err}");
-        assert!(err.contains("re-confirm"), "{err}");
+    fn credential_debug_is_redacted() {
+        let debug = format!("{:?} {:?}", jira_basic(), token("hunter2"));
+        assert!(debug.contains("a@b.c"), "{debug}");
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("\"t\""),
+            "{debug}"
+        );
     }
 
     #[test]
-    fn check_binding_rejects_an_unbound_credential() {
-        let err = check_binding("https://dafni.atlassian.net", None).unwrap_err();
-        assert!(err.contains("not bound"), "{err}");
+    fn classify_binding_configured_only_for_exact_destination_and_delivery() {
+        let base = "https://dafni.atlassian.net";
+        let tool = def(base, &header("X-API-Key"));
+
+        assert_eq!(classify_binding(&tool, None), BindingState::NotConfigured);
+        assert_eq!(
+            classify_binding(&tool, Some(&bound(base, header("X-API-Key"), token("t")))),
+            BindingState::Configured
+        );
+        // Header names are case-insensitive in HTTP.
+        assert_eq!(
+            classify_binding(&tool, Some(&bound(base, header("x-api-key"), token("t")))),
+            BindingState::Configured
+        );
+        // Trailing slash is cosmetic.
+        assert_eq!(
+            classify_binding(
+                &tool,
+                Some(&bound(
+                    "https://dafni.atlassian.net/",
+                    header("X-API-Key"),
+                    token("t")
+                ))
+            ),
+            BindingState::Configured
+        );
+    }
+
+    #[test]
+    fn classify_binding_reports_a_changed_destination() {
+        let tool = def("https://dafni.atlassian.net", &Delivery::Basic);
+        let stored = bound("https://evil.com", Delivery::Basic, jira_basic());
+        assert_eq!(
+            classify_binding(&tool, Some(&stored)),
+            BindingState::DestinationChanged {
+                bound_url: Some("https://evil.com:443/".to_owned())
+            }
+        );
+    }
+
+    /// The attack this binding exists for: the repo keeps the URL but changes
+    /// how the credential is sent.
+    #[test]
+    fn classify_binding_reports_a_changed_delivery() {
+        let base = "https://h.example.com";
+        let stored = bound(base, Delivery::Bearer, token("t"));
+        for now in [header("X-Echo"), Delivery::Basic] {
+            assert_eq!(
+                classify_binding(&def(base, &now), Some(&stored)),
+                BindingState::DeliveryChanged {
+                    approved: Some(Delivery::Bearer)
+                },
+                "{now:?}"
+            );
+        }
+        let stored = bound(base, header("X-API-Key"), token("t"));
+        assert_eq!(
+            classify_binding(&def(base, &header("Cookie")), Some(&stored)),
+            BindingState::DeliveryChanged {
+                approved: Some(header("X-API-Key"))
+            }
+        );
+    }
+
+    #[test]
+    fn classify_binding_requires_reapproval_for_v1_and_bare_values() {
+        let base = "https://h.example.com";
+        let tool = def(base, &Delivery::Bearer);
+        let v1_same =
+            r#"{"bound_url":"https://h.example.com:443/","credential":"{\"token\":\"t\"}"}"#;
+        assert_eq!(
+            classify_binding(&tool, Some(v1_same)),
+            BindingState::DeliveryChanged { approved: None }
+        );
+        let v1_other = r#"{"bound_url":"https://evil.com:443/","credential":"{\"token\":\"t\"}"}"#;
+        assert_eq!(
+            classify_binding(&tool, Some(v1_other)),
+            BindingState::DestinationChanged {
+                bound_url: Some("https://evil.com:443/".to_owned())
+            }
+        );
+        assert_eq!(
+            classify_binding(&tool, Some(r#"{"token":"t"}"#)),
+            BindingState::DestinationChanged { bound_url: None }
+        );
+    }
+
+    async fn forward_with(stored: String) -> mcp::ToolOutcome {
+        forward(
+            &jira_integration(),
+            Some(stored),
+            &args(serde_json::json!({"method": "GET", "path": "/rest/api/3/myself"})),
+            &reqwest::Client::new(),
+        )
+        .await
+    }
+
+    fn assert_error_contains(outcome: mcp::ToolOutcome, needle: &str) {
+        match outcome {
+            mcp::ToolOutcome::Error(text) => assert!(text.contains(needle), "{text}"),
+            other @ mcp::ToolOutcome::Success(_) => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn forward_rejects_a_credential_bound_to_a_different_url() {
-        // Credential approved for example.com, tool now points at atlassian.
-        let wrong = wrap_stored_secret(
-            &toolspec::canonical_base_url("https://example.com").unwrap(),
-            r#"{"username":"a@b.c","password":"t"}"#,
-        );
-        let outcome = forward(
-            &jira_integration(),
-            Some(wrong),
-            &args(serde_json::json!({"method": "GET", "path": "/rest/api/3/myself"})),
-            &reqwest::Client::new(),
-        )
-        .await;
-        match outcome {
-            mcp::ToolOutcome::Error(text) => assert!(text.contains("re-confirm"), "{text}"),
-            other @ mcp::ToolOutcome::Success(_) => panic!("expected binding error, got {other:?}"),
-        }
+        let stored = bound("https://evil.com", Delivery::Basic, jira_basic());
+        assert_error_contains(forward_with(stored).await, "re-confirm");
     }
 
     #[tokio::test]
-    async fn forward_rejects_an_unbound_legacy_credential() {
-        let outcome = forward(
-            &jira_integration(),
-            // Bare credential, no envelope.
-            Some(r#"{"username":"a@b.c","password":"t"}"#.to_string()),
-            &args(serde_json::json!({"method": "GET", "path": "/rest/api/3/myself"})),
-            &reqwest::Client::new(),
-        )
-        .await;
-        match outcome {
-            mcp::ToolOutcome::Error(text) => assert!(text.contains("not bound"), "{text}"),
-            other @ mcp::ToolOutcome::Success(_) => panic!("expected binding error, got {other:?}"),
-        }
+    async fn forward_rejects_a_credential_approved_for_a_different_delivery() {
+        let stored = bound("https://dafni.atlassian.net", Delivery::Bearer, token("t"));
+        assert_error_contains(forward_with(stored).await, "approved to be sent as");
     }
 
-    #[test]
-    fn classify_binding_covers_the_tri_state() {
-        let base = "https://dafni.atlassian.net";
-        let good = wrap_stored_secret(
-            &toolspec::canonical_base_url(base).unwrap(),
-            r#"{"token":"t"}"#,
+    #[tokio::test]
+    async fn forward_rejects_bare_and_v1_credentials() {
+        assert_error_contains(
+            forward_with(r#"{"username":"a@b.c","password":"t"}"#.to_owned()).await,
+            "not bound",
         );
-        let bad = wrap_stored_secret(
-            &toolspec::canonical_base_url("https://evil.com").unwrap(),
-            r#"{"token":"t"}"#,
-        );
-
-        assert_eq!(classify_binding(base, None), BindingState::NotConfigured);
-        assert_eq!(
-            classify_binding(base, Some(&good)),
-            BindingState::Configured
-        );
-        match classify_binding(base, Some(&bad)) {
-            BindingState::DestinationChanged { bound_url } => {
-                assert_eq!(
-                    bound_url.as_deref(),
-                    Some(
-                        toolspec::canonical_base_url("https://evil.com")
-                            .unwrap()
-                            .as_str()
-                    )
-                );
-            }
-            other => panic!("expected DestinationChanged, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_binding_reports_a_legacy_unbound_value_as_changed_with_no_url() {
-        match classify_binding("https://h.example.com", Some(r#"{"token":"t"}"#)) {
-            BindingState::DestinationChanged { bound_url } => assert!(bound_url.is_none()),
-            other => panic!("expected DestinationChanged, got {other:?}"),
-        }
+        let v1 = r#"{"bound_url":"https://dafni.atlassian.net:443/","credential":"{\"username\":\"a\",\"password\":\"b\"}"}"#;
+        assert_error_contains(forward_with(v1.to_owned()).await, "saved before");
     }
 
     #[test]
     fn a_bound_secret_for_the_integration_passes_its_own_binding_check() {
-        // A credential bound to the tool's own base_url must never be rejected.
         let integration = jira_integration();
-        let parsed = parse_stored_secret(&bound_jira_secret());
-        assert!(
-            check_binding(&integration.def.base_url, parsed.bound_url.as_deref()).is_ok(),
+        assert_eq!(
+            classify_binding(&integration.def, Some(&bound_jira_secret())),
+            BindingState::Configured,
             "a freshly-bound credential must pass its own tool's binding check"
         );
     }
 
     // --- Auth injection ---
 
-    fn built_request(
-        scheme: AuthScheme,
-        header_name: Option<&str>,
-        secret: &str,
-    ) -> reqwest::Request {
+    fn built_request(delivery: &Delivery, credential: &Credential) -> reqwest::Request {
         let client = reqwest::Client::new();
-        let builder = client.get("https://h.example.com/x");
-        apply_auth(builder, scheme, header_name, secret)
-            .unwrap()
+        apply_auth(client.get("https://h.example.com/x"), delivery, credential)
             .build()
             .unwrap()
     }
 
     #[test]
     fn apply_auth_basic_sets_base64_authorization_header() {
-        let req = built_request(
-            AuthScheme::Basic,
-            None,
-            r#"{"username":"user","password":"pass"}"#,
-        );
+        let creds = Credential::Basic {
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+        };
+        let req = built_request(&Delivery::Basic, &creds);
         // base64("user:pass") == "dXNlcjpwYXNz"
         assert_eq!(
             req.headers().get("authorization").unwrap(),
@@ -815,32 +1057,22 @@ tools:
     }
 
     #[test]
-    fn apply_auth_basic_rejects_a_non_object_secret() {
-        let client = reqwest::Client::new();
-        let builder = client.get("https://h.example.com/x");
-        assert!(apply_auth(builder, AuthScheme::Basic, None, "not-json").is_err());
-    }
-
-    #[test]
     fn apply_auth_bearer_sets_bearer_authorization_header() {
-        let req = built_request(AuthScheme::Bearer, None, r#"{"token":"abc123"}"#);
+        let req = built_request(&Delivery::Bearer, &token("abc123"));
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer abc123");
     }
 
     #[test]
     fn apply_auth_header_sets_the_named_header() {
-        let req = built_request(
-            AuthScheme::Header,
-            Some("X-API-Key"),
-            r#"{"token":"abc123"}"#,
-        );
+        let req = built_request(&header("X-API-Key"), &token("abc123"));
         assert_eq!(req.headers().get("x-api-key").unwrap(), "abc123");
     }
 
+    /// A mismatched pair (impossible via parse) must send no credential.
     #[test]
-    fn token_from_secret_accepts_json_or_bare_string() {
-        assert_eq!(token_from_secret(r#"{"token":"abc"}"#), "abc");
-        assert_eq!(token_from_secret("raw-token"), "raw-token");
+    fn apply_auth_sends_nothing_for_a_mismatched_pair() {
+        let req = built_request(&Delivery::Bearer, &jira_basic());
+        assert!(req.headers().get("authorization").is_none());
     }
 
     #[test]
@@ -888,10 +1120,7 @@ tools:
             def: config.tools.remove("t").unwrap(),
             secret_key: "k".to_owned(),
         };
-        let secret = wrap_stored_secret(
-            &toolspec::canonical_base_url(base_url).unwrap(),
-            r#"{"token":"SUPER-SECRET"}"#,
-        );
+        let secret = bound(base_url, header("X-API-Key"), token("SUPER-SECRET"));
         (integration, secret)
     }
 

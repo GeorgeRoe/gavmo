@@ -109,6 +109,12 @@ pub struct ToolConfig {
     /// The URL the stored credential was approved for, shown in the mismatch
     /// warning. `None` if the stored value carries no binding.
     pub bound_url: Option<String>,
+    /// How this tool sends the credential, e.g. "the X-API-Key header".
+    pub delivery: String,
+    /// `Some` when a credential is stored for this destination but was
+    /// approved to be sent differently (description of the approved way); the
+    /// tool stays disabled until the user re-confirms it.
+    pub approved_delivery: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1232,7 @@ fn ToolRow(
     let configured = tool.configured;
     let url_changed = tool.url_changed;
     let bound_url = tool.bound_url.clone();
+    let approved_delivery = tool.approved_delivery.clone();
     let tool = StoredValue::new(tool);
 
     let username = RwSignal::new(String::new());
@@ -1296,6 +1303,8 @@ fn ToolRow(
                 <span class="tool-name">{header.id.clone()}</span>
                 {if url_changed {
                     view! { <span class="tool-status tool-status--warn">"destination changed"</span> }.into_any()
+                } else if approved_delivery.is_some() {
+                    view! { <span class="tool-status tool-status--warn">"auth method changed"</span> }.into_any()
                 } else if configured {
                     view! { <span class="tool-status tool-status--ok">"configured"</span> }.into_any()
                 } else {
@@ -1306,7 +1315,18 @@ fn ToolRow(
             <p class="tool-url">
                 <span class="tool-url-label">"Sends your credential to: "</span>
                 <code>{header.base_url.clone()}</code>
+                " as " {header.delivery.clone()}
             </p>
+            {approved_delivery.clone().map(|was| view! {
+                <div class="tool-warning">
+                    <strong>"This tool's auth method changed."</strong>
+                    <p>
+                        "Your saved credential was approved to be sent as " {was}
+                        " but this tool now sends it as " {header.delivery.clone()} "."
+                    </p>
+                    <p>"The credential is disabled until you re-enter it below to confirm."</p>
+                </div>
+            })}
             {url_changed.then(|| view! {
                 <div class="tool-warning">
                     <strong>"This tool's destination changed."</strong>
