@@ -122,6 +122,15 @@ pub enum HostLockError {
         "blocked: request would go to {requested} but this integration is locked to {expected}"
     )]
     HostMismatch { expected: String, requested: String },
+    #[error("blocked: path {requested:?} escapes this integration's base path {base_path:?}")]
+    PathEscape {
+        base_path: String,
+        requested: String,
+    },
+    #[error("blocked: requested path contains an encoded slash or backslash: {0:?}")]
+    EncodedSeparator(String),
+    #[error("blocked: request URL must not carry userinfo (user:password@)")]
+    Userinfo,
 }
 
 // --- Parsing ---
@@ -138,8 +147,8 @@ pub fn parse_config(yaml: &str) -> Result<GavmoConfig, ParseError> {
 // --- Host-lock ---
 
 /// Resolves an agent-supplied `path` under `base_url` and returns it only if it
-/// stays on the same scheme, host and port; anything else is
-/// [`HostLockError::HostMismatch`], so credentials never leave the origin.
+/// stays on the same scheme, host and port *and* under the base's path
+/// prefix, so credentials never leave the destination they were approved for.
 ///
 /// `path` is relative to the base's full path, preserving prefixes such as
 /// `https://api.atlassian.com/ex/jira/<cloudId>`. `//host` and absolute URLs
@@ -179,6 +188,32 @@ pub fn lock_url(base_url: &str, path: &str) -> Result<Url, HostLockError> {
             requested: origin_string(&resolved),
         });
     }
+
+    // Userinfo in the request URL would override (or add) credentials.
+    if !resolved.username().is_empty() || resolved.password().is_some() {
+        return Err(HostLockError::Userinfo);
+    }
+
+    // The path prefix is part of the security boundary too (e.g. one tenant's
+    // `/ex/jira/<cloudId>/` on a shared gateway host). `Url::join` has already
+    // resolved `..`, `%2e%2e` and `\`, so a plain prefix check on the
+    // normalized path is sound. `base.path()` ends in `/`, so `/a/b` can't
+    // match a base of `/a/bc/`.
+    if !resolved.path().starts_with(base.path()) {
+        return Err(HostLockError::PathEscape {
+            base_path: base.path().to_owned(),
+            requested: resolved.path().to_owned(),
+        });
+    }
+
+    // `%2F`/`%5C` survive normalization as literal bytes, but many servers
+    // decode them before routing, which would turn `..%2F` back into a
+    // traversal on the far side.
+    let lower = resolved.path().to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") {
+        return Err(HostLockError::EncodedSeparator(resolved.path().to_owned()));
+    }
+
     Ok(resolved)
 }
 
@@ -401,6 +436,77 @@ tools:
         )
         .unwrap_err();
         assert!(matches!(err, HostLockError::HostMismatch { .. }));
+    }
+
+    /// Every spelling of "go up" must be caught once normalized.
+    #[test]
+    fn lock_url_rejects_escaping_the_base_path_prefix() {
+        for path in [
+            "../OTHER/rest",
+            "/../OTHER/rest",
+            "../../ex/jira/OTHER/rest",
+            "rest/../../OTHER",
+            "%2e%2e/OTHER",
+            ".%2E/OTHER",
+            "..\\OTHER",
+            "/\\..\\OTHER",
+            "https://api.atlassian.com/ex/jira/OTHER/rest",
+            "https://api.atlassian.com/",
+            "..",
+        ] {
+            assert!(
+                matches!(
+                    lock_url(GATEWAY, path),
+                    Err(HostLockError::PathEscape { .. })
+                ),
+                "{path:?} must be rejected, got {:?}",
+                lock_url(GATEWAY, path)
+            );
+        }
+    }
+
+    /// `/a/b` must not count as "under" `/a/bc/` (sibling-prefix confusion).
+    #[test]
+    fn lock_url_prefix_check_respects_segment_boundaries() {
+        let err = lock_url(
+            "https://api.atlassian.com/ex/jira/CLOUD",
+            "https://api.atlassian.com/ex/jira/CLOUDX/rest",
+        )
+        .unwrap_err();
+        assert!(matches!(err, HostLockError::PathEscape { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn lock_url_allows_dot_segments_that_stay_inside_the_prefix() {
+        let u = lock_url(GATEWAY, "rest/x/../myself").unwrap();
+        assert_eq!(
+            u.as_str(),
+            "https://api.atlassian.com/ex/jira/CLOUDID/rest/myself"
+        );
+    }
+
+    #[test]
+    fn lock_url_rejects_encoded_separators() {
+        for path in ["..%2F..%2Fother", "a%2fb", "a%5Cb"] {
+            assert!(
+                matches!(
+                    lock_url(GATEWAY, path),
+                    Err(HostLockError::EncodedSeparator(_))
+                ),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_url_rejects_same_origin_userinfo() {
+        let err = lock_url("https://h.example.com", "https://u:p@h.example.com/x").unwrap_err();
+        assert_eq!(err, HostLockError::Userinfo);
+    }
+
+    #[test]
+    fn lock_url_with_a_root_base_allows_any_path_on_the_origin() {
+        assert!(lock_url("https://h.example.com", "/../../x").is_ok());
     }
 
     #[test]
