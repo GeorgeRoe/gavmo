@@ -98,7 +98,11 @@ impl ShareBackend for VirtiofsShare {
         })?;
 
         let args = build_virtiofsd_args(&socket_path, spec, meta.uid(), meta.gid());
-        let child = Command::new("virtiofsd")
+        let mut command = Command::new("virtiofsd");
+        // Dies with the daemon; virtiofsd also writes `<socket>.pid`, which
+        // `process::reap_stale` uses if it is ever orphaned anyway.
+        crate::process::die_with_parent(&mut command);
+        let child = command
             .args(&args)
             .kill_on_drop(true)
             .spawn()

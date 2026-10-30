@@ -118,6 +118,8 @@ struct Inner {
     /// Per-workspace lifecycle locks: open, stop, reset and remove of one
     /// workspace run one at a time (open refuses rather than waits).
     lifecycle: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Set by [`AppState::shutdown`]; refuses new boots.
+    shutting_down: std::sync::atomic::AtomicBool,
     /// Source of [`VmSlot::Booting::generation`].
     boot_generation: std::sync::atomic::AtomicU64,
     /// Boots VMs (qemu in production, a fake in tests).
@@ -256,6 +258,7 @@ impl AppState {
     ) -> io::Result<Self> {
         std::fs::create_dir_all(gavmo_data_dir)?;
         vm::create_private_dir_all(runtime_base_dir).map_err(io::Error::other)?;
+        reap_stale_vm_processes(runtime_base_dir);
         let protected_dirs = [gavmo_data_dir, gcloud_dir.as_path(), runtime_base_dir]
             .into_iter()
             .map(canonical_or_self)
@@ -288,6 +291,7 @@ impl AppState {
                 workspace_integrations: std::sync::Mutex::new(HashMap::new()),
                 lifecycle: std::sync::Mutex::new(HashMap::new()),
                 boot_generation: std::sync::atomic::AtomicU64::new(0),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
                 launcher,
                 http_client: crate::integrations::forwarding_client().map_err(io::Error::other)?,
             }),
@@ -456,6 +460,13 @@ impl AppState {
         // Otherwise any host directory could be booted with `id` mounted
         // read-write into the guest.
         self.require_known(id).await?;
+        if self
+            .inner
+            .shutting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("GAVMO is shutting down".to_owned());
+        }
         let Ok(_lifecycle) = self.lifecycle_lock(id).try_lock_owned() else {
             return Err(
                 "this workspace is busy (stopping, resetting or being removed); \
@@ -718,6 +729,34 @@ impl AppState {
         };
         self.end_teardown(id, after).await;
         result
+    }
+
+    /// Stops every VM, for daemon shutdown: refuses new boots, then stops all
+    /// workspaces concurrently, waiting at most `limit` overall. Anything
+    /// still running after that is left to the kernel: VM processes get
+    /// `SIGTERM` when the daemon exits (`vm` crate, `PR_SET_PDEATHSIG`).
+    pub async fn shutdown(&self, limit: Duration) {
+        self.inner
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ids: Vec<String> = self.inner.running.lock().await.keys().cloned().collect();
+        if ids.is_empty() {
+            return;
+        }
+        tracing::info!("stopping {} VM(s) before exit", ids.len());
+        let mut stops = tokio::task::JoinSet::new();
+        for id in ids {
+            let state = self.clone();
+            stops.spawn(async move {
+                if let Err(e) = state.stop_workspace(&id).await {
+                    tracing::warn!(workspace = %id, error = %e, "VM did not stop cleanly at shutdown");
+                }
+            });
+        }
+        let all = async { while stops.join_next().await.is_some() {} };
+        if tokio::time::timeout(limit, all).await.is_err() {
+            tracing::warn!("timed out stopping VMs at shutdown; the kernel will signal the rest");
+        }
     }
 
     /// Moves a `Running` slot whose VM has died to `Failed` (revoking its
@@ -1278,6 +1317,21 @@ fn workspace_hash(id: &str) -> String {
     use sha2::Digest as _;
 
     format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
+}
+
+/// Terminates VM processes an earlier daemon left behind (each VM's runtime
+/// dir holds pidfiles; see [`vm::reap_stale`]), so they can't hold a disk
+/// lock or a port the next boot needs.
+fn reap_stale_vm_processes(runtime_base: &Path) {
+    let Ok(entries) = std::fs::read_dir(runtime_base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            vm::reap_stale(&path);
+        }
+    }
 }
 
 /// Where VM sockets live: `$XDG_RUNTIME_DIR/gavmo` (private to the user,
@@ -2541,6 +2595,42 @@ mod tests {
             state.status(&id).await == WorkspaceStatus::Booting
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_every_vm_and_refuses_new_boots() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo_a, a) = registered_repo(&state).await;
+        let (_repo_b, b) = registered_repo(&state).await;
+        open_and_run(&state, &script, &a).await;
+        open_and_run(&state, &script, &b).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state.shutdown(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(script.stops(), 2);
+        assert!(state.inner.running.lock().await.is_empty());
+        assert!(state.open_workspace(&a).await.is_err());
+    }
+
+    /// A VM that won't stop can't hold up exit past the limit.
+    #[tokio::test]
+    async fn shutdown_gives_up_after_its_limit() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        script
+            .stops_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state.shutdown(Duration::from_millis(100)),
+        )
+        .await
+        .expect("shutdown must respect its limit");
     }
 
     /// A boot finishing after its slot was taken over stops its VM instead of

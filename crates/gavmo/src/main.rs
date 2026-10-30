@@ -100,7 +100,7 @@ mod daemon {
 
         // Separate port from the UI: guests must reach the bearer-authenticated
         // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
-        let mcp_router = Router::new().nest_service("/mcp", mcp::service(app_state));
+        let mcp_router = Router::new().nest_service("/mcp", mcp::service(app_state.clone()));
         let mcp_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, mcp::GAVMO_MCP_PORT));
 
         // Bind both before announcing anything, so a port clash fails fast.
@@ -111,15 +111,46 @@ mod daemon {
         announce_login_url(ui_addr.port(), &ui_token);
 
         // Either server stopping is fatal: a UI without its gateway (or vice
-        // versa) would look healthy while silently failing.
-        tokio::select! {
+        // versa) would look healthy while silently failing. Every exit path
+        // stops the VMs first, so none outlives the daemon.
+        let outcome = tokio::select! {
             res = axum::serve(mcp_listener, mcp_router.into_make_service()) => {
-                res.context("MCP gateway server failed")?;
-                Err(anyhow!("MCP gateway server exited unexpectedly"))
+                res.context("MCP gateway server failed")
+                    .and_then(|()| Err(anyhow!("MCP gateway server exited unexpectedly")))
             }
             res = axum::serve(ui_listener, ui_router.into_make_service()) => {
-                res.context("control panel server failed")?;
-                Err(anyhow!("control panel server exited unexpectedly"))
+                res.context("control panel server failed")
+                    .and_then(|()| Err(anyhow!("control panel server exited unexpectedly")))
+            }
+            signal = shutdown_signal() => {
+                tracing::info!("received {signal}, shutting down");
+                Ok(())
+            }
+        };
+        app_state.shutdown(VM_SHUTDOWN_LIMIT).await;
+        outcome
+    }
+
+    /// Upper bound on stopping all VMs at exit: one VM's graceful (30s) plus
+    /// forced (5s) shutdown, with margin. VMs stop concurrently.
+    const VM_SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+    /// Resolves on SIGTERM or SIGINT (Ctrl-C), naming which. If the handlers
+    /// can't be installed, never resolves (logged): the daemon then still
+    /// relies on the kernel signalling VMs when it dies.
+    async fn shutdown_signal() -> &'static str {
+        use tokio::signal::unix::{SignalKind, signal};
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut term), Ok(mut int)) => tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            },
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!(error = %e, "cannot install signal handlers");
+                std::future::pending().await
             }
         }
     }

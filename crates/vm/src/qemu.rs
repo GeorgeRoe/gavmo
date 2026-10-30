@@ -144,6 +144,12 @@ pub(crate) fn build_qemu_args(
     args.push("-display".to_owned());
     args.push("none".to_owned());
 
+    // Lets a later daemon find and stop this qemu if it is ever orphaned
+    // (see `process::reap_stale`). A plain path argument, not an option
+    // string, so no comma escaping.
+    args.push("-pidfile".to_owned());
+    args.push(utf8_path(&crate::process::qemu_pidfile(&cfg.runtime_dir))?.to_owned());
+
     args.push("-chardev".to_owned());
     args.push(format!(
         "file,id=serial0,path={}",
@@ -190,7 +196,10 @@ pub(crate) async fn spawn_qemu(
         path: cfg.qemu_log_path(),
         source,
     };
-    let child = tokio::process::Command::new("qemu-system-x86_64")
+    let mut command = tokio::process::Command::new("qemu-system-x86_64");
+    // Dies with the daemon instead of running on unmanaged.
+    crate::process::die_with_parent(&mut command);
+    let child = command
         .args(&args)
         // Nothing may read the daemon's terminal.
         .stdin(Stdio::null())
