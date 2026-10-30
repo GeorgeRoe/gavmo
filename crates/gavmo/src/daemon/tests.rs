@@ -23,10 +23,6 @@ const HOST: &str = "localhost:3000";
 /// A daemon over temp dirs, plus a logged-in session.
 pub(super) struct Daemon {
     pub(super) data: tempfile::TempDir,
-    #[expect(
-        dead_code,
-        reason = "the MCP end-to-end tests (P4.3) drive mcp_router from it"
-    )]
     pub(super) state: AppState,
     pub(super) script: Arc<Script>,
     router: Router,

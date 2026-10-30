@@ -15,6 +15,8 @@ use crate::auth;
 use crate::registry::AppState;
 
 #[cfg(test)]
+mod mcp_tests;
+#[cfg(test)]
 mod tests;
 
 /// The control panel: Leptos pages, `/api/*` server functions, `/login` and
