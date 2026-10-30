@@ -78,6 +78,13 @@ struct Inner {
     /// (`~/.local/share/gavmo/mcp`), deliberately outside any repo.
     mcp_base_dir: PathBuf,
 
+    /// Host dirs no workspace may equal, contain, or sit inside (see
+    /// [`check_workspace_path`]): the data dir (UI token, vault, other
+    /// workspaces' MCP tokens) and the gcloud dir.
+    protected_dirs: Vec<PathBuf>,
+    /// The user's home dir, which no workspace may equal or contain.
+    home_dir: Option<PathBuf>,
+
     /// Bearer token -> workspace id. A `std::sync::Mutex` because
     /// `TokenAuthority::resolve` is synchronous and the lock is never held
     /// across an `.await`. Re-minted per boot; cleared on `stop`/`reset`.
@@ -132,7 +139,13 @@ impl AppState {
         let secret_store: Arc<dyn SecretStore> = Arc::new(secrets::LazyVaultStore::keyring_backed(
             gavmo_data_dir.join("secrets.vault"),
         ));
-        Self::with_data_dir(base_image, gcloud_dir, &gavmo_data_dir, secret_store)
+        Self::with_data_dir(
+            base_image,
+            gcloud_dir,
+            &gavmo_data_dir,
+            dirs::home_dir().as_deref(),
+            secret_store,
+        )
     }
 
     /// [`Self::new`] with an explicit data dir and secret store, so tests
@@ -141,9 +154,15 @@ impl AppState {
         base_image: PathBuf,
         gcloud_dir: PathBuf,
         gavmo_data_dir: &Path,
+        home_dir: Option<&Path>,
         secret_store: Arc<dyn SecretStore>,
     ) -> io::Result<Self> {
         std::fs::create_dir_all(gavmo_data_dir)?;
+        let protected_dirs = [gavmo_data_dir, gcloud_dir.as_path()]
+            .into_iter()
+            .map(canonical_or_self)
+            .collect();
+        let home_dir = home_dir.map(canonical_or_self);
         let registry_path = gavmo_data_dir.join("workspaces.json");
         let registry = load_registry(&registry_path)?;
         let mcp_base_dir = gavmo_data_dir.join("mcp");
@@ -158,6 +177,8 @@ impl AppState {
                 memory_mib: DEFAULT_MEMORY_MIB,
                 vcpus: DEFAULT_VCPUS,
                 mcp_base_dir,
+                protected_dirs,
+                home_dir,
                 mcp_tokens: std::sync::Mutex::new(HashMap::new()),
                 secret_store,
                 workspace_integrations: std::sync::Mutex::new(HashMap::new()),
@@ -188,8 +209,33 @@ impl AppState {
 
     /// Registers a new workspace by absolute host path. Idempotent: adding
     /// a path that is already known is a no-op.
+    ///
+    /// The directory is later mounted **read-write** into a VM, so paths that
+    /// would expose the daemon's own secrets or the user's whole home are
+    /// refused (see [`check_workspace_path`]).
     pub async fn add_workspace(&self, path: String) -> io::Result<()> {
-        let canonical = std::fs::canonicalize(&path)?.to_string_lossy().into_owned();
+        // Canonical: symlinks resolved, so the checks see the real target.
+        let canonical = tokio::fs::canonicalize(&path).await?;
+        if !tokio::fs::metadata(&canonical).await?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", canonical.display()),
+            ));
+        }
+        check_workspace_path(
+            &canonical,
+            &self.inner.protected_dirs,
+            self.inner.home_dir.as_deref(),
+        )
+        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        // Ids are UTF-8 strings; a lossy conversion would register a path
+        // that doesn't exist.
+        let canonical = canonical.into_os_string().into_string().map_err(|p| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not valid UTF-8", Path::new(&p).display()),
+            )
+        })?;
 
         let mut registry = self.inner.registry.lock().await;
         if !registry.workspaces.iter().any(|w| w.path == canonical) {
@@ -898,6 +944,45 @@ fn mcp_share_dir_name(id: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(id.as_bytes()))
 }
 
+/// Refuses workspace paths whose read-write mount would hand the guest more
+/// than a project: `/`, the user's home or any ancestor of it, and anything
+/// overlapping a protected dir in either direction (equal to it, inside it,
+/// or containing it). All paths must be canonical. Component-wise, so
+/// `/home/u/.local/share/gavmo-other` doesn't count as inside `.../gavmo`.
+fn check_workspace_path(
+    canonical: &Path,
+    protected: &[PathBuf],
+    home: Option<&Path>,
+) -> Result<(), String> {
+    if canonical.parent().is_none() {
+        return Err("the filesystem root cannot be a workspace".to_owned());
+    }
+    if let Some(home) = home
+        && home.starts_with(canonical)
+    {
+        return Err(format!(
+            "{} would expose your entire home directory to the VM; choose a project directory",
+            canonical.display()
+        ));
+    }
+    for dir in protected {
+        if canonical.starts_with(dir) || dir.starts_with(canonical) {
+            return Err(format!(
+                "{} overlaps {}, which holds GAVMO's own secrets or credentials",
+                canonical.display(),
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `path` canonicalized if it exists; otherwise as given (a protected dir
+/// that doesn't exist yet can't be reached through a symlink either).
+fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Maps a [`AppState::require_known`] failure into the `io::Error` some
 /// entry points return.
 fn unknown_workspace_io(message: String) -> io::Error {
@@ -1442,6 +1527,7 @@ mod tests {
             PathBuf::from("/nonexistent/gavmo-test-base.qcow2"),
             PathBuf::from("/nonexistent/gavmo-test-gcloud"),
             data.path(),
+            Some(Path::new("/nonexistent/gavmo-test-home")),
             Arc::new(secrets::MemoryStore::new()),
         )
         .unwrap();
@@ -1575,6 +1661,82 @@ mod tests {
             assert!(!state.is_known(alias).await, "{alias}");
         }
         assert!(state.is_known("/srv/repo").await);
+    }
+
+    #[test]
+    fn check_workspace_path_refuses_root_home_and_its_ancestors() {
+        let home = Path::new("/home/u");
+        for bad in ["/", "/home", "/home/u"] {
+            assert!(
+                check_workspace_path(Path::new(bad), &[], Some(home)).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(check_workspace_path(Path::new("/home/u/src/proj"), &[], Some(home)).is_ok());
+        assert!(check_workspace_path(Path::new("/srv/proj"), &[], Some(home)).is_ok());
+    }
+
+    #[test]
+    fn check_workspace_path_refuses_any_overlap_with_protected_dirs() {
+        let protected = [PathBuf::from("/home/u/.local/share/gavmo")];
+        for bad in [
+            "/home/u/.local/share/gavmo",
+            "/home/u/.local/share/gavmo/mcp/abc",
+            "/home/u/.local/share",
+            "/home/u/.local",
+        ] {
+            assert!(
+                check_workspace_path(Path::new(bad), &protected, None).is_err(),
+                "{bad}"
+            );
+        }
+        // Component-wise: a sibling with a shared name prefix is fine.
+        assert!(
+            check_workspace_path(
+                Path::new("/home/u/.local/share/gavmo-other"),
+                &protected,
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_workspace_refuses_dangerous_paths_and_accepts_a_project() {
+        let (data, state) = test_app_state();
+        let projects = tempfile::tempdir().unwrap();
+
+        // The data dir itself, something inside it, and a dir containing it.
+        assert!(state.add_workspace(path_str(data.path())).await.is_err());
+        let inside = data.path().join("mcp");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(state.add_workspace(path_str(&inside)).await.is_err());
+        let parent = data.path().parent().unwrap();
+        assert!(state.add_workspace(path_str(parent)).await.is_err());
+
+        // A regular file is not a workspace.
+        let file = projects.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(state.add_workspace(path_str(&file)).await.is_err());
+
+        // A symlink into the data dir is judged by its target.
+        #[cfg(unix)]
+        {
+            let link = projects.path().join("sneaky");
+            std::os::unix::fs::symlink(data.path(), &link).unwrap();
+            assert!(state.add_workspace(path_str(&link)).await.is_err());
+        }
+
+        let project = projects.path().join("proj");
+        std::fs::create_dir(&project).unwrap();
+        state.add_workspace(path_str(&project)).await.unwrap();
+        let canonical = path_str(&std::fs::canonicalize(&project).unwrap());
+        assert!(state.is_known(&canonical).await);
+        assert_eq!(state.list().await.len(), 1, "only the project was added");
+    }
+
+    fn path_str(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
     }
 
     /// Share dir names are deterministic, hex-only, and distinct per workspace.

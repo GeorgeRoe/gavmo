@@ -1450,14 +1450,23 @@ fn FolderBrowser(on_added: Callback<()>) -> impl IntoView {
         |path| async move { browse_dir(path).await },
     );
 
+    // Why the last "Use this directory" was refused (e.g. a protected path).
+    let add_error = RwSignal::new(None::<String>);
+    let adding = RwSignal::new(false);
+
     let add_current = move |_| {
-        let path = listing.get().and_then(Result::ok).map(|l| l.path);
+        let path = listing.get_untracked().and_then(Result::ok).map(|l| l.path);
         if let Some(path) = path {
+            add_error.set(None);
+            adding.set(true);
             leptos::task::spawn_local(async move {
-                if let Err(e) = add_workspace(path).await {
-                    leptos::logging::error!("add failed: {e}");
+                let outcome = add_workspace(path).await;
+                adding.set(false);
+                match outcome {
+                    // Close only on success, so a refusal stays readable.
+                    Ok(()) => on_added.run(()),
+                    Err(e) => add_error.set(Some(e.to_string())),
                 }
-                on_added.run(());
             });
         }
     };
@@ -1498,10 +1507,17 @@ fn FolderBrowser(on_added: Callback<()>) -> impl IntoView {
                             view! {
                                 <p class="cwd">{here.clone()}</p>
                                 <div class="toolbar">
-                                    <button on:click=add_current class="primary">
+                                    <button
+                                        on:click=add_current
+                                        class="primary"
+                                        prop:disabled=move || adding.get()
+                                    >
                                         "Use this directory"
                                     </button>
                                 </div>
+                                {move || add_error.get().map(|e| view! {
+                                    <p class="error">"Cannot add this directory: " {e}</p>
+                                })}
                                 <ul>
                                     {parent.map(|p| view! {
                                         <li on:click=move |_| cwd.set(Some(p.clone()))>".."</li>
