@@ -90,6 +90,8 @@ pub(crate) mod fake {
         /// `stops_block` is false.
         pub(crate) stop_gate: Semaphore,
         pub(crate) stops_block: std::sync::atomic::AtomicBool,
+        /// When set, `status()` never returns (a wedged qemu).
+        pub(crate) status_hangs: std::sync::atomic::AtomicBool,
         pub(crate) boots_started: AtomicUsize,
         pub(crate) stops: AtomicUsize,
         /// What every fake VM's `status()` reports.
@@ -102,6 +104,7 @@ pub(crate) mod fake {
                 boot_gate: Semaphore::new(0),
                 stop_gate: Semaphore::new(0),
                 stops_block: std::sync::atomic::AtomicBool::new(false),
+                status_hangs: std::sync::atomic::AtomicBool::new(false),
                 boots_started: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
                 status: Mutex::new(None),
@@ -161,7 +164,13 @@ pub(crate) mod fake {
 
         fn status(&mut self) -> BoxFuture<'_, VmStatus> {
             let status = self.script.status.lock().unwrap().clone();
-            Box::pin(async move { status.unwrap_or(VmStatus::Booting) })
+            let hangs = self.script.status_hangs.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if hangs {
+                    std::future::pending::<()>().await;
+                }
+                status.unwrap_or(VmStatus::Booting)
+            })
         }
 
         fn info(&self) -> VmInfo {

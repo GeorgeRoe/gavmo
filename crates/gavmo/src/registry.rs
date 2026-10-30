@@ -21,12 +21,19 @@ use secrets::SecretStore;
 
 use crate::app::{ToolConfig, VmStats, WorkspaceInfo, WorkspaceStatus};
 use crate::integrations::{BindingState, CandidateTool, Credential, Delivery, ResolvedIntegration};
-use crate::vm_handle::{Launcher, QemuLauncher, VmHandle};
+use crate::vm_handle::{Launcher, QemuLauncher, VmHandle, VmInfo};
 
 /// Default guest memory, in MiB.
 const DEFAULT_MEMORY_MIB: u32 = 4096;
 /// Default guest vCPU count.
 const DEFAULT_VCPUS: u32 = 4;
+
+/// How often a running VM's monitor probes it (QMP + HTTP).
+const MONITOR_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(2)
+};
 
 /// Gap between the two `/proc` samples [`AppState::vm_stats`] diffs for CPU
 /// percentage. Short enough to keep a poll snappy, long enough that ~10ms
@@ -154,10 +161,38 @@ enum VmSlot {
     BuildFailed { log: String },
 }
 
+/// A booted VM, watched by a background monitor task.
+///
+/// The VM handle sits behind its own lock, which only the monitor (while
+/// probing) and a teardown (to take it) ever hold - never the `running`
+/// lock. Readers get the latest status from `status` without waiting on
+/// qemu, and the stats panel uses the `info` snapshot.
 struct RunningSlot {
-    vm: Box<dyn VmHandle>,
+    vm: Arc<Mutex<Option<Box<dyn VmHandle>>>>,
+    status: tokio::sync::watch::Receiver<WorkspaceStatus>,
+    monitor: tokio::task::JoinHandle<()>,
+    info: VmInfo,
+    /// When `info` was taken, so uptime can be derived later.
+    info_taken: std::time::Instant,
     token: String,
     integrations: Arc<[ResolvedIntegration]>,
+}
+
+impl RunningSlot {
+    /// Stops monitoring and takes the VM out for a stop. Aborting cancels a
+    /// probe in flight (releasing the VM lock) at its next await point.
+    async fn take_vm(&self) -> Option<Box<dyn VmHandle>> {
+        self.monitor.abort();
+        self.vm.lock().await.take()
+    }
+}
+
+impl Drop for RunningSlot {
+    /// A slot dropped without a teardown (e.g. at shutdown) must not leave
+    /// its monitor running.
+    fn drop(&mut self) {
+        self.monitor.abort();
+    }
 }
 
 impl VmSlot {
@@ -177,7 +212,7 @@ impl VmSlot {
 
 /// What a teardown found in the slot it replaced with `Stopping`.
 enum Teardown {
-    Vm(Box<dyn VmHandle>),
+    Vm(Box<RunningSlot>),
     Boot(tokio::task::JoinHandle<()>),
     Nothing,
 }
@@ -261,31 +296,21 @@ impl AppState {
 
     /// All known workspaces plus each one's current status.
     pub async fn list(&self) -> Vec<WorkspaceInfo> {
-        let mut dead = Vec::new();
-        let out = {
-            let registry = self.inner.registry.lock().await;
-            let mut running = self.inner.running.lock().await;
-            let mut out = Vec::with_capacity(registry.workspaces.len());
-            for rec in &registry.workspaces {
-                let status = match running.get_mut(&rec.path) {
-                    Some(slot) => slot_status(slot).await,
-                    None => WorkspaceStatus::Stopped,
-                };
-                if let Some(reason) = dead_reason(&status) {
-                    dead.push((rec.path.clone(), reason));
-                }
-                out.push(WorkspaceInfo {
-                    id: rec.path.clone(),
-                    path: rec.path.clone(),
-                    status,
-                });
-            }
-            out
-        };
-        for (id, reason) in dead {
-            self.mark_dead(&id, reason).await;
-        }
-        out
+        // Both locks are held only for in-memory reads: statuses are published
+        // by each VM's monitor, so nothing here waits on qemu.
+        let registry = self.inner.registry.lock().await;
+        let running = self.inner.running.lock().await;
+        registry
+            .workspaces
+            .iter()
+            .map(|rec| WorkspaceInfo {
+                id: rec.path.clone(),
+                path: rec.path.clone(),
+                status: running
+                    .get(&rec.path)
+                    .map_or(WorkspaceStatus::Stopped, slot_status),
+            })
+            .collect()
     }
 
     /// Registers a new workspace by absolute host path. Idempotent: adding
@@ -361,14 +386,12 @@ impl AppState {
         if !self.is_known(id).await {
             return WorkspaceStatus::Stopped;
         }
-        let status = match self.inner.running.lock().await.get_mut(id) {
-            Some(slot) => slot_status(slot).await,
-            None => WorkspaceStatus::Stopped,
-        };
-        if let Some(reason) = dead_reason(&status) {
-            self.mark_dead(id, reason).await;
-        }
-        status
+        self.inner
+            .running
+            .lock()
+            .await
+            .get(id)
+            .map_or(WorkspaceStatus::Stopped, slot_status)
     }
 
     // --- Lifecycle ---
@@ -534,11 +557,23 @@ impl AppState {
         );
         match result {
             Ok(vm) if still_wanted => {
+                let info = vm.info();
+                // It just passed its health check, so it starts out Running.
+                let (status_tx, status) =
+                    tokio::sync::watch::channel(to_status(VmStatus::Running {
+                        url: format!("http://127.0.0.1:{}", info.host_port),
+                    }));
+                let vm = Arc::new(Mutex::new(Some(vm)));
+                let monitor = self.spawn_monitor(id.to_owned(), Arc::clone(&vm), status_tx);
                 self.replace_slot(
                     &mut running,
                     id,
                     Some(VmSlot::Running(Box::new(RunningSlot {
                         vm,
+                        status,
+                        monitor,
+                        info,
+                        info_taken: std::time::Instant::now(),
                         token,
                         integrations,
                     }))),
@@ -564,7 +599,7 @@ impl AppState {
             return Teardown::Nothing;
         }
         match self.replace_slot(&mut running, id, Some(VmSlot::Stopping)) {
-            Some(VmSlot::Running(slot)) => Teardown::Vm(slot.vm),
+            Some(VmSlot::Running(slot)) => Teardown::Vm(slot),
             Some(VmSlot::Booting { task, .. }) => Teardown::Boot(task),
             _ => Teardown::Nothing,
         }
@@ -574,7 +609,10 @@ impl AppState {
     /// task (so qemu is gone on return either way).
     async fn run_teardown(id: &str, teardown: Teardown) -> Result<(), String> {
         match teardown {
-            Teardown::Vm(vm) => vm.stop().await.map_err(|e| e.to_string()),
+            Teardown::Vm(slot) => match slot.take_vm().await {
+                Some(vm) => vm.stop().await.map_err(|e| e.to_string()),
+                None => Ok(()),
+            },
             Teardown::Boot(task) => {
                 abort_boot_task(id, task).await;
                 Ok(())
@@ -686,22 +724,62 @@ impl AppState {
     /// credentials, and letting `open` boot it again), and reaps the dead
     /// VM's helpers in the background. A no-op if the slot changed meanwhile
     /// or `id` is mid-lifecycle-operation (that operation handles it).
-    async fn mark_dead(&self, id: &str, reason: String) {
+    ///
+    /// Returns `false` only if it had to back off because a lifecycle
+    /// operation holds the lock, so the caller should check again later.
+    async fn mark_dead(&self, id: &str, reason: String) -> bool {
         let lifecycle = self.lifecycle_lock(id);
         let Ok(_held) = lifecycle.try_lock() else {
-            return;
+            return false;
         };
         let mut running = self.inner.running.lock().await;
         if !matches!(running.get(id), Some(VmSlot::Running(_))) {
-            return;
+            return true;
         }
         if let Some(VmSlot::Running(slot)) =
             self.replace_slot(&mut running, id, Some(VmSlot::Failed(reason)))
         {
             drop(running);
             let id = id.to_owned();
-            tokio::spawn(async move { stop_vm_logged(&id, slot.vm, "dead").await });
+            tokio::spawn(async move {
+                if let Some(vm) = slot.take_vm().await {
+                    stop_vm_logged(&id, vm, "dead").await;
+                }
+            });
         }
+        true
+    }
+
+    /// Watches a running VM: every [`MONITOR_INTERVAL`] probes it (holding
+    /// only its own VM lock, never `running`) and publishes the result for
+    /// `list`/`status`. A dead VM is moved to `Failed` and monitoring ends.
+    /// Aborted by teardown via [`RunningSlot::take_vm`].
+    fn spawn_monitor(
+        &self,
+        id: String,
+        vm: Arc<Mutex<Option<Box<dyn VmHandle>>>>,
+        status_tx: tokio::sync::watch::Sender<WorkspaceStatus>,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(MONITOR_INTERVAL).await;
+                let status = {
+                    let mut guard = vm.lock().await;
+                    let Some(vm) = guard.as_mut() else { return };
+                    vm.status().await
+                };
+                // The `vm` crate reports `Failed` only for an exited (or
+                // unwaitable) qemu.
+                if let VmStatus::Failed { reason } = status {
+                    if state.mark_dead(&id, reason).await {
+                        return;
+                    }
+                    continue;
+                }
+                status_tx.send_replace(to_status(status));
+            }
+        })
     }
 
     /// Builds the per-VM [`VmConfig`] for a workspace path. `host_port` is
@@ -1073,7 +1151,10 @@ impl AppState {
     /// QMP call, so stats polls never block `stop`/`reset`.
     pub async fn vm_stats(&self, id: &str) -> Option<VmStats> {
         let info = match self.inner.running.lock().await.get(id) {
-            Some(VmSlot::Running(running)) => running.vm.info(),
+            Some(VmSlot::Running(running)) => VmInfo {
+                uptime: running.info.uptime + running.info_taken.elapsed(),
+                ..running.info.clone()
+            },
             _ => return None,
         };
         let pid = info.qemu_pid?;
@@ -1479,28 +1560,17 @@ fn sanitize_console(bytes: &[u8]) -> String {
     out
 }
 
-/// Maps a [`VmSlot`] to the serializable view type shared with the browser,
-/// probing the live `vm` crate status for a `Running` slot (the qemu
-/// process may have exited or stopped answering health checks since the
-/// last poll).
-async fn slot_status(slot: &mut VmSlot) -> WorkspaceStatus {
+/// Maps a [`VmSlot`] to the serializable view type shared with the browser.
+/// A `Running` slot reports what its monitor last published.
+fn slot_status(slot: &VmSlot) -> WorkspaceStatus {
     match slot {
         VmSlot::Booting { .. } => WorkspaceStatus::Booting,
-        VmSlot::Running(running) => to_status(running.vm.status().await),
+        VmSlot::Running(running) => running.status.borrow().clone(),
         VmSlot::Stopping => WorkspaceStatus::Stopping,
         VmSlot::Failed(reason) => WorkspaceStatus::Failed {
             reason: reason.clone(),
         },
         VmSlot::BuildFailed { log } => WorkspaceStatus::BuildFailed { log: log.clone() },
-    }
-}
-
-/// A `Running` slot reporting `Failed` means its qemu is gone (the `vm` crate
-/// only reports `Failed` for an exited or unwaitable process).
-fn dead_reason(status: &WorkspaceStatus) -> Option<String> {
-    match status {
-        WorkspaceStatus::Failed { reason } => Some(reason.clone()),
-        _ => None,
     }
 }
 
@@ -2418,10 +2488,11 @@ mod tests {
         script.set_status(VmStatus::Failed {
             reason: "qemu exited: signal 9".to_owned(),
         });
-        assert!(matches!(
-            state.status(&id).await,
-            WorkspaceStatus::Failed { .. }
-        ));
+        // Noticed by the monitor, not by the status read.
+        eventually("Failed", async || {
+            matches!(state.status(&id).await, WorkspaceStatus::Failed { .. })
+        })
+        .await;
         assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Failed(_)))).await);
         assert_eq!(TokenAuthority::resolve(&state, &token), None);
         eventually("dead VM reaped", async || script.stops() == 1).await;
@@ -2431,6 +2502,45 @@ mod tests {
         });
         open_and_run(&state, &script, &id).await;
         assert_eq!(script.boots(), 2);
+    }
+
+    /// A VM whose status probe never returns (wedged qemu) must not block
+    /// `list`, `status`, or stopping it.
+    #[tokio::test]
+    async fn a_wedged_vm_blocks_neither_reads_nor_stop() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        script
+            .status_hangs
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Let the monitor get stuck inside a probe.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let quick = Duration::from_secs(1);
+        let listed = tokio::time::timeout(quick, state.list()).await.unwrap();
+        assert!(matches!(listed[0].status, WorkspaceStatus::Running { .. }));
+        tokio::time::timeout(quick, state.status(&id))
+            .await
+            .unwrap();
+        tokio::time::timeout(quick, state.stop_workspace(&id))
+            .await
+            .expect("stop must cancel the stuck probe")
+            .unwrap();
+        assert_eq!(script.stops(), 1);
+    }
+
+    /// The monitor publishes what the VM reports.
+    #[tokio::test]
+    async fn the_monitor_publishes_status_changes() {
+        let (_data, state, script) = scripted_app_state();
+        let (_repo, id) = registered_repo(&state).await;
+        open_and_run(&state, &script, &id).await;
+        script.set_status(VmStatus::Booting);
+        eventually("Booting published", async || {
+            state.status(&id).await == WorkspaceStatus::Booting
+        })
+        .await;
     }
 
     /// A boot finishing after its slot was taken over stops its VM instead of
