@@ -1016,6 +1016,7 @@ dependencies = [
  "leptos_axum",
  "leptos_meta",
  "leptos_router",
+ "libc",
  "mcp",
  "reqwest",
  "secrets",

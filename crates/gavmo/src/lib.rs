@@ -10,6 +10,9 @@ pub mod app;
 pub mod auth;
 
 #[cfg(feature = "ssr")]
+mod guest_files;
+
+#[cfg(feature = "ssr")]
 pub mod integrations;
 
 #[cfg(feature = "ssr")]

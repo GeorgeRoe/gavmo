@@ -401,19 +401,49 @@ pub fn select_integrations(
         .collect()
 }
 
-/// Reads a workspace's `gavmo.yaml`. Missing or invalid files yield an empty
-/// config, so a malformed repo config never breaks a boot.
+/// Largest `gavmo.yaml` accepted; a tool list is a few KiB at most.
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// Reads a workspace's `gavmo.yaml`. Missing, unreadable or invalid files
+/// yield an empty config (logged), so a bad repo config never breaks a boot.
+///
+/// The file is guest-writable, so it is read without following symlinks
+/// (it could otherwise point at any host file, whose contents YAML errors
+/// might then echo into the log) and with a size limit.
 pub async fn read_config(workspace_path: &str) -> GavmoConfig {
     let path = std::path::Path::new(workspace_path).join("gavmo.yaml");
-    match tokio::fs::read_to_string(&path).await {
-        Ok(text) => match toolspec::parse_config(&text) {
-            Ok(config) => config,
-            Err(e) => {
-                eprintln!("gavmo: ignoring invalid {}: {e}", path.display());
-                GavmoConfig::default()
-            }
-        },
-        Err(_) => GavmoConfig::default(),
+    let file = match crate::guest_files::read_guest_file(
+        path.clone(),
+        Vec::new(),
+        MAX_CONFIG_BYTES,
+        crate::guest_files::Keep::Head,
+    )
+    .await
+    {
+        Ok(Some(file)) => file,
+        Ok(None) => return GavmoConfig::default(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring unreadable gavmo.yaml");
+            return GavmoConfig::default();
+        }
+    };
+    if file.truncated {
+        tracing::warn!(
+            path = %path.display(),
+            "ignoring gavmo.yaml larger than {MAX_CONFIG_BYTES} bytes"
+        );
+        return GavmoConfig::default();
+    }
+    let Ok(text) = String::from_utf8(file.bytes) else {
+        tracing::warn!(path = %path.display(), "ignoring gavmo.yaml that is not UTF-8");
+        return GavmoConfig::default();
+    };
+    match toolspec::parse_config(&text) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring invalid gavmo.yaml");
+            GavmoConfig::default()
+        }
     }
 }
 

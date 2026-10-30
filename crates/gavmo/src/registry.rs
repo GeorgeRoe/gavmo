@@ -795,19 +795,28 @@ impl AppState {
                 "invalid build log filename",
             ));
         }
-        tokio::fs::read_to_string(Self::state_dir_for(id).join(log)).await
+        let file = read_state_file(id, log, MAX_BUILD_LOG_BYTES)
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "build log not found"))?;
+        let mut text = String::from_utf8_lossy(&file.bytes).into_owned();
+        if file.truncated {
+            text.insert_str(
+                0,
+                &format!("[... showing the last {MAX_BUILD_LOG_BYTES} bytes ...]\n"),
+            );
+        }
+        Ok(text)
     }
 
     /// Reads and sanitizes the guest's boot console log for the live panel.
     /// A missing file (qemu not spawned yet) is an empty log, not an error.
+    /// Only the newest [`MAX_CONSOLE_LOG_BYTES`] are returned.
     pub async fn read_console_log(&self, id: &str) -> io::Result<String> {
         self.require_known(id).await.map_err(unknown_workspace_io)?;
-        let path = Self::state_dir_for(id).join("console.log");
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(sanitize_console(&bytes)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(e),
-        }
+        Ok(read_state_file(id, "console.log", MAX_CONSOLE_LOG_BYTES)
+            .await?
+            .map(|file| sanitize_console(&file.bytes))
+            .unwrap_or_default())
     }
 
     /// Resource usage for a `Running` VM: per-core CPU %, guest-reported
@@ -981,6 +990,29 @@ fn check_workspace_path(
 /// that doesn't exist yet can't be reached through a symlink either).
 fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Most of the console log returned per poll (the newest output).
+const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
+/// Most of a rebuild log shown in the UI (the end, where errors are).
+const MAX_BUILD_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Reads the tail of `<id>/.gavmo/vm/<name>`, which the guest can write
+/// (see [`crate::guest_files`]): no symlinks, FIFOs or unbounded reads.
+async fn read_state_file(
+    id: &str,
+    name: &str,
+    max_bytes: u64,
+) -> io::Result<Option<crate::guest_files::GuestFile>> {
+    let gavmo_dir = Path::new(id).join(".gavmo");
+    let state_dir = AppState::state_dir_for(id);
+    crate::guest_files::read_guest_file(
+        state_dir.join(name),
+        vec![gavmo_dir, state_dir],
+        max_bytes,
+        crate::guest_files::Keep::Tail,
+    )
+    .await
 }
 
 /// Maps a [`AppState::require_known`] failure into the `io::Error` some
@@ -1737,6 +1769,52 @@ mod tests {
 
     fn path_str(path: &Path) -> String {
         path.to_str().unwrap().to_owned()
+    }
+
+    /// A guest can replace `console.log` (or the whole state dir) with a
+    /// symlink; the daemon must not follow it into a host file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn console_and_build_logs_refuse_guest_planted_symlinks() {
+        let (_tmp, repo_dir) = unique_temp_dir("symlink-repo");
+        let host = tempfile::tempdir().unwrap();
+        let secret = host.path().join("rebuild-2026-01-01T00-00-00Z.log");
+        std::fs::write(&secret, b"HOST SECRET").unwrap();
+        let id = repo_dir.to_string_lossy().into_owned();
+        let (_data, state) = test_app_state();
+        register(&state, &id).await;
+
+        let state_dir = repo_dir.join(".gavmo").join("vm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::os::unix::fs::symlink(&secret, state_dir.join("console.log")).unwrap();
+        assert!(state.read_console_log(&id).await.is_err());
+
+        // Whole state dir swapped for a symlink to a host dir.
+        std::fs::remove_dir_all(&state_dir).unwrap();
+        std::os::unix::fs::symlink(host.path(), &state_dir).unwrap();
+        assert!(
+            state
+                .read_build_log(&id, "rebuild-2026-01-01T00-00-00Z.log")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn console_log_returns_only_the_newest_bytes() {
+        let (_tmp, repo_dir) = unique_temp_dir("big-console");
+        let id = repo_dir.to_string_lossy().into_owned();
+        let (_data, state) = test_app_state();
+        register(&state, &id).await;
+        let state_dir = repo_dir.join(".gavmo").join("vm");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut big = vec![b'a'; usize::try_from(MAX_CONSOLE_LOG_BYTES).unwrap() * 2];
+        big.extend_from_slice(b"NEWEST");
+        std::fs::write(state_dir.join("console.log"), &big).unwrap();
+
+        let text = state.read_console_log(&id).await.unwrap();
+        assert!(text.ends_with("NEWEST"));
+        assert!(text.len() as u64 <= MAX_CONSOLE_LOG_BYTES);
     }
 
     /// Share dir names are deterministic, hex-only, and distinct per workspace.
