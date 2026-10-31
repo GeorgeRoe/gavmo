@@ -1,0 +1,298 @@
+# cargo-deny: supply-chain checks over every crate in Cargo.lock. Run with
+# `cargo deny check` (CI runs it with `-D warnings`, so stale exceptions fail
+# too). Policy: everything is denied unless listed here, and every exception
+# says why. When an exception stops matching, delete it.
+
+[graph]
+# Linux x86-64 daemon plus the wasm32 control-panel bundle; nothing else ships.
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+all-features = true
+
+# --- Advisories (RustSec) ---------------------------------------------------
+# Every vulnerability is an error regardless of configuration.
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+unused-ignored-advisory = "deny"
+# Unmaintained crates with no maintained release to move to. [bans] below
+# limits which crates may depend on each, so nothing new can pull them in.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste: compile-time macro helper used by Leptos; no runtime code" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: via serde_yaml_ng in toolspec (parses untrusted gavmo.yaml); replace with a maintained pure-Rust YAML parser" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 4: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 3: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 4: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
+]
+
+# --- Licenses ---------------------------------------------------------------
+# Permissive licenses only. A license may be listed only if some crate needs it.
+[licenses]
+confidence-threshold = 1.0
+unused-allowed-license = "deny"
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = [
+    # File-level copyleft, compatible with an MIT project as long as the crate
+    # is used unmodified. Via dirs -> dirs-sys.
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+[licenses.private]
+# The workspace's own crates are `publish = false` and carry no license field.
+ignore = true
+
+# --- Bans -------------------------------------------------------------------
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# Workspace path dependencies (`vm = { path = ... }`) aren't wildcards.
+allow-wildcard-paths = true
+highlight = "all"
+deny = [
+    # TLS is rustls-only (see reqwest's features in crates/gavmo/Cargo.toml).
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+    # keyring uses async-secret-service so no C libdbus is linked.
+    { crate = "libdbus-sys", reason = "keyring must stay on async-secret-service (pure-Rust zbus)" },
+    # Unmaintained (see [advisories]): only their current parents may use them.
+    { crate = "paste", wrappers = ["either_of", "leptos", "reactive_graph", "reactive_stores", "tachys"], reason = "unmaintained, RUSTSEC-2024-0436" },
+    { crate = "unsafe-libyaml", wrappers = ["serde_yaml_ng"], reason = "unmaintained, RUSTSEC-2024-0449" },
+    { crate = "zbus_names", wrappers = ["zbus"], reason = "unmaintained, RUSTSEC-2026-0371" },
+    { crate = "zvariant", wrappers = ["zbus", "zbus_names"], reason = "unmaintained, RUSTSEC-2026-0370" },
+    { crate = "zvariant_derive", wrappers = ["zvariant"], reason = "unmaintained, RUSTSEC-2026-0372" },
+]
+# Duplicate versions that come from upstream, not from this repo. Each skips
+# the older version; revisit on every dependency bump.
+skip = [
+    # rmcp moved to base64 0.23; axum, leptos, reqwest and secrets are on 0.22.
+    { crate = "base64@0.22", reason = "upstream split: rmcp/hyper-util on 0.23" },
+    # Two RustCrypto generations: chacha20poly1305 0.11 (secrets) is on the new
+    # one; keyring's aes/cbc and sha1/sha2/hmac are on the old one.
+    { crate = "block-buffer@0.10", reason = "RustCrypto generation split" },
+    { crate = "cipher@0.4", reason = "RustCrypto generation split" },
+    { crate = "cpufeatures@0.2", reason = "RustCrypto generation split" },
+    { crate = "crypto-common@0.1", reason = "RustCrypto generation split" },
+    { crate = "inout@0.1", reason = "RustCrypto generation split" },
+    # zbus/secret-service (keyring 3) on rand 0.8, leptos on 0.9, rmcp on 0.10.
+    { crate = "rand@0.8", reason = "keyring 3's zbus" },
+    { crate = "rand@0.9", reason = "leptos" },
+    { crate = "rand_core@0.6", reason = "keyring 3's zbus" },
+    { crate = "rand_core@0.9", reason = "leptos" },
+    { crate = "rand_chacha@0.3", reason = "keyring 3's zbus" },
+    { crate = "getrandom@0.2", reason = "rand_core 0.6 and ring" },
+    { crate = "getrandom@0.3", reason = "rand_core 0.9" },
+    # The ecosystem is mid-move from syn 2 to syn 3.
+    { crate = "syn@2", reason = "syn 2 -> 3 transition" },
+    { crate = "thiserror@1", reason = "gloo-net (Leptos, wasm side)" },
+    { crate = "thiserror-impl@1", reason = "gloo-net (Leptos, wasm side)" },
+    { crate = "convert_case@0.6", reason = "config (leptos_config); Leptos macros are on 0.11" },
+]
+
+# Crates that run code at compile time. A new crate with a build script, or a
+# script/executable shipped inside a compile-time crate, fails the check.
+[bans.build]
+executables = "deny"
+interpreted = "deny"
+enable-builtin-globs = true
+include-dependencies = true
+include-archives = true
+allow-build-scripts = [
+    "anyhow",
+    "async-io",
+    "camino",
+    "crossbeam-utils",
+    "encoding_rs",
+    "generic-array",
+    "getrandom",
+    "httparse",
+    "icu_normalizer_data",
+    "icu_properties_data",
+    "leptos",
+    "leptos_macro",
+    "leptos_router",
+    "libc",
+    "libm",
+    "memoffset",
+    "mime_guess",
+    "multer",
+    "nix",
+    "num-traits",
+    "paste",
+    "prettyplease",
+    "proc-macro2",
+    "proc-macro2-diagnostics",
+    "qapi-qmp",
+    "quote",
+    "reactive_graph",
+    "ref-cast",
+    "ring",
+    "rmcp",
+    "rstml",
+    "rustix",
+    "rustls",
+    "rustversion",
+    "serde",
+    "serde_core",
+    "serde_json",
+    "server_fn",
+    "server_fn_macro",
+    "slotmap",
+    "tachys",
+    "thiserror",
+    "wasm-bindgen",
+    "wasm-bindgen-shared",
+    "zerocopy",
+    "zmij",
+]
+
+# Files in compile-time crates that the scan flags but that never run during a
+# build. Pinned by checksum: a changed file fails the check until reviewed.
+# wasm-bindgen's JS glue for the browser bundle.
+[[bans.build.bypass]]
+crate = "js-sys"
+allow = [{ path = "src/futures/task/worker.js", checksum = "1f1b207b7f45925d8c50f51538d3c23caf14073080bfe6e6bc64a3689b93db78" }]
+
+[[bans.build.bypass]]
+crate = "wasm-bindgen-macro"
+allow = [{ path = "src/worker.js", checksum = "cb5c33dd41cfad622abce5464a3ceae478904ea16ddc3c6c769ee33e0c086692" }]
+
+[[bans.build.bypass]]
+crate = "leptos_hot_reload"
+allow = [{ path = "src/patch.js", checksum = "328bffda5736f8eff26499ac5acb805d0e0a3524cb040d6ba1abe32d711547ef" }]
+
+# Upstream test fixtures and maintainer CI scripts, unused by builds.
+[[bans.build.bypass]]
+crate = "gloo-utils"
+allow = [{ path = "tests/serde.js", checksum = "c439138b8869d420c5ab7adc2d2d6c806a6cc9536eb56c2c674dea2c64630810" }]
+
+[[bans.build.bypass]]
+crate = "wasm-streams"
+allow = [
+    { path = "tests/js/readable_stream.js", checksum = "f10c5f0b21d54519b8c200e28da4e82a9a8159ea82fa5c717a7b755d5b665afc" },
+    { path = "tests/js/transform_stream.js", checksum = "48dbc3b2f94865165f95ff61e0cacb78b09fc6cc9b2ca70a86b5ea7f7dc384e1" },
+    { path = "tests/js/writable_stream.js", checksum = "1eca123bc7450db9c831a8c628eb667858e10182c045aa686c47fabc013ee383" },
+]
+
+[[bans.build.bypass]]
+crate = "tracing"
+allow = [{ path = "test-macros/bin/macro-results.sh", checksum = "86cc594cd5988829226e5558f97463c709820ee33b85355aadf06e61d6e242ec" }]
+
+[[bans.build.bypass]]
+crate = "typed-builder"
+allow = [{ path = "run-retrospective-crate-version-tagging.sh", checksum = "38c2d82e3b0ed5cfa62da1e3e5ccc9ceea22d0d61c5a1e265314d893e09df556" }]
+
+[[bans.build.bypass]]
+crate = "untrusted"
+allow = [
+    { path = "mk/cargo.sh", checksum = "766c00df2767ac0998000e9b55d076b6dbbeb05ecf4c4d9b317df8551fae1bbe" },
+    { path = "mk/install-build-tools.sh", checksum = "90ec3cce41b1660b5103a37803e537ff167bae17badaca2d89f492116555919d" },
+    { path = "mk/runner", checksum = "471602c60f4243f87ebf952f8e69c07dfa29d8c69f2ef3885a4c61a2d6bf3b33" },
+]
+
+[[bans.build.bypass]]
+crate = "walkdir"
+allow = [{ path = "compare/walk.py", checksum = "d49e26d0b8b2b201d00f2f46bf1f9db46f873c27332da679c9a7adbbf54462d2" }]
+
+# Leptos hydration scripts, embedded into the served page.
+[[bans.build.bypass]]
+crate = "leptos"
+allow = [
+    { path = "src/hydration/hydration_script.js", checksum = "7f942d162a0ceb39dd354f6a46a3113a342ff5e4e7525451782a765ef8567409" },
+    { path = "src/hydration/island_script.js", checksum = "ceb71195c4a8aad1f390f5798aa7163f8e976c49b6fc8414458f265b31e9293d" },
+    { path = "src/hydration/islands_routing.js", checksum = "edececb3dd8f46c2a325ee08281ac41082ee22bdc9f5748d626ab55fa661a90b" },
+    { path = "src/hydration/reload_script.js", checksum = "fff584aebadcaa0cb164b1e814dcda5ecd844a72f50eb65c6b50c17a6cf1a165" },
+]
+
+# ring's perlasm sources; the generated assembly ships in the crate, so perl
+# never runs when building from crates.io.
+[[bans.build.bypass]]
+crate = "ring"
+allow = [
+    { path = "crypto/chacha/asm/chacha-armv4.pl", checksum = "25100401cfe20d6f39cf71a3f3ffe54b5a2d2b93828f84a104c0599d1c30c9c4" },
+    { path = "crypto/chacha/asm/chacha-armv8.pl", checksum = "05fe6547dab17296cb7e0b8b9253a860a39c7c931569ab22cd420e0083505fe6" },
+    { path = "crypto/chacha/asm/chacha-x86_64.pl", checksum = "24e536daad8464a6daea17de527b02f9c3ebe1f09356dd5e48cfdfa04abb955a" },
+    { path = "crypto/chacha/asm/chacha-x86.pl", checksum = "c3b133032416211ffddd63485636ada3ee9783d2a41deb39da59f6cb09b9feab" },
+    { path = "crypto/cipher/asm/chacha20_poly1305_armv8.pl", checksum = "a7f58ba7d3dd189fe2f1acde2357d62fce89f311509c7a058ead468cd6796de4" },
+    { path = "crypto/cipher/asm/chacha20_poly1305_x86_64.pl", checksum = "48f2a06a297d3575a760d01e219b0b8d8f8733c1e7b6d2aa6e7949cc12c1a9ae" },
+    { path = "crypto/fipsmodule/aes/asm/aes-gcm-avx2-x86_64.pl", checksum = "981415091853018d18144f6b3f3459e5ecf5cddd962d2706f1c7391a48fa6722" },
+    { path = "crypto/fipsmodule/aes/asm/aesni-gcm-x86_64.pl", checksum = "e85c2ddf728eb6253562f24d2db6fb305ed7808110f18949cdcd597e6c52c532" },
+    { path = "crypto/fipsmodule/aes/asm/aesni-x86_64.pl", checksum = "74e331f10e9e97ae998a1929cacd7f6653b4826158a9269a82d5780ccfad72c8" },
+    { path = "crypto/fipsmodule/aes/asm/aesni-x86.pl", checksum = "c08d6b755f541256190730274fde1d8634165760856bf05d1a0300f7f1313e91" },
+    { path = "crypto/fipsmodule/aes/asm/aesv8-armx.pl", checksum = "989b4086b368c8df4085dc433d020e463a9c24716e59b473fdbcc751d8357e21" },
+    { path = "crypto/fipsmodule/aes/asm/aesv8-gcm-armv8.pl", checksum = "e2f7e1a1147f711255e974f5942be63139da27db8da0706b0e7bfe23e4ef4c48" },
+    { path = "crypto/fipsmodule/aes/asm/bsaes-armv7.pl", checksum = "b262de8ca1d88c83de3319a926c637ae51781d530b710904bafd3ad360f52929" },
+    { path = "crypto/fipsmodule/aes/asm/ghash-armv4.pl", checksum = "d1a0f8100031e2c6babc97eacc8b05cb076952a2d63d07487ceebbb8ce176e18" },
+    { path = "crypto/fipsmodule/aes/asm/ghash-neon-armv8.pl", checksum = "6530524ab8c968cfc2867355cda5021da30ebd256e229e52b8936419a1f968d5" },
+    { path = "crypto/fipsmodule/aes/asm/ghashv8-armx.pl", checksum = "081ec51966fee94ee0bd5710e82a581c5b131deec40347d79587a6db9ae8c6a8" },
+    { path = "crypto/fipsmodule/aes/asm/ghash-x86_64.pl", checksum = "889157ff342fae29cec2e84f5d767e8c2e39910626a113ede4ffb526cd757f04" },
+    { path = "crypto/fipsmodule/aes/asm/ghash-x86.pl", checksum = "4487fc642997d6741981381da74f7e72cbf9297682e5b7ada9bb57cc1101f786" },
+    { path = "crypto/fipsmodule/aes/asm/vpaes-armv7.pl", checksum = "0cccfba4deebf93ae317c4e14c2986ec8abac58e4a8557924248eebaa975139e" },
+    { path = "crypto/fipsmodule/aes/asm/vpaes-armv8.pl", checksum = "7c0e738f4166f38f39bb709ca0bde1a3cec009708646c7c94971dce28b3fa9c9" },
+    { path = "crypto/fipsmodule/aes/asm/vpaes-x86_64.pl", checksum = "b54f198a0faac2cc144f98a6c14019fe6d58d897124c7d69aebb2535a0102de9" },
+    { path = "crypto/fipsmodule/aes/asm/vpaes-x86.pl", checksum = "ef5252558dc5b23b7550800f53ab3d7c508f2a4fe71c717c5b35b05a971ec3d6" },
+    { path = "crypto/fipsmodule/bn/asm/armv4-mont.pl", checksum = "2cb2a0a84c4281a9dda17945b94e76b5a9656dc2df6d8c2c1e62be7ff59e3b12" },
+    { path = "crypto/fipsmodule/bn/asm/armv8-mont.pl", checksum = "8993f64606360cbc1b688a1ec3ffd7011464ea78823a126df10e29bd94adaf13" },
+    { path = "crypto/fipsmodule/bn/asm/x86_64-mont5.pl", checksum = "c0529d1a7faefd26c065601d5cfdc081c314c04294fd2c69589696681edf867c" },
+    { path = "crypto/fipsmodule/bn/asm/x86_64-mont.pl", checksum = "14cd1cb9fa1dd08473afa943e90ce98a43fbb4a9323d3101871f6724fb6b27ac" },
+    { path = "crypto/fipsmodule/bn/asm/x86-mont.pl", checksum = "3a7085a9c8de3d7fd684de75d397e1aa4b74ca0386e9bc4d353626e06b6be3ab" },
+    { path = "crypto/fipsmodule/ec/asm/p256-armv8-asm.pl", checksum = "029ce13a55ccf289f3cb58271ab6e1602f4b68ec244c3cbe739cc0858944ad50" },
+    { path = "crypto/fipsmodule/ec/asm/p256-x86_64-asm.pl", checksum = "454c278064dbae0f718bb2e415efee97e31a38958776623574632961b24e34ca" },
+    { path = "crypto/fipsmodule/sha/asm/sha256-armv4.pl", checksum = "1a9cc7c77921fb44912bf6e946d002a59a66ead474d0dc8b2bc581492dd941c5" },
+    { path = "crypto/fipsmodule/sha/asm/sha512-armv4.pl", checksum = "d900f16d6ecc4187a5a5ee35f1e7cf932ca5fe934ddeb4e0e55a8a05ff8393b7" },
+    { path = "crypto/fipsmodule/sha/asm/sha512-armv8.pl", checksum = "3db10ef65179656aa709cdab607ca3c5a2f5244d33071984385eb5990f7b404e" },
+    { path = "crypto/fipsmodule/sha/asm/sha512-x86_64.pl", checksum = "ab4c2e2cd6425b26d7df080bf363e938242016bfc929e523aa3318c6d352a098" },
+    { path = "crypto/perlasm/arm-xlate.pl", checksum = "18c99bd9639d132b091bd360af7a1cfc57148b46cabcc7d20224c68a35d432bf" },
+    { path = "crypto/perlasm/x86_64-xlate.pl", checksum = "783d46f1a12d150a60d51b44e3c1141b19ff65268f8d85e9bb4a44cdf32b9caa" },
+    { path = "crypto/perlasm/x86asm.pl", checksum = "99a3123e5135486546b36cf32c8e91f3635451cb9d926acdc6ac4d82aa652ed5" },
+    { path = "crypto/perlasm/x86gas.pl", checksum = "48bd5fb1f764137fe58dac82e86b8876bc9bdfd041ff53b5706ba2ad46bf6d80" },
+    { path = "crypto/perlasm/x86nasm.pl", checksum = "15383baac0a53850322e304b8f2ff9f210bed8c0d080ae938d329d71ed93d71e" },
+]
+
+# rmcp's interop test fixtures.
+[[bans.build.bypass]]
+crate = "rmcp"
+allow = [
+    { path = "tests/test_with_js/client.js", checksum = "1f1b26431e26706dc2d380f9fc3475bc78ada1c0c0ebe7302c1c59267a64b123" },
+    { path = "tests/test_with_js/server.js", checksum = "760f0721c1b9f44272cc3416a71172a9163044c12d2b58310c72d3286081df81" },
+    { path = "tests/test_with_js/streamable_client.js", checksum = "af4ccaf89ec0b34cda1b2af71edf9acd04924410a4ed4f579a0ccbd1360ec18a" },
+    { path = "tests/test_with_js/streamable_server.js", checksum = "01074613ae942d99028c3f31b1ff35e64817c6de30ab8beabeb3823cb97e7498" },
+    { path = "tests/test_with_python/client.py", checksum = "522e2401016ad7d87efa6b13a113c618cc1c1ee568b8f51bd1b92a605668b0ab" },
+    { path = "tests/test_with_python/server.py", checksum = "d27a404deb187a66f6b521d2deea4743bb8dc1e64179f2bf2e3a6cfb58aaa4d9" },
+]
+
+# zerocopy's maintainer CI scripts.
+[[bans.build.bypass]]
+crate = "zerocopy"
+allow = [
+    { path = "cargo.sh", checksum = "23b2eddb1e982dcc2228b573bb92a768e05e056e24f440d7efdf7fb1a747ac87" },
+    { path = "ci/check_all_toolchains_tested.sh", checksum = "979cece8aff80ff997bc317f9e48bb9f9a8c36486e7f23d7f1e869c75f03de85" },
+    { path = "ci/check_fmt.sh", checksum = "83e6654d1b6658c6d65c8b0beb4cbe7aaaa0cbf3cd4cc4d196d40b7c21f8d9eb" },
+    { path = "ci/check_msrv_is_minimal.sh", checksum = "b6adac6e751ef1dd5927090b30bb098a64e9c9c50e047562088b889e25c2d5fc" },
+    { path = "ci/check_readme.sh", checksum = "c23dc51696893e171018fb1cb86b7c606a2cd3ad4800c7a44f913a1451607c5e" },
+    { path = "ci/check_stale_stderr.sh", checksum = "61a25ca45e05e684c31af4f926c15c7d7f97945f90a744038ab45816799dc6d0" },
+    { path = "ci/check_versions.sh", checksum = "c2603621c4981c1400d946cd83b2d3af0ba7db2355779b55eab89ca2c821fe0d" },
+    { path = "ci/release_crate_version.sh", checksum = "e5f4b957eae4251f66a9497cc596533d767d97a841556c5c18425aa7259005eb" },
+    { path = "win-cargo.bat", checksum = "892ced98796378161965ed3c4260fe77f4e66650051849864936877da7420f0d" },
+]
+
+# --- Sources ----------------------------------------------------------------
+# crates.io only: no git dependencies, no other registries.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+unused-allowed-source = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

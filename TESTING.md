@@ -119,7 +119,12 @@ cargo clippy -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
 cargo clippy -p gavmo --lib --tests --features hydrate --target wasm32-unknown-unknown
 cargo test -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
 cargo leptos build
+cargo deny check -D warnings
 ```
+
+`cargo deny` checks dependencies against `deny.toml`: RustSec advisories,
+licenses, duplicate and banned crates, build scripts, and sources. Every
+exception there carries its reason; delete one once it no longer matches.
 
 Lints are strict (pedantic, `unwrap_used`, `unreachable_pub`, ...). Tests
 are exempt from the panic-family lints through `clippy.toml`.
