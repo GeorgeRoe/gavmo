@@ -85,7 +85,10 @@ cargo test --workspace --exclude gavmo -- --include-ignored
 
 A few `vm` tests start real `qemu` and `virtiofsd` (no base image needed;
 they check that boot failures are reported promptly and that qemu uses the
-explicit backing file rather than the overlay's header). They work inside a
+explicit backing file rather than the overlay's header). Others run real
+`qemu-img` to check that overlay disks are created at the requested size,
+grown in place and never shrunk; for the daemon-side version of that, run
+`cargo test -p gavmo --features ssr -- --ignored an_existing_disk`. They work inside a
 GAVMO VM too, since it has `qemu`, `virtiofsd` and `/dev/kvm`.
 
 ## Full-boot test (host only)

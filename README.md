@@ -161,6 +161,25 @@ the status and `Location` and can request that path itself, if it's on the
 same integration. Which tools a VM offers is fixed when it starts; the
 credential itself is read fresh on every call.
 
+## VM resources
+
+Each workspace's modal has a **Resources** section: disk size, memory and
+vCPUs. They are set in the panel, not in the repo, because they decide how
+much of your machine a VM may use and the repo is writable by the agent.
+They are saved in `workspaces.json`; an empty field means the default
+(32 GiB disk, 4 GiB memory, 4 vCPUs).
+
+- Memory and vCPUs can be changed any time and apply on the next start, up
+  to the host's RAM and CPU count.
+- The disk (16-1024 GiB) can only be changed while the VM is stopped, and
+  only upward. On the next start the overlay is grown in place
+  (`qemu-img resize`) and the guest grows its partition and filesystem to
+  fit, so nothing is lost. The disk is sparse: its size is a cap, not space
+  taken up front.
+- To make a disk smaller, Reset the workspace (this deletes the VM disk,
+  including `/nix` and anything installed outside `/workspace`); the next
+  start creates a fresh disk at the saved size.
+
 ## Upgrading from earlier versions
 
 One-time changes when moving to this version:
@@ -229,7 +248,7 @@ A few things worth knowing:
   files are untouched.)
 - **Disk headroom.** Everything `gavmo.nix` adds (packages, Docker images,
   browser bundles, build caches) lives on the workspace's persistent overlay
-  disk; see `crates/vm/src/disk.rs` for its size.
+  disk (32 GiB by default; grow it per workspace, see "VM resources").
 
 See `examples/` for worked `gavmo.nix` recipes:
 
