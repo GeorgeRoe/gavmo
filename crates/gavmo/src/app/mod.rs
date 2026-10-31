@@ -12,6 +12,7 @@ mod home;
 mod hooks;
 mod modal;
 mod polling;
+mod resources;
 mod tools;
 mod transitions;
 mod workspace_modal;

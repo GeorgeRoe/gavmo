@@ -10,6 +10,7 @@ mod lifecycle;
 mod logs;
 mod paths;
 mod ports;
+mod resources;
 mod secret_store;
 mod stats;
 mod store;
@@ -39,15 +40,6 @@ use crate::integrations::ResolvedIntegration;
 use crate::types::{WorkspaceInfo, WorkspaceStatus};
 use crate::vm_handle::{Launcher, QemuLauncher};
 
-/// Default guest memory, in MiB.
-const DEFAULT_MEMORY_MIB: u32 = 4096;
-/// Overlay disk size for new workspaces, in GiB. The base image is auto-sized
-/// with little headroom, too small once `gavmo.nix` adds real packages;
-/// qcow2 is sparse, so this costs nothing until written.
-pub(super) const DEFAULT_DISK_GIB: u32 = 32;
-/// Default guest vCPU count.
-const DEFAULT_VCPUS: u32 = 4;
-
 /// Shared, cloneable application state, injected into every server function
 /// via Leptos context.
 #[derive(Clone)]
@@ -61,8 +53,6 @@ struct Inner {
     running: Mutex<HashMap<String, VmSlot>>,
     base_image: PathBuf,
     gcloud_dir: PathBuf,
-    memory_mib: u32,
-    vcpus: u32,
 
     /// Root dir for every workspace's MCP token share
     /// (`~/.local/share/gavmo/mcp`), deliberately outside any repo.
@@ -172,8 +162,6 @@ impl AppState {
                 running: Mutex::new(HashMap::new()),
                 base_image,
                 gcloud_dir,
-                memory_mib: DEFAULT_MEMORY_MIB,
-                vcpus: DEFAULT_VCPUS,
                 mcp_base_dir,
                 vms_base_dir,
                 runtime_base_dir: runtime_base_dir.to_path_buf(),
@@ -248,6 +236,7 @@ impl AppState {
             registry.workspaces.push(WorkspaceRecord {
                 path: canonical,
                 host_port: None,
+                resources: crate::types::Resources::default(),
             });
             save_registry(&self.inner.registry_path, &registry)
                 .await

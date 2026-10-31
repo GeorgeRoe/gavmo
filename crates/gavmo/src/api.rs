@@ -2,7 +2,8 @@
 //! daemon. Bodies only compile on the server, where they use the registry.
 
 use crate::types::{
-    AppError, ConsoleChunk, DirListing, ToolList, VmStats, WorkspaceInfo, WorkspaceStatus,
+    AppError, ConsoleChunk, DirListing, ResourcesView, ToolList, VmStats, WorkspaceInfo,
+    WorkspaceStatus,
 };
 use leptos::prelude::*;
 
@@ -145,6 +146,35 @@ pub async fn clear_tool_secret(id: String, tool_id: String) -> Result<(), AppErr
 pub async fn test_tool(id: String, tool_id: String) -> Result<String, AppError> {
     let state = app_state()?;
     state.test_tool(&id, &tool_id).await.map_err(AppError::from)
+}
+
+/// A workspace's VM resource settings, their defaults and limits, and the
+/// current disk size.
+#[server]
+pub async fn get_resources(id: String) -> Result<ResourcesView, AppError> {
+    let state = app_state()?;
+    state.resources(&id).await.map_err(AppError::from)
+}
+
+/// Saves a workspace's resource settings (applied on its next start). Empty
+/// fields mean "use the default".
+#[server]
+pub async fn set_resources(
+    id: String,
+    disk_gib: Option<u32>,
+    memory_gib: Option<u32>,
+    vcpus: Option<u32>,
+) -> Result<(), AppError> {
+    let state = app_state()?;
+    let settings = crate::types::Resources {
+        disk_gib,
+        memory_gib,
+        vcpus,
+    };
+    state
+        .set_resources(&id, settings)
+        .await
+        .map_err(AppError::from)
 }
 
 /// Fetches the injected [`registry::AppState`] from Leptos context.

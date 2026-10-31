@@ -10,11 +10,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use vm::{Error as VmError, VmConfig, VmStatus};
 
+use super::AppState;
+use super::resources::DEFAULTS;
 use super::store::save_registry;
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
-use super::{AppState, DEFAULT_DISK_GIB};
 use crate::integrations::ResolvedIntegration;
-use crate::types::WorkspaceStatus;
+use crate::types::{ResourceValues, WorkspaceStatus};
 use crate::vm_handle::{VmHandle, VmInfo};
 
 /// How often a running VM's monitor probes it (QMP + HTTP).
@@ -230,7 +231,9 @@ impl AppState {
             }
         };
 
-        let cfg = self.vm_config(id, mcp_dir, host_port);
+        // Read before the `running` lock (lock order: registry, then running).
+        let resources = self.saved_resources(id).await.resolve(DEFAULTS);
+        let cfg = self.vm_config(id, mcp_dir, host_port, resources);
         let generation = self
             .inner
             .boot_generation
@@ -542,10 +545,16 @@ impl AppState {
         })
     }
 
-    /// Builds the per-VM [`VmConfig`] for a workspace path. `host_port` is
-    /// passed in because resolving it takes the `registry` lock, which must
+    /// Builds the per-VM [`VmConfig`] for a workspace path. `host_port` and
+    /// `resources` are passed in because reading them takes the `registry` lock, which must
     /// not nest under the `running` lock held here.
-    pub(super) fn vm_config(&self, id: &str, mcp_dir: PathBuf, host_port: u16) -> VmConfig {
+    pub(super) fn vm_config(
+        &self,
+        id: &str,
+        mcp_dir: PathBuf,
+        host_port: u16,
+        resources: ResourceValues,
+    ) -> VmConfig {
         let repo_dir = PathBuf::from(id);
         let workspace_id = repo_dir.file_name().map_or_else(
             || "workspace".to_string(),
@@ -561,9 +570,9 @@ impl AppState {
             base_image: self.inner.base_image.clone(),
             gcloud_dir: self.inner.gcloud_dir.clone(),
             mcp_dir,
-            disk_size_gib: DEFAULT_DISK_GIB,
-            memory_mib: self.inner.memory_mib,
-            vcpus: self.inner.vcpus,
+            disk_size_gib: resources.disk_gib,
+            memory_mib: resources.memory_gib.saturating_mul(1024),
+            vcpus: resources.vcpus,
             host_port,
         }
     }

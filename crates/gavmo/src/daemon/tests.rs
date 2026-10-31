@@ -480,3 +480,43 @@ async fn an_invalid_gavmo_yaml_is_reported_through_the_api() {
     assert!(list.tools.is_empty());
     assert!(list.config_error.is_some());
 }
+
+#[tokio::test]
+async fn resources_round_trip_through_the_api() {
+    let d = Daemon::start().await;
+    let (_repo, id) = d.add_repo().await;
+    let view: crate::types::ResourcesView = d
+        .call(api::GetResources::PATH, &[("id", &id)])
+        .await
+        .unwrap();
+    assert_eq!(view.saved, crate::types::Resources::default());
+    assert_eq!(view.disk_current_gib, None);
+
+    // Absent fields are "use the default".
+    d.call::<()>(
+        api::SetResources::PATH,
+        &[("id", &id), ("disk_gib", "48"), ("vcpus", "1")],
+    )
+    .await
+    .unwrap();
+    let view: crate::types::ResourcesView = d
+        .call(api::GetResources::PATH, &[("id", &id)])
+        .await
+        .unwrap();
+    assert_eq!(
+        view.saved,
+        crate::types::Resources {
+            disk_gib: Some(48),
+            memory_gib: None,
+            vcpus: Some(1),
+        }
+    );
+
+    let too_small = d
+        .call::<()>(api::SetResources::PATH, &[("id", &id), ("disk_gib", "1")])
+        .await;
+    assert!(
+        matches!(too_small, Err(AppError::InvalidInput(_))),
+        "{too_small:?}"
+    );
+}

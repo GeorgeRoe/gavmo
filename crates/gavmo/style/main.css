@@ -600,3 +600,17 @@ button.danger:hover:not(:disabled) {
 .topbar-actions form {
   margin: 0;
 }
+
+/* Resources panel */
+.resource-grid {
+  display: grid;
+  grid-template-columns: max-content 8rem 1fr;
+  gap: 0.4rem 0.75rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.resource-grid .hint {
+  margin: 0;
+}

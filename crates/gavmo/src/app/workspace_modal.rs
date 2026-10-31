@@ -13,6 +13,7 @@ use leptos::prelude::*;
 use super::format::{display_name, format_bytes, format_uptime, percent_of, status_view};
 use super::hooks::{run_action, use_polling};
 use super::modal::Modal;
+use super::resources::ResourcesPanel;
 use super::tools::WorkspaceTools;
 use super::transitions::{scroll_to_bottom, vt_name};
 use crate::api::{
@@ -88,6 +89,7 @@ pub(crate) fn WorkspaceModal(
             <ConsolePanel id status />
             <StatsPanel id status />
             <BuildLogPanel id status />
+            <ResourcesPanel id=id.get_value() status />
             <WorkspaceTools id=id.get_value() />
         </Modal>
     }

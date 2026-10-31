@@ -171,3 +171,48 @@ pub struct ToolConfig {
     /// tool stays disabled until the user re-confirms it.
     pub approved_delivery: Option<String>,
 }
+
+/// A workspace's VM resource settings, as saved. `None` means "use the
+/// default", so a changed default reaches workspaces that never chose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_gib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u32>,
+}
+
+/// Concrete resource values (defaults, limits, or a resolved setting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceValues {
+    pub disk_gib: u32,
+    pub memory_gib: u32,
+    pub vcpus: u32,
+}
+
+impl Resources {
+    /// These settings with `defaults` filled in.
+    pub fn resolve(self, defaults: ResourceValues) -> ResourceValues {
+        ResourceValues {
+            disk_gib: self.disk_gib.unwrap_or(defaults.disk_gib),
+            memory_gib: self.memory_gib.unwrap_or(defaults.memory_gib),
+            vcpus: self.vcpus.unwrap_or(defaults.vcpus),
+        }
+    }
+}
+
+/// The Resources panel's view: what is saved, what an unset field means,
+/// the allowed range, and the disk's current size.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourcesView {
+    pub saved: Resources,
+    pub defaults: ResourceValues,
+    pub min: ResourceValues,
+    pub max: ResourceValues,
+    /// Virtual size of the existing overlay disk, rounded up to whole GiB;
+    /// `None` before the first boot (or after a reset). The disk can only
+    /// be set to this or more.
+    pub disk_current_gib: Option<u32>,
+}

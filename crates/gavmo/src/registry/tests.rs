@@ -19,7 +19,7 @@ use super::paths::{check_workspace_path, human_bytes, workspace_hash};
 use super::ports::{alloc_port, choose_host_port, resolve_host_port_in};
 use super::store::{Registry, WorkspaceRecord, load_registry, save_registry};
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
-use crate::types::WorkspaceStatus;
+use crate::types::{ResourceValues, Resources, WorkspaceStatus};
 
 /// systemd's SGR-colored `[  OK  ]` lines with `\r\n` come out as plain text.
 #[test]
@@ -196,6 +196,7 @@ fn resolve_host_port_in_persists_a_fresh_port_for_a_new_workspace() {
         workspaces: vec![WorkspaceRecord {
             path: "/workspace/one".to_string(),
             host_port: None,
+            resources: Resources::default(),
         }],
     };
 
@@ -217,6 +218,7 @@ fn resolve_host_port_in_is_a_noop_when_the_persisted_port_is_still_free() {
         workspaces: vec![WorkspaceRecord {
             path: "/workspace/two".to_string(),
             host_port: Some(persisted),
+            resources: Resources::default(),
         }],
     };
 
@@ -239,6 +241,7 @@ fn resolve_host_port_in_overwrites_a_persisted_port_that_is_now_taken() {
         workspaces: vec![WorkspaceRecord {
             path: "/workspace/three".to_string(),
             host_port: Some(occupied_port),
+            resources: Resources::default(),
         }],
     };
 
@@ -258,10 +261,12 @@ fn resolve_host_port_in_only_touches_the_matching_workspace() {
             WorkspaceRecord {
                 path: "/workspace/a".to_string(),
                 host_port: Some(4096),
+                resources: Resources::default(),
             },
             WorkspaceRecord {
                 path: "/workspace/b".to_string(),
                 host_port: None,
+                resources: Resources::default(),
             },
         ],
     };
@@ -432,6 +437,7 @@ async fn register(state: &AppState, id: &str) {
         .push(WorkspaceRecord {
             path: id.to_owned(),
             host_port: None,
+            resources: Resources::default(),
         });
 }
 
@@ -693,7 +699,7 @@ async fn an_invalid_gavmo_yaml_is_reported_in_the_tool_list() {
 fn vm_config_keeps_host_state_out_of_the_repo() {
     let (data, state) = test_app_state();
     let id = "/home/u/src/project";
-    let cfg = state.vm_config(id, state.mcp_dir_for(id), 40000);
+    let cfg = state.vm_config(id, state.mcp_dir_for(id), 40000, resources::DEFAULTS);
     let hash = workspace_hash(id);
 
     assert_eq!(cfg.state_dir, data.path().join("vms").join(&hash));
@@ -1024,7 +1030,7 @@ async fn a_superseded_boot_result_is_stopped_not_published() {
         let mut running = state.inner.running.lock().await;
         state.replace_slot(&mut running, &id, Some(VmSlot::Stopping));
     }
-    let cfg = state.vm_config(&id, state.mcp_dir_for(&id), 1);
+    let cfg = state.vm_config(&id, state.mcp_dir_for(&id), 1, resources::DEFAULTS);
     script.release_boots(1);
     let vm = state.inner.launcher.boot(cfg).await.unwrap();
 
@@ -1045,6 +1051,7 @@ async fn save_registry_round_trips_atomically_and_owner_only() {
         workspaces: vec![WorkspaceRecord {
             path: "/srv/a".to_owned(),
             host_port: Some(40000),
+            resources: Resources::default(),
         }],
     };
     save_registry(&path, &registry).await.unwrap();
@@ -1235,4 +1242,159 @@ async fn an_unreadable_secret_store_is_an_error_not_unconfigured() {
     ));
     // Booting still works, just without tools.
     assert!(state.resolve_integrations_for(&id).await.is_empty());
+}
+
+// --- Resources ---
+
+#[test]
+fn mem_total_is_read_in_whole_gib() {
+    let meminfo = "MemTotal:       16314508 kB\nMemFree:  1 kB\n";
+    assert_eq!(resources::parse_mem_total_gib(meminfo), Some(15));
+    assert_eq!(resources::parse_mem_total_gib("MemFree: 1 kB\n"), None);
+}
+
+#[test]
+fn resources_outside_the_limits_are_refused() {
+    let min = ResourceValues {
+        disk_gib: 16,
+        memory_gib: 1,
+        vcpus: 1,
+    };
+    let max = ResourceValues {
+        disk_gib: 1024,
+        memory_gib: 8,
+        vcpus: 4,
+    };
+    let ok = Resources {
+        disk_gib: Some(16),
+        memory_gib: Some(8),
+        vcpus: None,
+    };
+    assert!(resources::validate(ok, min, max).is_ok());
+    for bad in [
+        Resources {
+            disk_gib: Some(15),
+            ..ok
+        },
+        Resources {
+            memory_gib: Some(9),
+            ..ok
+        },
+        Resources {
+            vcpus: Some(0),
+            ..ok
+        },
+    ] {
+        assert!(
+            matches!(
+                resources::validate(bad, min, max),
+                Err(RegistryError::InvalidInput(_))
+            ),
+            "{bad:?}"
+        );
+    }
+}
+
+/// Saved settings persist, and the next boot uses them.
+#[tokio::test]
+async fn saved_resources_persist_and_reach_the_next_boot() {
+    let (data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    let settings = Resources {
+        disk_gib: Some(48),
+        memory_gib: Some(2),
+        vcpus: Some(1),
+    };
+    state.set_resources(&id, settings).await.unwrap();
+    assert_eq!(state.resources(&id).await.unwrap().saved, settings);
+
+    let reloaded = super::store::load_registry(&data.path().join("workspaces.json")).unwrap();
+    assert_eq!(reloaded.workspaces[0].resources, settings);
+
+    open_and_run(&state, &script, &id).await;
+    let cfg = script.booted.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        (cfg.disk_size_gib, cfg.memory_mib, cfg.vcpus),
+        (48, 2048, 1)
+    );
+}
+
+/// Unset fields use the defaults.
+#[tokio::test]
+async fn unset_resources_boot_with_the_defaults() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    open_and_run(&state, &script, &id).await;
+    let cfg = script.booted.lock().unwrap().last().cloned().unwrap();
+    let d = resources::DEFAULTS;
+    assert_eq!(
+        (cfg.disk_size_gib, cfg.memory_mib, cfg.vcpus),
+        (d.disk_gib, d.memory_gib * 1024, d.vcpus)
+    );
+}
+
+/// Memory and vCPUs can change while running (next start); the disk can't.
+#[tokio::test]
+async fn the_disk_size_cannot_change_while_running() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    open_and_run(&state, &script, &id).await;
+
+    let memory = Resources {
+        memory_gib: Some(2),
+        ..Resources::default()
+    };
+    state.set_resources(&id, memory).await.unwrap();
+    let disk = Resources {
+        disk_gib: Some(64),
+        ..memory
+    };
+    let err = state.set_resources(&id, disk).await.unwrap_err();
+    assert!(err.to_string().contains("stop the VM"), "{err}");
+    assert_eq!(state.resources(&id).await.unwrap().saved, memory);
+}
+
+/// An older `workspaces.json` without `resources` still loads.
+#[test]
+fn a_registry_without_resources_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workspaces.json");
+    std::fs::write(
+        &path,
+        r#"{"workspaces":[{"path":"/srv/a","host_port":4000}]}"#,
+    )
+    .unwrap();
+    let registry = super::store::load_registry(&path).unwrap();
+    assert_eq!(registry.workspaces[0].resources, Resources::default());
+}
+
+/// With a real overlay: it can be grown but not shrunk, and its size is
+/// reported.
+#[tokio::test]
+#[ignore = "needs qemu-img"]
+async fn an_existing_disk_can_grow_but_not_shrink() {
+    let (_data, state, _script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    let dir = state.host_state_dir_for(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let status = std::process::Command::new("qemu-img")
+        .args(["create", "-f", "qcow2"])
+        .arg(dir.join("disk.qcow2"))
+        .arg("40G")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        state.resources(&id).await.unwrap().disk_current_gib,
+        Some(40)
+    );
+
+    let size = |gib| Resources {
+        disk_gib: Some(gib),
+        ..Resources::default()
+    };
+    let err = state.set_resources(&id, size(33)).await.unwrap_err();
+    assert!(err.to_string().contains("can't shrink"), "{err}");
+    state.set_resources(&id, size(40)).await.unwrap();
+    state.set_resources(&id, size(64)).await.unwrap();
 }

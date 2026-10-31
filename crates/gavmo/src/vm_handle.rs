@@ -96,6 +96,8 @@ pub(crate) mod fake {
         pub(crate) stops: AtomicUsize,
         /// What every fake VM's `status()` reports.
         pub(crate) status: Mutex<Option<VmStatus>>,
+        /// The config of every boot, in order.
+        pub(crate) booted: Mutex<Vec<VmConfig>>,
     }
 
     impl Script {
@@ -108,6 +110,7 @@ pub(crate) mod fake {
                 boots_started: AtomicUsize::new(0),
                 stops: AtomicUsize::new(0),
                 status: Mutex::new(None),
+                booted: Mutex::new(Vec::new()),
             });
             script.set_status(VmStatus::Running {
                 url: "http://127.0.0.1:1".to_owned(),
@@ -139,6 +142,7 @@ pub(crate) mod fake {
             let script = Arc::clone(&self.0);
             Box::pin(async move {
                 script.boots_started.fetch_add(1, Ordering::SeqCst);
+                script.booted.lock().unwrap().push(cfg.clone());
                 script.boot_gate.acquire().await.unwrap().forget();
                 let vm: Box<dyn VmHandle> = Box::new(FakeVm { script, cfg });
                 Ok(vm)

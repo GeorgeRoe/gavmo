@@ -24,10 +24,14 @@ use wasm_bindgen_test::wasm_bindgen_test;
 use web_sys::HtmlElement;
 
 use super::hooks::use_polling;
+use super::resources::ResourcesPanel;
 use super::tools::WorkspaceTools;
 use super::workspace_modal::{ConsolePanel, StatsPanel, WorkspaceModal};
 use crate::api;
-use crate::types::{ConsoleChunk, ToolConfig, ToolList, VmStats, WorkspaceInfo, WorkspaceStatus};
+use crate::types::{
+    ConsoleChunk, ResourceValues, Resources, ResourcesView, ToolConfig, ToolList, VmStats,
+    WorkspaceInfo, WorkspaceStatus,
+};
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
@@ -413,4 +417,77 @@ async fn a_tool_row_keeps_saved_across_the_reload() {
     assert_eq!(save_bodies.len(), 1);
     assert!(save_bodies[0].contains("token=tok-123"), "{save_bodies:?}");
     assert_eq!(calls_to(&calls, api::ListToolConfigs::PATH).len(), 2);
+}
+
+// --- Resources ---
+
+/// The disk can't be edited while the VM runs (memory can); saving sends
+/// only the filled-in fields and shows the result; stopping unlocks the disk.
+#[wasm_bindgen_test]
+async fn resources_lock_the_disk_while_running_and_save_the_rest() {
+    let saved = Rc::new(RefCell::new(Resources::default()));
+    let calls = {
+        let saved = Rc::clone(&saved);
+        fake_fetch(move |path, body| {
+            if path == api::SetResources::PATH {
+                saved.borrow_mut().memory_gib = Some(8);
+                assert!(!body.contains("disk_gib"), "{body}");
+                return "null".to_owned();
+            }
+            assert_eq!(path, api::GetResources::PATH);
+            let values = |disk_gib, memory_gib, vcpus| ResourceValues {
+                disk_gib,
+                memory_gib,
+                vcpus,
+            };
+            json(&ResourcesView {
+                saved: *saved.borrow(),
+                defaults: values(32, 4, 4),
+                min: values(16, 1, 1),
+                max: values(1024, 16, 8),
+                disk_current_gib: Some(32),
+            })
+        })
+    };
+    let status = RwSignal::new(WorkspaceStatus::Running {
+        url: "http://127.0.0.1:1".to_owned(),
+    });
+    let root = container();
+    let _handle = mount_to(root.clone(), move || {
+        let status = Memo::new(move |_| status.get());
+        view! { <ResourcesPanel id=ID.to_owned() status /> }
+    });
+
+    let inputs = || {
+        let list = root.query_selector_all(".resource-input").unwrap();
+        (0..list.length())
+            .map(|i| {
+                list.item(i)
+                    .unwrap()
+                    .unchecked_into::<web_sys::HtmlInputElement>()
+            })
+            .collect::<Vec<_>>()
+    };
+    until("the fields", || inputs().len() == 3).await;
+    assert!(inputs()[0].disabled(), "disk locked while running");
+    assert!(!inputs()[1].disabled(), "memory editable while running");
+    assert_eq!(inputs()[0].placeholder(), "32 (default)");
+
+    let memory = &inputs()[1];
+    memory.set_value("8");
+    memory
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    element(&root, ".resources-save").click();
+    until("saved", || {
+        text_of(&root, ".tool-result--ok").is_some_and(|t| t.starts_with("Saved"))
+    })
+    .await;
+    let save_bodies = calls_to(&calls, api::SetResources::PATH);
+    assert_eq!(save_bodies.len(), 1);
+    assert!(save_bodies[0].contains("memory_gib=8"), "{save_bodies:?}");
+    until("the reload", || inputs()[1].value() == "8").await;
+
+    status.set(WorkspaceStatus::Stopped);
+    until("disk unlocked", || !inputs()[0].disabled()).await;
 }

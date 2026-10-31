@@ -23,6 +23,11 @@ pub(super) struct WorkspaceRecord {
     /// `serde(default)` keeps older `workspaces.json` files loadable.
     #[serde(default)]
     pub host_port: Option<u16>,
+
+    /// VM resource settings chosen in the panel; unset fields use the
+    /// defaults. `serde(default)` keeps older files loadable.
+    #[serde(default)]
+    pub resources: crate::types::Resources,
 }
 
 /// Loads `~/.local/share/gavmo/workspaces.json` (or platform equivalent).
