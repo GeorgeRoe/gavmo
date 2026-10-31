@@ -1,0 +1,81 @@
+# Mirrors the "Lints and builds" checks in TESTING.md. The #[ignore]
+# real-qemu and full-boot tests are left out: runners have no /dev/kvm.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes a run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Must match `wasm-bindgen` in Cargo.lock exactly (see README / gavmo.nix).
+  WASM_BINDGEN_VERSION: "0.2.129"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain, targets and components from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # `-D warnings`: the workspace lints are `warn` level; CI makes them gate.
+      - run: cargo clippy --workspace --exclude gavmo --all-targets -- -D warnings
+      - run: cargo clippy -p gavmo --features ssr --all-targets -- -D warnings
+      - run: cargo clippy -p gavmo --lib --features hydrate --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy -p gavmo --lib --tests --features hydrate --target wasm32-unknown-unknown -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --exclude gavmo
+      - run: cargo test -p gavmo --features ssr
+
+  wasm-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Provides `wasm-bindgen-test-runner`, the wasm32 runner set in
+      # .cargo/config.toml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      # Firefox and geckodriver come preinstalled on GitHub's Ubuntu images.
+      - name: Check browser tooling
+        run: |
+          firefox --version
+          geckodriver --version
+      - run: cargo test -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
+
+  leptos-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }},cargo-leptos
+      - run: cargo leptos build
