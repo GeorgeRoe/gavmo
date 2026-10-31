@@ -19,7 +19,7 @@ use super::paths::{check_workspace_path, human_bytes, workspace_hash};
 use super::ports::{alloc_port, choose_host_port, resolve_host_port_in};
 use super::store::{Registry, WorkspaceRecord, load_registry, save_registry};
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
-use crate::types::{ResourceValues, Resources, WorkspaceStatus};
+use crate::types::{ResourceValues, Resources, ToolConfig, WorkspaceStatus};
 
 /// systemd's SGR-colored `[  OK  ]` lines with `\r\n` come out as plain text.
 #[test]
@@ -689,7 +689,7 @@ async fn an_invalid_gavmo_yaml_is_reported_in_the_tool_list() {
         .await
         .unwrap();
     let list = state.list_tool_configs(&id).await.unwrap();
-    assert!(list.tools.is_empty());
+    assert_eq!(list.tools, Vec::<ToolConfig>::new());
     assert!(list.config_error.is_some_and(|e| !e.is_empty()));
 }
 

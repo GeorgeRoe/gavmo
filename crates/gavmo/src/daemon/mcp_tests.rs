@@ -282,7 +282,7 @@ async fn a_credential_approved_for_another_delivery_is_withheld() {
         is_error && text.contains("approved to be sent as"),
         "{text}"
     );
-    assert!(upstream.requests().is_empty());
+    assert_eq!(upstream.requests(), Vec::new());
 }
 
 #[tokio::test]
@@ -302,7 +302,7 @@ async fn redirects_are_reported_not_followed() {
         "{text}"
     );
     assert_eq!(origin.requests().len(), 1);
-    assert!(elsewhere.requests().is_empty());
+    assert_eq!(elsewhere.requests(), Vec::new());
 }
 
 #[tokio::test]

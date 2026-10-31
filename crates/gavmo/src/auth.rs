@@ -454,8 +454,8 @@ mod tests {
 
     #[test]
     fn cookie_values_handles_missing_header_and_absent_cookie() {
-        assert!(session_values(&[]).is_empty());
-        assert!(session_values(&["foo=bar"]).is_empty());
+        assert_eq!(session_values(&[]), Vec::<String>::new());
+        assert_eq!(session_values(&["foo=bar"]), Vec::<String>::new());
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
 
         let token = load_or_create_token_at(&path).unwrap();
 
-        assert!(!token.is_empty());
+        assert_ne!(token, "");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
     }
 
@@ -546,7 +546,7 @@ mod tests {
 
         let token = load_or_create_token_at(&path).unwrap();
 
-        assert!(!token.trim().is_empty());
+        assert_ne!(token.trim(), "");
     }
 
     /// A read error other than "missing" must not mint (and persist) a new

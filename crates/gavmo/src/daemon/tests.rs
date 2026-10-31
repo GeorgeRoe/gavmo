@@ -14,7 +14,7 @@ use tower::ServiceExt as _;
 
 use crate::api;
 use crate::registry::AppState;
-use crate::types::{AppError, ConsoleChunk, ToolList, WorkspaceInfo, WorkspaceStatus};
+use crate::types::{AppError, ConsoleChunk, ToolConfig, ToolList, WorkspaceInfo, WorkspaceStatus};
 use crate::vm_handle::fake::{FakeLauncher, Script};
 
 const TOKEN: &str = "test-ui-token";
@@ -307,7 +307,7 @@ async fn add_open_stop_reset_remove_round_trip() {
         .await
         .unwrap();
     let listed: Vec<WorkspaceInfo> = d.call(api::ListWorkspaces::PATH, &[]).await.unwrap();
-    assert!(listed.is_empty());
+    assert_eq!(listed, Vec::<WorkspaceInfo>::new());
 }
 
 #[tokio::test]
@@ -477,7 +477,7 @@ async fn an_invalid_gavmo_yaml_is_reported_through_the_api() {
         .call(api::ListToolConfigs::PATH, &[("id", &id)])
         .await
         .unwrap();
-    assert!(list.tools.is_empty());
+    assert_eq!(list.tools, Vec::<ToolConfig>::new());
     assert!(list.config_error.is_some());
 }
 

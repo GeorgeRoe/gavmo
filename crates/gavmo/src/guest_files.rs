@@ -218,7 +218,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(past.bytes.is_empty());
+        assert_eq!(past.bytes, b"");
         assert_eq!(past.len, 10);
     }
 
