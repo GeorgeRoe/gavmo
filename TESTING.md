@@ -148,6 +148,14 @@ All three workflows can also be started by hand ("Run workflow").
 GitHub emails scheduled-run failures to whoever last changed the `cron`
 line, if Actions notifications are enabled in their settings.
 
+Every `uses:` is pinned to a full commit SHA, with the release tag in a
+comment, because tags can be moved to other code. To update one, resolve
+the new release tag and replace both, e.g.
+`git ls-remote https://github.com/actions/checkout 'refs/tags/v4.4.0^{}'`
+(drop `^{}` if it prints nothing). Update every file that uses the action.
+The tool versions passed to `taiki-e/install-action` must be in that
+release's manifests, or it falls back to a slower install.
+
 ## Inside a GAVMO VM
 
 The VM has about 4 GB of RAM and no swap, and two `rustc` processes on the
