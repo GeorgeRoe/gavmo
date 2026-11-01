@@ -14,6 +14,8 @@ use crate::app::{App, shell};
 use crate::auth;
 use crate::registry::AppState;
 
+mod body_limit;
+
 #[cfg(test)]
 mod boot_tests;
 #[cfg(test)]
@@ -60,6 +62,12 @@ pub fn ui_router(
         // `/login` sits behind the auth layer too; it stays reachable only
         // because `auth::is_public_path` allowlists it, not via layer order.
         .merge(auth::login_router(Arc::clone(auth)))
+        // Inside the auth layer: a request without a session is refused before
+        // its body is read at all.
+        .layer(axum::middleware::from_fn_with_state(
+            body_limit::BodyLimits::UI,
+            body_limit::buffer_body,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(auth),
             auth::require_session,

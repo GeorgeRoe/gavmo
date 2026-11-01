@@ -233,6 +233,26 @@ async fn api_without_a_session_is_a_typed_unauthorized_error() {
 }
 
 #[tokio::test]
+async fn oversized_api_bodies_are_refused_after_the_session_check() {
+    let d = Daemon::start().await;
+    let big = "x".repeat(65 * 1024);
+    let args = [("path", big.as_str())];
+
+    let (status, body) = d
+        .raw_call(api::AddWorkspace::PATH, &args, &d.cookie, SAME_ORIGIN)
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let err: AppError = serde_json::from_slice(&body).unwrap();
+    assert!(matches!(err, AppError::InvalidInput(m) if m.contains("larger than")));
+
+    // Without a session the auth layer answers first.
+    let (status, _) = d
+        .raw_call(api::AddWorkspace::PATH, &args, "", SAME_ORIGIN)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn api_refuses_cross_site_posts_and_gets() {
     let d = Daemon::start().await;
     let (status, _) = d

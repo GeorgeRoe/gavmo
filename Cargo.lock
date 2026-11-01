@@ -1017,6 +1017,7 @@ dependencies = [
  "axum",
  "console_error_panic_hook",
  "dirs",
+ "http-body-util",
  "js-sys",
  "leptos",
  "leptos_axum",
@@ -1206,6 +1207,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

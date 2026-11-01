@@ -40,6 +40,9 @@ vm = { workspace = true, optional = true }
 mcp = { workspace = true, optional = true }
 secrets = { workspace = true, optional = true }
 toolspec = { workspace = true, optional = true }
+# `LengthLimitError`, to tell an oversized control-panel request body from
+# other read errors. Already in the tree via axum.
+http-body-util = { version = "0.1", optional = true }
 # Host-side HTTP forwarder. rustls (not native-tls) avoids an OpenSSL
 # build/system dependency.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
@@ -71,6 +74,8 @@ web-sys = { version = "0.3", optional = true, features = [
 # axum; this only enables the `util` feature.
 tower = { workspace = true, features = ["util"] }
 secrets = { workspace = true, features = ["test-util"] }
+# `Channel`: request bodies that stall, for the body-limit tests.
+http-body-util = { version = "0.1", features = ["channel"] }
 
 [features]
 hydrate = [
@@ -99,6 +104,7 @@ ssr = [
     "dep:secrets",
     "dep:toolspec",
     "dep:reqwest",
+    "dep:http-body-util",
     "dep:web-sys",
     "leptos/ssr",
     "leptos_meta/ssr",

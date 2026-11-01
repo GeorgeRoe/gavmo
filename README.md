@@ -63,6 +63,9 @@ Tool gateway and secrets:
   entry; it opens lazily and fails closed without a keystore.
 - Guests can reach the UI port (`:3000`) too, so every route requires a
   session cookie from a host-only token; the daemon prints the login URL.
+  Request bodies there are capped at 64 KiB and must arrive within 10 s in
+  total; handlers themselves are never timed out, since stop/reset tear
+  VMs down inline.
 
 ## Running the daemon locally
 
