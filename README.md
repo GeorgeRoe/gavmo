@@ -92,7 +92,8 @@ actually booting VMs from inside that VM is nested virtualization and needs
 the outer VM to expose KVM to be usable. The `wasm-bindgen` CLI comes from
 nixpkgs and must match the `wasm-bindgen` crate version in `Cargo.lock`
 exactly; `gavmo.nix` reads the lock and warns in the rebuild log if they
-drift. TESTING.md describes the test levels and how to run each.
+drift. It likewise warns if nixpkgs' `rustc` differs from the version
+pinned in `rust-toolchain.toml`, which CI uses. TESTING.md describes the test levels and how to run each.
 
 ## Logging in to the control panel
 

@@ -17,12 +17,24 @@ let
   wasmBindgenCrate =
     (lib.findFirst (p: p.name == "wasm-bindgen") { version = "none"; } cargoLock.package).version;
   wasmBindgenCli = pkgs.wasm-bindgen-cli;
+
+  # CI uses the Rust pinned in rust-toolchain.toml; this VM uses nixpkgs'
+  # rustc. When they differ, clippy can pass here and fail in CI (or the
+  # reverse), so bump the pin to match.
+  rustPin = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
+  rustVm = pkgs.rustc.version;
 in
 {
-  warnings = lib.optional (wasmBindgenCli.version != wasmBindgenCrate) ''
-    gavmo.nix: nixpkgs' wasm-bindgen-cli is ${wasmBindgenCli.version} but Cargo.lock
-    uses wasm-bindgen ${wasmBindgenCrate}; `cargo leptos build` will refuse to run.
-  '';
+  warnings =
+    lib.optional (wasmBindgenCli.version != wasmBindgenCrate) ''
+      gavmo.nix: nixpkgs' wasm-bindgen-cli is ${wasmBindgenCli.version} but Cargo.lock
+      uses wasm-bindgen ${wasmBindgenCrate}; `cargo leptos build` will refuse to run.
+    ''
+    ++ lib.optional (rustPin != rustVm) ''
+      gavmo.nix: this VM's rustc is ${rustVm} but rust-toolchain.toml pins ${rustPin},
+      which CI uses; lints can differ between them. Set the pin to ${rustVm}, in its
+      own commit with any new lint fixes (see CONTRIBUTING.md).
+    '';
 
   environment.systemPackages = with pkgs; [
     # Version tracks this VM's nixpkgs, not `rust-toolchain.toml`. nixpkgs'
