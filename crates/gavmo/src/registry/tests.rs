@@ -1042,6 +1042,297 @@ async fn a_superseded_boot_result_is_stopped_not_published() {
     assert_eq!(script.stops(), 1);
 }
 
+/// Installs `slot` through `replace_slot`, so its token is indexed as a
+/// real boot's would be.
+async fn install_slot(state: &AppState, id: &str, slot: VmSlot) {
+    let mut running = state.inner.running.lock().await;
+    state.replace_slot(&mut running, id, Some(slot));
+}
+
+/// A boot that fails shows why, and revokes the boot's token at once.
+#[tokio::test]
+async fn a_failed_boot_shows_the_reason_and_revokes_the_token() {
+    let (_data, state) = test_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    install_slot(&state, &id, never_finishing_boot_slot()).await;
+    assert!(TokenAuthority::resolve(&state, "test-token").is_some());
+
+    let err = VmError::HealthTimeout(Duration::from_secs(1));
+    state
+        .finish_boot(&id, u64::MAX, "test-token".to_owned(), Err(err))
+        .await;
+
+    assert_eq!(
+        state.status(&id).await,
+        WorkspaceStatus::Failed {
+            reason: "vm did not become healthy within 1s".to_owned()
+        }
+    );
+    assert_eq!(TokenAuthority::resolve(&state, "test-token"), None);
+    assert!(state.integrations_for(&id).is_empty());
+}
+
+/// A `gavmo.nix` build failure is reported as such (with its log), and the
+/// workspace can be opened again once it is fixed.
+#[tokio::test]
+async fn a_build_failure_shows_its_log_and_can_be_reopened() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    install_slot(&state, &id, never_finishing_boot_slot()).await;
+    let log = "rebuild-2026-01-01T00-00-00Z.log".to_owned();
+
+    let err = VmError::RebuildFailed {
+        log_file: log.clone(),
+    };
+    state
+        .finish_boot(&id, u64::MAX, "test-token".to_owned(), Err(err))
+        .await;
+
+    assert_eq!(
+        state.status(&id).await,
+        WorkspaceStatus::BuildFailed { log }
+    );
+    assert_eq!(TokenAuthority::resolve(&state, "test-token"), None);
+    open_and_run(&state, &script, &id).await;
+    assert_eq!(script.boots(), 1);
+}
+
+/// A boot result for an older boot than the one in flight is stopped; the
+/// current boot and its token are untouched.
+#[tokio::test]
+async fn a_boot_result_from_an_older_generation_is_stopped() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    install_slot(&state, &id, never_finishing_boot_slot()).await;
+    let cfg = state.vm_config(&id, state.mcp_dir_for(&id), 1, resources::DEFAULTS);
+    script.release_boots(1);
+    let vm = state.inner.launcher.boot(cfg).await.unwrap();
+
+    state.finish_boot(&id, 7, "old".to_owned(), Ok(vm)).await;
+
+    assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Booting { .. }))).await);
+    assert!(TokenAuthority::resolve(&state, "test-token").is_some());
+    assert_eq!(TokenAuthority::resolve(&state, "old"), None);
+    assert_eq!(script.stops(), 1);
+}
+
+/// A failed boot whose slot is already gone (stopped meanwhile) leaves it
+/// gone rather than showing a stale failure.
+#[tokio::test]
+async fn a_failed_boot_nobody_waits_for_changes_nothing() {
+    let (_data, state) = test_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+
+    let err = VmError::HealthTimeout(Duration::from_secs(1));
+    state.finish_boot(&id, 0, "t".to_owned(), Err(err)).await;
+
+    assert!(slot_is(&state, &id, |s| s.is_none()).await);
+    assert_eq!(state.status(&id).await, WorkspaceStatus::Stopped);
+}
+
+/// Opening a workspace that is already booting neither boots it again nor
+/// rotates the token the guest has been given.
+#[tokio::test]
+async fn opening_while_booting_neither_reboots_nor_rotates_the_token() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    state.open_workspace(&id).await.unwrap();
+    let token = current_token(&state, &id).unwrap();
+
+    state.open_workspace(&id).await.unwrap();
+
+    assert_eq!(current_token(&state, &id), Some(token));
+    script.release_boots(2);
+    eventually("Running", async || {
+        slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Running(_)))).await
+    })
+    .await;
+    assert_eq!(script.boots(), 1);
+}
+
+/// A dead VM is noticed even if a lifecycle operation held its lock at the
+/// time: the monitor backs off and checks again.
+#[tokio::test]
+async fn a_dead_vm_is_marked_failed_once_a_held_lock_is_released() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    open_and_run(&state, &script, &id).await;
+    let token = current_token(&state, &id).unwrap();
+    let lifecycle = state.lifecycle_lock(&id);
+    let held = lifecycle.lock().await;
+
+    script.set_status(VmStatus::Failed(vm::VmFailure::Unwaitable(
+        "gone".to_owned(),
+    )));
+    // Several monitor intervals: each one backs off.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Running(_)))).await);
+
+    drop(held);
+    eventually("Failed", async || {
+        slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Failed(_)))).await
+    })
+    .await;
+    assert_eq!(TokenAuthority::resolve(&state, &token), None);
+    eventually("dead VM reaped", async || script.stops() == 1).await;
+}
+
+/// A reset that stops the VM but can't delete its state shows the failure
+/// (not a misleading Stopped), and the next open still works.
+#[tokio::test]
+async fn a_reset_that_cannot_delete_state_is_failed_not_stopped() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    open_and_run(&state, &script, &id).await;
+    let token = current_token(&state, &id).unwrap();
+    // A file where the state dir should be: deleting it as a dir fails.
+    let state_dir = state.host_state_dir_for(&id);
+    tokio::fs::create_dir_all(state_dir.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&state_dir, b"not a dir").await.unwrap();
+
+    state.reset_workspace(&id).await.unwrap_err();
+
+    assert_eq!(script.stops(), 1);
+    assert_eq!(TokenAuthority::resolve(&state, &token), None);
+    match state.status(&id).await {
+        WorkspaceStatus::Failed { reason } => {
+            assert!(
+                reason.starts_with("reset could not delete VM state"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    tokio::fs::remove_file(&state_dir).await.unwrap();
+    open_and_run(&state, &script, &id).await;
+}
+
+/// If the per-boot MCP token can't be written, nothing boots and the
+/// failure is shown.
+#[tokio::test]
+async fn a_token_that_cannot_be_written_fails_the_open_without_booting() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    let mcp_dir = state.mcp_dir_for(&id);
+    tokio::fs::create_dir_all(mcp_dir.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&mcp_dir, b"not a dir").await.unwrap();
+
+    state.open_workspace(&id).await.unwrap_err();
+
+    assert_eq!(script.boots(), 0);
+    assert_eq!(current_token(&state, &id), None);
+    match state.status(&id).await {
+        WorkspaceStatus::Failed { reason } => {
+            assert!(reason.contains("writing the MCP token"), "{reason}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// Removing a booting workspace aborts the boot; a late boot result can't
+/// bring it back.
+#[tokio::test]
+async fn remove_during_boot_aborts_it_and_revokes_the_token() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    state.open_workspace(&id).await.unwrap();
+    let token = current_token(&state, &id).unwrap();
+
+    state.remove_workspace(&id).await.unwrap();
+    script.release_boots(1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(!state.is_known(&id).await);
+    assert!(slot_is(&state, &id, |s| s.is_none()).await);
+    assert_eq!(TokenAuthority::resolve(&state, &token), None);
+}
+
+/// Stop and reset clear a failed or build-failed workspace back to Stopped,
+/// the normal way out after fixing `gavmo.nix`.
+#[tokio::test]
+async fn stop_and_reset_clear_failed_and_build_failed_workspaces() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    let failed = || VmSlot::Failed("boom".to_owned());
+    let build_failed = || VmSlot::BuildFailed {
+        log: "rebuild-2026-01-01T00-00-00Z.log".to_owned(),
+    };
+
+    for slot in [failed(), build_failed()] {
+        install_slot(&state, &id, slot).await;
+        state.stop_workspace(&id).await.unwrap();
+        assert_eq!(state.status(&id).await, WorkspaceStatus::Stopped);
+    }
+    for slot in [failed(), build_failed()] {
+        install_slot(&state, &id, slot).await;
+        state.reset_workspace(&id).await.unwrap();
+        assert_eq!(state.status(&id).await, WorkspaceStatus::Stopped);
+    }
+    assert_eq!(script.stops(), 0);
+}
+
+/// Shutdown aborts a boot in flight; its late result can't start a VM.
+#[tokio::test]
+async fn shutdown_aborts_an_in_flight_boot() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    state.open_workspace(&id).await.unwrap();
+    let token = current_token(&state, &id).unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        state.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    script.release_boots(1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(state.inner.running.lock().await.is_empty());
+    assert_eq!(TokenAuthority::resolve(&state, &token), None);
+    assert_eq!(script.stops(), 0);
+}
+
+/// Even with nothing running, shutdown refuses new boots, with a distinct
+/// error.
+#[tokio::test]
+async fn shutdown_with_nothing_running_still_refuses_opens() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+
+    state.shutdown(Duration::from_secs(1)).await;
+
+    let err = state.open_workspace(&id).await.unwrap_err();
+    assert!(matches!(err, RegistryError::ShuttingDown), "{err}");
+    assert_eq!(script.boots(), 0);
+}
+
+/// A slot dropped without a teardown stops its monitor, which would
+/// otherwise keep the VM handle alive and keep probing it.
+#[tokio::test]
+async fn dropping_a_running_slot_stops_its_monitor() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    open_and_run(&state, &script, &id).await;
+    let vm = match state.inner.running.lock().await.get(&id) {
+        Some(VmSlot::Running(slot)) => Arc::clone(&slot.vm),
+        _ => panic!("expected Running"),
+    };
+    assert!(Arc::strong_count(&vm) >= 3, "slot, monitor and this test");
+
+    state.inner.running.lock().await.remove(&id);
+
+    eventually("monitor released the VM", async || {
+        Arc::strong_count(&vm) == 1
+    })
+    .await;
+}
+
+
 #[tokio::test]
 async fn save_registry_round_trips_atomically_and_owner_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -1398,3 +1689,4 @@ async fn an_existing_disk_can_grow_but_not_shrink() {
     state.set_resources(&id, size(40)).await.unwrap();
     state.set_resources(&id, size(64)).await.unwrap();
 }
+
