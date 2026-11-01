@@ -19,9 +19,9 @@ unused-ignored-advisory = "deny"
 # limits which crates may depend on each, so nothing new can pull them in.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste: compile-time macro helper used by Leptos; no runtime code" },
-    { id = "RUSTSEC-2026-0370", reason = "zvariant 4: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
-    { id = "RUSTSEC-2026-0371", reason = "zbus_names 3: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
-    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 4: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: via secret-service's zbus 5 (vault key store); merged into zbus 6, which secret-service doesn't support yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: via secret-service's zbus 5 (vault key store); merged into zbus 6, which secret-service doesn't support yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: via secret-service's zbus 5 (vault key store); merged into zbus 6, which secret-service doesn't support yet" },
 ]
 
 # --- Licenses ---------------------------------------------------------------
@@ -66,16 +66,17 @@ deny = [
     { crate = "openssl", use-instead = "rustls" },
     { crate = "openssl-sys", use-instead = "rustls" },
     { crate = "native-tls", use-instead = "rustls" },
-    # keyring uses async-secret-service so no C libdbus is linked.
-    { crate = "libdbus-sys", reason = "keyring must stay on async-secret-service (pure-Rust zbus)" },
+    # The vault key store talks to the Secret Service over pure-Rust zbus, so
+    # no C libdbus is linked (keyring's dbus-based store would link it).
+    { crate = "libdbus-sys", reason = "use zbus-secret-service-keyring-store (pure-Rust zbus)" },
     # Unmaintained C-to-Rust libyaml ports, without alias-expansion budgets;
     # gavmo.yaml is parsed by serde-saphyr.
     { crate = "unsafe-libyaml", reason = "unmaintained (RUSTSEC-2024-0449); use serde-saphyr" },
     { crate = "unsafe-libyaml-norway", reason = "libyaml port; use serde-saphyr" },
     # Unmaintained (see [advisories]): only their current parents may use them.
     { crate = "paste", wrappers = ["either_of", "leptos", "reactive_graph", "reactive_stores", "tachys"], reason = "unmaintained, RUSTSEC-2024-0436" },
-    { crate = "zbus_names", wrappers = ["zbus"], reason = "unmaintained, RUSTSEC-2026-0371" },
-    { crate = "zvariant", wrappers = ["zbus", "zbus_names"], reason = "unmaintained, RUSTSEC-2026-0370" },
+    { crate = "zbus_names", wrappers = ["zbus", "zbus_macros"], reason = "unmaintained, RUSTSEC-2026-0371" },
+    { crate = "zvariant", wrappers = ["zbus", "zbus_macros", "zbus_names"], reason = "unmaintained, RUSTSEC-2026-0370" },
     { crate = "zvariant_derive", wrappers = ["zvariant"], reason = "unmaintained, RUSTSEC-2026-0372" },
 ]
 # Duplicate versions that come from upstream, not from this repo. Each skips
@@ -83,20 +84,18 @@ deny = [
 skip = [
     # rmcp moved to base64 0.23; axum, leptos, reqwest and secrets are on 0.22.
     { crate = "base64@0.22", reason = "upstream split: rmcp/hyper-util on 0.23" },
-    # Two RustCrypto generations: chacha20poly1305 0.11 (secrets) is on the new
-    # one; keyring's aes/cbc and sha1/sha2/hmac are on the old one.
+    # Two RustCrypto generations: chacha20poly1305 (secrets) and
+    # secret-service's sha2/hmac are on the new one; sha2 0.10 (gavmo, Leptos's
+    # wasm_split_macros) and sha1 (axum, tungstenite) are on the old one.
     { crate = "block-buffer@0.10", reason = "RustCrypto generation split" },
-    { crate = "cipher@0.4", reason = "RustCrypto generation split" },
     { crate = "cpufeatures@0.2", reason = "RustCrypto generation split" },
     { crate = "crypto-common@0.1", reason = "RustCrypto generation split" },
-    { crate = "inout@0.1", reason = "RustCrypto generation split" },
-    # zbus/secret-service (keyring 3) on rand 0.8, leptos on 0.9, rmcp on 0.10.
-    { crate = "rand@0.8", reason = "keyring 3's zbus" },
+    { crate = "digest@0.10", reason = "RustCrypto generation split" },
+    { crate = "sha2@0.10", reason = "RustCrypto generation split" },
+    # leptos on rand 0.9, rmcp on 0.10.
     { crate = "rand@0.9", reason = "leptos" },
-    { crate = "rand_core@0.6", reason = "keyring 3's zbus" },
     { crate = "rand_core@0.9", reason = "leptos" },
-    { crate = "rand_chacha@0.3", reason = "keyring 3's zbus" },
-    { crate = "getrandom@0.2", reason = "rand_core 0.6 and ring" },
+    { crate = "getrandom@0.2", reason = "ring" },
     { crate = "getrandom@0.3", reason = "rand_core 0.9" },
     # The ecosystem is mid-move from syn 2 to syn 3.
     { crate = "syn@2", reason = "syn 2 -> 3 transition" },

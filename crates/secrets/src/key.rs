@@ -79,8 +79,14 @@ pub trait KeyProvider: Send + Sync {
 pub struct KeyringKeyProvider;
 
 impl KeyringKeyProvider {
-    fn entry() -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(KEYRING_SERVICE, VAULT_KEY_ENTRY).map_err(SecretError::KeyUnavailable)
+    /// Built from its own store (connecting to the Secret Service), not
+    /// keyring-core's process-wide default store: no global state, and the
+    /// key is read only when a vault opens.
+    fn entry() -> Result<keyring_core::Entry, SecretError> {
+        use keyring_core::api::CredentialStoreApi as _;
+        zbus_secret_service_keyring_store::Store::new()
+            .and_then(|store| store.build(KEYRING_SERVICE, VAULT_KEY_ENTRY, None))
+            .map_err(SecretError::KeyUnavailable)
     }
 }
 
@@ -88,7 +94,7 @@ impl KeyProvider for KeyringKeyProvider {
     fn load_key(&self) -> Result<Option<DataKey>, SecretError> {
         match Self::entry()?.get_password() {
             Ok(encoded) => DataKey::decode(&Zeroizing::new(encoded)).map(Some),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(e) => Err(SecretError::KeyUnavailable(e)),
         }
     }

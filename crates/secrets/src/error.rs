@@ -8,7 +8,7 @@ pub enum SecretError {
     /// The OS keystore couldn't be reached or refused access (locked, no
     /// Secret Service, ...).
     #[error("the OS keystore is unavailable: {0}")]
-    KeyUnavailable(#[source] keyring::Error),
+    KeyUnavailable(#[source] keyring_core::Error),
     /// A vault exists but its data key is gone from the keystore. A new key
     /// is deliberately *not* minted: that would make the existing secrets
     /// unrecoverable without saying so.
