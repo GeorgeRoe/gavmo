@@ -35,7 +35,7 @@ use self::lifecycle::{VmSlot, reap_stale_vm_processes, slot_status};
 use self::paths::{
     canonical_or_self, check_workspace_path, default_runtime_base, warn_about_legacy_vm_state,
 };
-use self::store::{Registry, WorkspaceRecord, load_registry, save_registry};
+use self::store::{Registry, WorkspaceRecord, commit_registry, load_registry};
 use crate::integrations::ResolvedIntegration;
 use crate::types::{WorkspaceInfo, WorkspaceStatus};
 use crate::vm_handle::{Launcher, QemuLauncher};
@@ -233,12 +233,13 @@ impl AppState {
         let mut registry = self.inner.registry.lock().await;
         if !registry.workspaces.iter().any(|w| w.path == canonical) {
             warn_about_legacy_vm_state(&canonical);
-            registry.workspaces.push(WorkspaceRecord {
+            let mut updated = registry.clone();
+            updated.workspaces.push(WorkspaceRecord {
                 path: canonical,
                 host_port: None,
                 resources: crate::types::Resources::default(),
             });
-            save_registry(&self.inner.registry_path, &registry)
+            commit_registry(&mut registry, &self.inner.registry_path, updated)
                 .await
                 .map_err(io_ctx("saving the workspace registry"))?;
         }

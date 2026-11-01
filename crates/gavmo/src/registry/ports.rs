@@ -4,7 +4,7 @@ use std::io;
 use std::net::TcpListener;
 
 use super::AppState;
-use super::store::{Registry, save_registry};
+use super::store::{Registry, commit_registry};
 
 impl AppState {
     /// Returns the workspace's persisted host port if still free, otherwise
@@ -16,9 +16,10 @@ impl AppState {
     /// port, which would force a needless reallocation).
     pub(super) async fn resolve_host_port(&self, id: &str) -> io::Result<u16> {
         let mut registry = self.inner.registry.lock().await;
-        let (port, changed) = resolve_host_port_in(&mut registry, id)?;
+        let mut updated = registry.clone();
+        let (port, changed) = resolve_host_port_in(&mut updated, id)?;
         if changed {
-            save_registry(&self.inner.registry_path, &registry).await?;
+            commit_registry(&mut registry, &self.inner.registry_path, updated).await?;
         }
         Ok(port)
     }

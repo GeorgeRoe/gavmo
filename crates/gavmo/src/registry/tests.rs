@@ -1332,6 +1332,25 @@ async fn dropping_a_running_slot_stops_its_monitor() {
     .await;
 }
 
+/// If the registry can't be saved, remove changes nothing: the workspace
+/// stays listed and its VM keeps running with a working token, rather than
+/// running on unlisted.
+#[tokio::test]
+async fn a_remove_that_cannot_save_the_registry_changes_nothing() {
+    let (data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    open_and_run(&state, &script, &id).await;
+    let token = current_token(&state, &id).unwrap();
+    block_registry_saves(data.path()).await;
+
+    let err = state.remove_workspace(&id).await.unwrap_err();
+
+    assert_saving_failed(&err);
+    assert!(state.is_known(&id).await);
+    assert!(slot_is(&state, &id, |s| matches!(s, Some(VmSlot::Running(_)))).await);
+    assert!(TokenAuthority::resolve(&state, &token).is_some());
+    assert_eq!(script.stops(), 0);
+}
 
 #[tokio::test]
 async fn save_registry_round_trips_atomically_and_owner_only() {
@@ -1690,3 +1709,57 @@ async fn an_existing_disk_can_grow_but_not_shrink() {
     state.set_resources(&id, size(64)).await.unwrap();
 }
 
+/// Makes every later registry save fail: a non-empty dir where
+/// `workspaces.json` goes can't be renamed over.
+async fn block_registry_saves(data: &Path) {
+    let file = data.join("workspaces.json");
+    if file.exists() {
+        tokio::fs::remove_file(&file).await.unwrap();
+    }
+    tokio::fs::create_dir(&file).await.unwrap();
+    tokio::fs::write(file.join("x"), b"").await.unwrap();
+}
+
+fn assert_saving_failed(err: &RegistryError) {
+    assert!(
+        matches!(err, RegistryError::Io { context, .. } if context == "saving the workspace registry"),
+        "{err}"
+    );
+}
+
+/// An add whose save fails doesn't list a workspace that would vanish on
+/// restart.
+#[tokio::test]
+async fn an_add_that_cannot_save_the_registry_changes_nothing() {
+    let (data, state) = test_app_state();
+    let repo = tempfile::tempdir().unwrap();
+    block_registry_saves(data.path()).await;
+
+    let err = state
+        .add_workspace(repo.path().to_str().unwrap().to_owned())
+        .await
+        .unwrap_err();
+
+    assert_saving_failed(&err);
+
+    assert!(state.list().await.is_empty());
+}
+
+/// Resource settings whose save fails aren't applied to the next boot
+/// either, so what the panel shows after the error is what is used.
+#[tokio::test]
+async fn resources_that_cannot_be_saved_are_not_applied() {
+    let (data, state) = test_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    block_registry_saves(data.path()).await;
+    let wanted = Resources {
+        disk_gib: None,
+        memory_gib: Some(2),
+        vcpus: Some(1),
+    };
+
+    let err = state.set_resources(&id, wanted).await.unwrap_err();
+
+    assert_saving_failed(&err);
+    assert_eq!(state.saved_resources(&id).await, Resources::default());
+}

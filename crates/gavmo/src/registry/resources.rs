@@ -6,7 +6,7 @@
 
 use super::AppState;
 use super::error::{RegistryError, Result, io_ctx};
-use super::store::save_registry;
+use super::store::commit_registry;
 use crate::types::{ResourceValues, Resources, ResourcesView};
 
 /// What an unset setting means. 32 GiB of disk because the base image is
@@ -174,11 +174,12 @@ impl AppState {
         }
 
         let mut registry = self.inner.registry.lock().await;
-        let Some(record) = registry.workspaces.iter_mut().find(|w| w.path == id) else {
+        let mut updated = registry.clone();
+        let Some(record) = updated.workspaces.iter_mut().find(|w| w.path == id) else {
             return Err(RegistryError::UnknownWorkspace(id.to_owned()));
         };
         record.resources = settings;
-        save_registry(&self.inner.registry_path, &registry)
+        commit_registry(&mut registry, &self.inner.registry_path, updated)
             .await
             .map_err(io_ctx("saving the workspace registry"))
     }

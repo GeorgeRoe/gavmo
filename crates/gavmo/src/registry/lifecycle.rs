@@ -12,7 +12,7 @@ use vm::{Error as VmError, VmConfig, VmStatus};
 
 use super::AppState;
 use super::resources::DEFAULTS;
-use super::store::save_registry;
+use super::store::commit_registry;
 use super::util::{lock_unpoisoned, remove_dir_all_idempotent, write_owner_only};
 use crate::integrations::ResolvedIntegration;
 use crate::types::{ResourceValues, WorkspaceStatus};
@@ -394,11 +394,13 @@ impl AppState {
         let lifecycle = self.lifecycle_lock(id);
         let _held = lifecycle.lock().await;
         {
+            // If this fails, the workspace stays listed and its VM keeps
+            // running with valid credentials; nothing is half-removed.
             let mut registry = self.inner.registry.lock().await;
-            let before = registry.workspaces.len();
-            registry.workspaces.retain(|w| w.path != id);
-            if registry.workspaces.len() != before {
-                save_registry(&self.inner.registry_path, &registry)
+            if registry.workspaces.iter().any(|w| w.path == id) {
+                let mut updated = registry.clone();
+                updated.workspaces.retain(|w| w.path != id);
+                commit_registry(&mut registry, &self.inner.registry_path, updated)
                     .await
                     .map_err(io_ctx("saving the workspace registry"))?;
             }

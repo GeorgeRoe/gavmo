@@ -77,3 +77,16 @@ pub(super) async fn save_registry(path: &Path, registry: &Registry) -> io::Resul
         .await
         .map_err(io::Error::other)?
 }
+
+/// Saves `updated` (a changed copy of `*current`), then makes it current.
+/// Every change goes through here so a failed save changes nothing: memory
+/// keeps matching the file, and the caller's error is the whole outcome.
+pub(super) async fn commit_registry(
+    current: &mut Registry,
+    path: &Path,
+    updated: Registry,
+) -> io::Result<()> {
+    save_registry(path, &updated).await?;
+    *current = updated;
+    Ok(())
+}
