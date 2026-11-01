@@ -19,7 +19,6 @@ unused-ignored-advisory = "deny"
 # limits which crates may depend on each, so nothing new can pull them in.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste: compile-time macro helper used by Leptos; no runtime code" },
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: via serde_yaml_ng in toolspec (parses untrusted gavmo.yaml); replace with a maintained pure-Rust YAML parser" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant 4: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names 3: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 4: via keyring 3's zbus 4; fixed by moving secrets to keyring 4" },
@@ -69,9 +68,12 @@ deny = [
     { crate = "native-tls", use-instead = "rustls" },
     # keyring uses async-secret-service so no C libdbus is linked.
     { crate = "libdbus-sys", reason = "keyring must stay on async-secret-service (pure-Rust zbus)" },
+    # Unmaintained C-to-Rust libyaml ports, without alias-expansion budgets;
+    # gavmo.yaml is parsed by serde-saphyr.
+    { crate = "unsafe-libyaml", reason = "unmaintained (RUSTSEC-2024-0449); use serde-saphyr" },
+    { crate = "unsafe-libyaml-norway", reason = "libyaml port; use serde-saphyr" },
     # Unmaintained (see [advisories]): only their current parents may use them.
     { crate = "paste", wrappers = ["either_of", "leptos", "reactive_graph", "reactive_stores", "tachys"], reason = "unmaintained, RUSTSEC-2024-0436" },
-    { crate = "unsafe-libyaml", wrappers = ["serde_yaml_ng"], reason = "unmaintained, RUSTSEC-2024-0449" },
     { crate = "zbus_names", wrappers = ["zbus"], reason = "unmaintained, RUSTSEC-2026-0371" },
     { crate = "zvariant", wrappers = ["zbus", "zbus_names"], reason = "unmaintained, RUSTSEC-2026-0370" },
     { crate = "zvariant_derive", wrappers = ["zvariant"], reason = "unmaintained, RUSTSEC-2026-0372" },

@@ -144,6 +144,10 @@ strictly, and a file that fails any check is ignored entirely, with the
 reason shown in the panel:
 
 - Unknown keys are errors, so a typo doesn't silently disable something.
+- So are duplicate keys (two `jira:` entries), YAML merge keys (`<<`),
+  custom tags and more than one document. Anchors and aliases work, but
+  parsing has limits sized to a tool list, so a file can't expand into
+  more than 512 KiB of values.
 - Tool ids are 1-64 of `[A-Za-z0-9_-]` and can't start with `gavmo_`; at
   most 64 tools.
 - `base_url` must be http(s) with a host and no `user:pass@`, query or

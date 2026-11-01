@@ -10,8 +10,11 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
-# Maintained fork of the deprecated `serde_yaml`; same API surface.
-serde_yaml_ng = "0.10"
+# Pure-Rust YAML with resource budgets, for the untrusted gavmo.yaml (the
+# libyaml ports are unmaintained and have no alias-expansion budget). Pinned
+# exactly: the parser of untrusted input is bumped deliberately, after
+# re-checking `yaml_options`. No `comments` feature: comments aren't kept.
+serde-saphyr = { version = "=2.0.0", default-features = false, features = ["deserialize"] }
 thiserror.workspace = true
 # Spec-compliant parsing for host-lock checks; string prefixing is bypassable.
 url.workspace = true
