@@ -129,6 +129,25 @@ exception there carries its reason; delete one once it no longer matches.
 Lints are strict (pedantic, `unwrap_used`, `unreachable_pub`, ...). Tests
 are exempt from the panic-family lints through `clippy.toml`.
 
+## GitHub Actions
+
+All three workflows can also be started by hand ("Run workflow").
+
+- **CI** (`ci.yml`, on push to `main`): the checks above, except
+  `cargo deny`, on the Rust pinned in `rust-toolchain.toml`.
+- **Deny** (`deny.yml`, on push to `main` and daily): `cargo deny`. It is
+  the only check whose result changes without a code change, since the
+  RustSec database grows daily. A scheduled failure means a new advisory
+  affects `main` as it is: usually `cargo update -p <crate>` fixes it.
+- **Upcoming** (`upcoming.yml`, weekly): clippy, the native tests and
+  `cargo deny` on the latest stable Rust after an uncommitted
+  `cargo update`. A failure doesn't mean `main` is broken; it previews what
+  the next toolchain or dependency bump will need (new lints, upstream
+  breakage, `deny.toml` skips and checksums to refresh).
+
+GitHub emails scheduled-run failures to whoever last changed the `cron`
+line, if Actions notifications are enabled in their settings.
+
 ## Inside a GAVMO VM
 
 The VM has about 4 GB of RAM and no swap, and two `rustc` processes on the

@@ -1,5 +1,6 @@
 # Mirrors the "Lints and builds" checks in TESTING.md. The #[ignore]
 # real-qemu and full-boot tests are left out: runners have no /dev/kvm.
+# cargo-deny runs separately, in deny.yml.
 name: CI
 
 on:
@@ -20,7 +21,6 @@ env:
   CARGO_INCREMENTAL: "0"
   # Must match `wasm-bindgen` in Cargo.lock exactly (see README / gavmo.nix).
   WASM_BINDGEN_VERSION: "0.2.129"
-  CARGO_DENY_VERSION: "0.20.2"
 
 jobs:
   fmt:
@@ -69,19 +69,6 @@ jobs:
           firefox --version
           geckodriver --version
       - run: cargo test -p gavmo --lib --features hydrate --target wasm32-unknown-unknown
-
-  # Supply-chain policy in deny.toml. `-D warnings` also fails on stale
-  # exceptions. Can go red with no code change when a new RustSec advisory
-  # lands against a locked dependency.
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
-      - run: cargo deny --locked check -D warnings
 
   leptos-build:
     runs-on: ubuntu-latest

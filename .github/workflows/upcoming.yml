@@ -1,0 +1,57 @@
+# Early warning, not a check of main: would main still pass on the latest
+# stable Rust with every dependency updated (`cargo update`, not committed)?
+# A failure here does not mean main is broken. It previews work for the next
+# toolchain or dependency bump: new clippy lints, upstream breakage, or
+# deny.toml entries (version skips, file checksums) that will need updating.
+# wasm-test and leptos-build are left out: they need a wasm-bindgen CLI that
+# matches whatever version `cargo update` resolves.
+name: Upcoming
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays, 06:43 UTC.
+    - cron: "43 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upcoming-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Overrides the pin in rust-toolchain.toml.
+  RUSTUP_TOOLCHAIN: stable
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  upcoming:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown
+      - run: rustc --version && cargo clippy --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+      - id: update
+        run: cargo update
+      # Each check runs even if an earlier check failed, so one run reports
+      # everything that is coming; none run if setup failed.
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo clippy --workspace --exclude gavmo --all-targets -- -D warnings
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo clippy -p gavmo --features ssr --all-targets -- -D warnings
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo clippy -p gavmo --lib --features hydrate --target wasm32-unknown-unknown -- -D warnings
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo clippy -p gavmo --lib --tests --features hydrate --target wasm32-unknown-unknown -- -D warnings
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo test --workspace --exclude gavmo
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo test -p gavmo --features ssr
+      - if: ${{ !cancelled() && steps.update.outcome == 'success' }}
+        run: cargo deny check -D warnings

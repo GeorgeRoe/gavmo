@@ -1,0 +1,37 @@
+# Supply-chain policy in deny.toml. Separate from CI because it is the one
+# check whose result changes without a code change: the RustSec database
+# grows daily, so this also runs on a schedule. A scheduled failure means a
+# new advisory affects what is on main now. `-D warnings` also fails on
+# exceptions in deny.toml that no longer match anything.
+name: Deny
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Daily, 06:17 UTC (off the hour: GitHub delays runs queued at :00).
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deny-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+      - run: cargo deny --locked check -D warnings
