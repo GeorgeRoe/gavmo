@@ -1,6 +1,7 @@
-# Mirrors the "Lints and builds" checks in TESTING.md. The #[ignore]
-# real-qemu and full-boot tests are left out: runners have no /dev/kvm.
-# cargo-deny runs separately, in deny.yml.
+# Mirrors the "Lints and builds" checks in TESTING.md, plus coverage. The
+# #[ignore] real-qemu tests run only in the coverage job; the full-boot test
+# is left out (it needs a built base image). cargo-deny runs separately, in
+# deny.yml.
 name: CI
 
 on:
@@ -19,6 +20,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Keep in step with the cargo-llvm-cov that gavmo.nix gets from nixpkgs.
+  CARGO_LLVM_COV_VERSION: "0.9.0"
 
 jobs:
   fmt:
@@ -55,6 +58,49 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --exclude gavmo
       - run: cargo test -p gavmo --features ssr
+
+  # The native tests again, instrumented, plus the #[ignore]d real-qemu ones
+  # (only the full-boot test is skipped: it needs a built base image). Fails
+  # below the floor in the last step; see "Coverage" in TESTING.md. The
+  # browser tests aren't measured: llvm-cov can't instrument wasm on stable.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # llvm-cov and llvm-profdata matching the pinned rustc's LLVM.
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }}
+      # Ubuntu installs virtiofsd in /usr/libexec, and /dev/kvm is root-only
+      # until a udev rule opens it up.
+      - name: Install qemu and virtiofsd, enable KVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils virtiofsd
+          echo /usr/libexec >> "$GITHUB_PATH"
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: cargo llvm-cov --no-report --workspace --exclude gavmo -- --include-ignored
+      - run: cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm
+      - run: cargo llvm-cov report --summary-only --fail-under-regions "$COVERAGE_FLOOR" --fail-under-lines "$COVERAGE_FLOOR"
+        env:
+          COVERAGE_FLOOR: "95"
+      # Uploaded even when the floor fails: it shows which lines are missed.
+      - if: ${{ !cancelled() }}
+        run: cargo llvm-cov report --html
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-html
+          path: target/llvm-cov/html
+          if-no-files-found: ignore
 
   wasm-test:
     runs-on: ubuntu-latest

@@ -107,6 +107,33 @@ GAVMO_BASE_IMAGE="$(readlink -f result/nixos.qcow2)" \
 The first boot takes a few minutes; the timeout is 15. Everything lives in
 temp dirs, and the VM is killed if the test process dies.
 
+## Coverage
+
+CI fails if the native tests cover less than 95% of regions or lines,
+across all crates together. Regions are the closest stable Rust gets to
+branch coverage: every `if`/`match` arm and every `?` error path is its
+own region, so an untested branch counts even when its line ran.
+
+```sh
+cargo llvm-cov clean --workspace
+cargo llvm-cov --no-report --workspace --exclude gavmo -- --include-ignored
+cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm
+cargo llvm-cov report --summary-only --fail-under-regions 95 --fail-under-lines 95
+cargo llvm-cov report --html   # -> $CARGO_TARGET_DIR/llvm-cov/html/index.html
+```
+
+This includes the real-qemu tests (so it needs `qemu`, `virtiofsd` and
+`/dev/kvm`, as in a GAVMO VM) but not the full-boot test. This repo's
+`gavmo.nix` provides `cargo-llvm-cov` and points it at the LLVM tools of
+the LLVM that rustc was built with; with rustup, `rustup component add
+llvm-tools-preview` does the same.
+
+Nothing is excluded from the count. The browser tests aren't measured
+(llvm-cov can't instrument wasm on stable Rust), so components are also
+covered natively by rendering them server-side, which runs the code that
+builds their views; only event handlers and effects stay browser-only.
+On a CI failure, the `coverage-html` artifact shows which lines are missed.
+
 ## Lints and builds
 
 Every commit should also pass:
@@ -134,7 +161,9 @@ are exempt from the panic-family lints through `clippy.toml`.
 All three workflows can also be started by hand ("Run workflow").
 
 - **CI** (`ci.yml`, on push to `main`): the checks above, except
-  `cargo deny`, on the Rust pinned in `rust-toolchain.toml`.
+  `cargo deny`, on the Rust pinned in `rust-toolchain.toml`, plus the
+  coverage floor (see "Coverage"). The coverage job installs qemu and
+  virtiofsd and opens up `/dev/kvm`, so the real-qemu tests run there too.
 - **Deny** (`deny.yml`, on push to `main` and daily): `cargo deny`. It is
   the only check whose result changes without a code change, since the
   RustSec database grows daily. A scheduled failure means a new advisory
