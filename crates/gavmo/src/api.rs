@@ -277,3 +277,40 @@ mod browse {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "ssr")]
+mod tests {
+    use super::*;
+
+    /// Called outside the daemon's router there is no `AppState` in
+    /// context: every server function says so instead of panicking.
+    #[tokio::test]
+    async fn without_app_state_every_server_function_is_an_internal_error() {
+        let id = || "x".to_owned();
+        let results = [
+            list_workspaces().await.map(drop),
+            poll_status(id()).await.map(drop),
+            read_build_log(id(), id()).await.map(drop),
+            read_console_log(id(), 0).await.map(drop),
+            poll_vm_stats(id()).await.map(drop),
+            add_workspace(id()).await,
+            open_workspace(id()).await,
+            stop_workspace(id()).await,
+            reset_workspace(id()).await,
+            remove_workspace(id()).await,
+            list_tool_configs(id()).await.map(drop),
+            set_tool_secret(id(), id(), None, id()).await,
+            clear_tool_secret(id(), id()).await,
+            test_tool(id(), id()).await.map(drop),
+            get_resources(id()).await.map(drop),
+            set_resources(id(), None, None, None).await,
+        ];
+        for result in results {
+            assert_eq!(
+                result,
+                Err(AppError::Internal("app state not available".to_owned()))
+            );
+        }
+    }
+}

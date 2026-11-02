@@ -16,6 +16,7 @@ use tower::ServiceExt as _;
 
 use super::tests::Daemon;
 use crate::api;
+use crate::types::AppError;
 
 /// Every request an [`Upstream`] received: (path, headers).
 type Seen = Arc<Mutex<Vec<(String, HeaderMap)>>>;
@@ -336,4 +337,128 @@ async fn after_stop_the_old_token_is_rejected() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The panel's "Test" button: a `GET` of the tool's `test_path` with the
+/// stored credential, reported as success or failure.
+#[tokio::test]
+async fn the_test_button_calls_the_tool_with_its_credential() {
+    let d = Daemon::start().await;
+    let upstream = Upstream::start(None).await;
+    let (repo, id) = d.add_repo().await;
+    let yaml = format!("{}    test_path: /me\n", bearer_tool(&upstream.url));
+    std::fs::write(repo.path().join("gavmo.yaml"), yaml).unwrap();
+    d.set_token(&id, "tok").await;
+
+    let text: String = d
+        .call(api::TestTool::PATH, &[("id", &id), ("tool_id", "api")])
+        .await
+        .unwrap();
+
+    assert!(text.contains("hello"), "{text}");
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, "/me");
+    assert_eq!(requests[0].1[header::AUTHORIZATION], "Bearer tok");
+}
+
+#[tokio::test]
+async fn the_test_button_reports_an_unreachable_tool_and_a_missing_credential() {
+    let d = Daemon::start().await;
+    let (repo, id) = d.add_repo().await;
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    std::fs::write(repo.path().join("gavmo.yaml"), bearer_tool(&closed)).unwrap();
+    let test = async || {
+        d.call::<String>(api::TestTool::PATH, &[("id", &id), ("tool_id", "api")])
+            .await
+    };
+
+    let missing = test().await;
+    assert!(missing.is_err(), "{missing:?}");
+
+    d.set_token(&id, "tok").await;
+    let unreachable = test().await;
+    assert!(
+        matches!(unreachable, Err(AppError::Failed(_))),
+        "{unreachable:?}"
+    );
+}
+
+/// A stored credential whose binding no longer matches `gavmo.yaml` shows
+/// as such in the panel, saying what it was approved for.
+#[tokio::test]
+async fn the_tool_list_explains_a_changed_destination_or_delivery() {
+    let d = Daemon::start().await;
+    let (repo, id) = d.add_repo().await;
+    let yaml = repo.path().join("gavmo.yaml");
+    std::fs::write(&yaml, bearer_tool("https://a.example.com")).unwrap();
+    d.set_token(&id, "tok").await;
+
+    std::fs::write(&yaml, bearer_tool("https://b.example.com")).unwrap();
+    let tool = d.only_tool(&id).await;
+    assert!(!tool.configured && tool.url_changed, "{tool:?}");
+    assert_eq!(
+        tool.bound_url.as_deref(),
+        Some("https://a.example.com:443/")
+    );
+
+    std::fs::write(&yaml, header_tool("https://a.example.com")).unwrap();
+    let tool = d.only_tool(&id).await;
+    assert!(!tool.configured && !tool.url_changed, "{tool:?}");
+    assert_eq!(
+        tool.approved_delivery.as_deref(),
+        Some("a Bearer token in the Authorization header")
+    );
+}
+
+/// Basic auth needs a username as well as the password/token.
+#[tokio::test]
+async fn basic_auth_credentials_need_a_username() {
+    let d = Daemon::start().await;
+    let (repo, id) = d.add_repo().await;
+    std::fs::write(
+        repo.path().join("gavmo.yaml"),
+        "tools:\n  api:\n    type: http\n    base_url: https://a.example.com\n    auth: basic\n    secret: s\n",
+    )
+    .unwrap();
+    let set = async |username: &str| {
+        d.call::<()>(
+            api::SetToolSecret::PATH,
+            &[
+                ("id", &id),
+                ("tool_id", "api"),
+                ("username", username),
+                ("token", "pw"),
+            ],
+        )
+        .await
+    };
+
+    assert!(matches!(set("").await, Err(AppError::InvalidInput(_))));
+    assert!(!d.only_tool(&id).await.configured);
+    set("me@example.com").await.unwrap();
+    assert!(d.only_tool(&id).await.configured);
+}
+
+impl Daemon {
+    async fn set_token(&self, id: &str, token: &str) {
+        self.call::<()>(
+            api::SetToolSecret::PATH,
+            &[("id", id), ("tool_id", "api"), ("token", token)],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn only_tool(&self, id: &str) -> crate::types::ToolConfig {
+        let mut list: crate::types::ToolList = self
+            .call(api::ListToolConfigs::PATH, &[("id", id)])
+            .await
+            .unwrap();
+        assert_eq!(list.tools.len(), 1, "{list:?}");
+        list.tools.remove(0)
+    }
 }

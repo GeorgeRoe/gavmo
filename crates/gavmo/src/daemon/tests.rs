@@ -540,3 +540,47 @@ async fn resources_round_trip_through_the_api() {
         "{too_small:?}"
     );
 }
+
+/// Stats exist only while a workspace runs; the fake VM's "qemu" is this
+/// test process, so CPU and RSS are real samples. Without a QMP socket the
+/// guest memory is simply unknown.
+#[tokio::test]
+async fn vm_stats_are_reported_only_while_running() {
+    let d = Daemon::start().await;
+    let (_repo, id) = d.add_repo().await;
+    let stats = async |d: &Daemon| {
+        d.call::<Option<crate::types::VmStats>>(api::PollVmStats::PATH, &[("id", &id)])
+            .await
+            .unwrap()
+    };
+    assert_eq!(stats(&d).await, None);
+
+    d.open_running(&id).await;
+    let running = stats(&d).await.unwrap();
+    assert!(running.vcpus > 0, "{running:?}");
+    assert_eq!(
+        (running.mem_used_bytes, running.mem_total_bytes),
+        (None, None)
+    );
+    assert_eq!(running.disk_bytes, 0);
+}
+
+/// The folder picker lists a given directory, or the home directory.
+#[tokio::test]
+async fn the_folder_picker_browses_directories() {
+    let d = Daemon::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("project")).unwrap();
+    let path = dir.path().to_str().unwrap();
+
+    let listing: crate::types::DirListing = d
+        .call(api::BrowseDir::PATH, &[("path", path)])
+        .await
+        .unwrap();
+    assert_eq!(listing.entries.len(), 1);
+    assert_eq!(listing.entries[0].name, "project");
+
+    let home: crate::types::DirListing = d.call(api::BrowseDir::PATH, &[]).await.unwrap();
+    let expected = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
+    assert_eq!(home.path, expected.to_str().unwrap());
+}

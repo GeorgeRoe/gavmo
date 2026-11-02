@@ -179,7 +179,8 @@ pub(crate) mod fake {
 
         fn info(&self) -> VmInfo {
             VmInfo {
-                qemu_pid: None,
+                // A real process to sample: this test binary.
+                qemu_pid: Some(std::process::id()),
                 uptime: std::time::Duration::ZERO,
                 vcpus: self.cfg.vcpus,
                 host_port: self.cfg.host_port,
