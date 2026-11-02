@@ -419,10 +419,12 @@ impl BaseUrl {
         // `parse` guarantees a host.
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
         let path = url.path();
-        match url.port_or_known_default() {
-            Some(p) => format!("{scheme}://{host}:{p}{path}"),
-            None => format!("{scheme}://{host}{path}"),
-        }
+        // Always a port: `parse` only accepts http(s), which have defaults.
+        let port = url
+            .port_or_known_default()
+            .map(|p| format!(":{p}"))
+            .unwrap_or_default();
+        format!("{scheme}://{host}{port}{path}")
     }
 }
 
@@ -508,6 +510,25 @@ tools:
             err,
             ParseError::Validation(ValidationError::MissingHeaderName { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_a_base_url_that_is_not_a_string() {
+        let yaml =
+            "tools:\n  t:\n    type: http\n    base_url: [a]\n    auth: bearer\n    secret: s\n";
+        assert!(parse_config(yaml).is_err());
+    }
+
+    #[test]
+    fn more_than_max_tools_is_an_error() {
+        let mut yaml = String::from("tools:\n");
+        for i in 0..=MAX_TOOLS {
+            yaml.push_str(&format!(
+                "  t{i}:\n    type: http\n    base_url: \"https://a.example.com\"\n    auth: bearer\n    secret: s\n"
+            ));
+        }
+        let err = parse_config(&yaml).unwrap_err().to_string();
+        assert!(err.contains(&MAX_TOOLS.to_string()), "{err}");
     }
 
     #[test]
@@ -619,6 +640,30 @@ tools:
     fn lock_url_rejects_absolute_url_to_another_host() {
         let err = lock_url("https://dafni.atlassian.net", "https://evil.com/steal").unwrap_err();
         assert!(matches!(err, HostLockError::HostMismatch { .. }));
+    }
+
+    /// The refusal names the origin that was asked for, even for schemes
+    /// without a default port or a host.
+    #[test]
+    fn lock_url_rejects_other_schemes_naming_their_origin() {
+        for (path, origin) in [
+            ("gopher://evil.com/x", "gopher://evil.com"),
+            ("custom://evil.com/x", "custom://evil.com"),
+            ("file:///etc/passwd", "file"),
+        ] {
+            let err = lock_url(GATEWAY, path).unwrap_err();
+            assert!(
+                matches!(&err, HostLockError::HostMismatch { expected, requested }
+                    if expected == "https://api.atlassian.com:443" && requested == origin),
+                "{path}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_url_rejects_a_path_that_is_not_a_url() {
+        let err = lock_url(GATEWAY, "http://[::1").unwrap_err();
+        assert!(matches!(err, HostLockError::InvalidResult(_)), "{err:?}");
     }
 
     #[test]
@@ -926,6 +971,7 @@ tools:
     fn auth_scheme_displays_as_its_yaml_value() {
         assert_eq!(AuthScheme::Header.to_string(), "header");
         assert_eq!(AuthScheme::Basic.as_str(), "basic");
+        assert_eq!(AuthScheme::Bearer.to_string(), "bearer");
     }
 
     // --- Parser strictness (untrusted input) ---
