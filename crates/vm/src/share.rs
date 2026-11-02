@@ -1,6 +1,7 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use tokio::process::{Child, Command};
 
@@ -130,9 +131,150 @@ fn build_virtiofsd_args(
     args
 }
 
+/// A virtiofsd release as `(major, minor, patch)`.
+type Version = (u32, u32, u32);
+
+/// The first virtiofsd with `--translate-uid`/`--translate-gid` and
+/// `--readonly`, which [`build_virtiofsd_args`] passes. Older ones (e.g.
+/// Ubuntu 24.04's) reject them and exit with status 2.
+const MIN_VIRTIOFSD_VERSION: Version = (1, 13, 0);
+
+/// Refuses a virtiofsd older than [`MIN_VIRTIOFSD_VERSION`], which would
+/// otherwise only show up as [`Error::HelperExited`] with no reason.
+/// `program` is `"virtiofsd"` outside tests. Output that doesn't parse is
+/// let through with a warning, so a distro that formats `--version`
+/// differently isn't locked out; a missing binary is a spawn error.
+pub(crate) async fn check_virtiofsd_version(program: &OsStr) -> Result<()> {
+    let output = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|source| Error::Spawn {
+            program: program.to_string_lossy().into_owned(),
+            source,
+        })?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    match parse_virtiofsd_version(&text) {
+        Some(found) if found < MIN_VIRTIOFSD_VERSION => Err(Error::VirtiofsdTooOld {
+            found: fmt_version(found),
+            required: fmt_version(MIN_VIRTIOFSD_VERSION),
+        }),
+        Some(_) => Ok(()),
+        None => {
+            tracing::warn!(
+                output = %text.trim(),
+                "could not read the virtiofsd version; assuming it is new enough"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Parses `virtiofsd --version` output: `virtiofsd 1.14.0`, possibly with a
+/// distro suffix (`1.10.1-1ubuntu1`) or no patch number. `None` for
+/// anything else, including the old C virtiofsd's `virtiofsd version 7.2.0`
+/// (a qemu version, which must not be compared as a virtiofsd one).
+fn parse_virtiofsd_version(output: &str) -> Option<Version> {
+    let mut words = output.split_whitespace();
+    if words.next()? != "virtiofsd" {
+        return None;
+    }
+    let mut parts = words.next()?.split('.');
+    // The leading digits of the next component: `1-1ubuntu1` is 1.
+    let mut number = || -> Option<u32> {
+        parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let major = number()?;
+    let minor = number()?;
+    let patch = number().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn fmt_version((major, minor, patch): Version) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_virtiofsd_versions_and_rejects_other_output() {
+        assert_eq!(
+            parse_virtiofsd_version("virtiofsd 1.14.0\n"),
+            Some((1, 14, 0))
+        );
+        assert_eq!(
+            parse_virtiofsd_version("virtiofsd 1.10.1-1ubuntu1"),
+            Some((1, 10, 1))
+        );
+        assert_eq!(parse_virtiofsd_version("virtiofsd 1.13"), Some((1, 13, 0)));
+        assert_eq!(parse_virtiofsd_version("virtiofsd version 7.2.0"), None);
+        assert_eq!(parse_virtiofsd_version("virtiofsd"), None);
+        assert_eq!(parse_virtiofsd_version("virtiofsd 1"), None);
+        assert_eq!(parse_virtiofsd_version("qemu 1.14.0"), None);
+        assert_eq!(parse_virtiofsd_version(""), None);
+    }
+
+    /// A stand-in `virtiofsd` that prints `version_output` for `--version`.
+    fn fake_virtiofsd(dir: &Path, version_output: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("virtiofsd");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{version_output}'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn an_old_virtiofsd_is_refused_by_name_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_virtiofsd(dir.path(), "virtiofsd 1.10.1");
+
+        let err = check_virtiofsd_version(fake.as_os_str()).await.unwrap_err();
+
+        assert!(
+            matches!(&err, Error::VirtiofsdTooOld { found, required }
+                if found == "1.10.1" && required == "1.13.0"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "virtiofsd 1.10.1 is too old: GAVMO needs 1.13.0 or newer \
+             (for --translate-uid and --readonly)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_or_unrecognized_virtiofsd_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        for output in ["virtiofsd 1.13.0", "virtiofsd 1.14.0", "something else"] {
+            let fake = fake_virtiofsd(dir.path(), output);
+            check_virtiofsd_version(fake.as_os_str()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_virtiofsd_is_a_spawn_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("virtiofsd");
+
+        let err = check_virtiofsd_version(missing.as_os_str())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Spawn { .. }), "{err:?}");
+    }
 
     fn strings(args: Vec<OsString>) -> Vec<String> {
         args.into_iter().map(|a| a.into_string().unwrap()).collect()

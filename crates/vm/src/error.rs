@@ -26,6 +26,12 @@ pub enum Error {
         source: io::Error,
     },
 
+    #[error(
+        "virtiofsd {found} is too old: GAVMO needs {required} or newer \
+         (for --translate-uid and --readonly)"
+    )]
+    VirtiofsdTooOld { found: String, required: String },
+
     #[error("a VM helper process (virtiofsd) exited during startup: {status}")]
     HelperExited { status: ExitStatus },
 

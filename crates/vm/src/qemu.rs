@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::Path;
 use std::process::Stdio;
@@ -8,7 +8,7 @@ use tokio::process::Child;
 use crate::config::{GUEST_OPENCODE_PORT, VmConfig};
 use crate::error::{Error, Result};
 use crate::fsutil::{check_socket_path, remove_if_exists};
-use crate::share::ShareSpec;
+use crate::share::{ShareSpec, check_virtiofsd_version};
 
 /// The `id=` of the `virtio-balloon-pci` device. `qmp.rs` derives the
 /// balloon's QOM path (`/machine/peripheral/<id>`) from this.
@@ -91,7 +91,7 @@ fn disk_args(cfg: &VmConfig) -> Result<Vec<String>> {
 /// for unit testing without `qemu` or `/dev/kvm`.
 pub(crate) fn build_qemu_args(cfg: &VmConfig, shares: &[ShareSpec]) -> Result<Vec<OsString>> {
     let mut args: Vec<OsString> = Vec::new();
-    let mut push = |arg: &dyn AsRef<std::ffi::OsStr>| args.push(arg.as_ref().to_owned());
+    let mut push = |arg: &dyn AsRef<OsStr>| args.push(arg.as_ref().to_owned());
 
     // Hosts are Linux-only (virtiofs); the `cfg` just keeps non-Linux
     // development builds compiling.
@@ -191,6 +191,11 @@ pub(crate) async fn spawn_qemu(
     check_socket_path(&qmp_socket)?;
     // A stale socket from a crashed run would make qemu's bind fail.
     remove_if_exists(&qmp_socket)?;
+
+    // An old virtiofsd rejects our arguments and exits with no explanation.
+    if !shares.is_empty() {
+        check_virtiofsd_version(OsStr::new("virtiofsd")).await?;
+    }
 
     let mut helpers = Vec::new();
     for share in shares {
@@ -541,7 +546,7 @@ mod tests {
     async fn real_qemu_boots_with_explicit_backing_and_ignores_the_header() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("base,with,commas.qcow2");
-        let run = |args: &[&std::ffi::OsStr]| {
+        let run = |args: &[&OsStr]| {
             let status = std::process::Command::new("qemu-img")
                 .args(args)
                 .status()
