@@ -162,8 +162,10 @@ All three workflows can also be started by hand ("Run workflow").
 
 - **CI** (`ci.yml`, on push to `main`): the checks above, except
   `cargo deny`, on the Rust pinned in `rust-toolchain.toml`, plus the
-  coverage floor (see "Coverage"). The coverage job installs qemu and
-  virtiofsd and opens up `/dev/kvm`, so the real-qemu tests run there too.
+  coverage floor (see "Coverage"). The coverage job installs qemu from apt,
+  opens up `/dev/kvm`, and takes virtiofsd from the nixpkgs revision that
+  `nix/base/flake.lock` pins (Ubuntu's is older than the 1.13 GAVMO needs),
+  so the real-qemu tests run there too.
 - **Deny** (`deny.yml`, on push to `main` and daily): `cargo deny`. It is
   the only check whose result changes without a code change, since the
   RustSec database grows daily. A scheduled failure means a new advisory

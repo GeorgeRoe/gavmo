@@ -84,6 +84,12 @@ Forgetting `virtiofsd` fails a VM boot immediately with `failed to spawn
 `console.log` is written for that attempt either) - if you see that, this is
 almost certainly why.
 
+`virtiofsd` must be **1.13.0 or newer**, the first release with
+`--translate-uid` and `--readonly`. Older ones, such as Ubuntu 24.04's
+package, are refused before qemu starts with `virtiofsd X is too old`;
+use nixpkgs' (`nix-shell -p virtiofsd`, as above) or `cargo install
+virtiofsd` instead.
+
 This repo's own `gavmo.nix` sets up a GAVMO VM for developing GAVMO itself
 (Rust toolchain, `cargo-leptos`, `wasm-bindgen-cli`, `binaryen`, headless
 Firefox for the browser tests, `qemu`, `virtiofsd`) and cargo settings that fit
