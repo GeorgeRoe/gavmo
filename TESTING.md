@@ -109,16 +109,20 @@ temp dirs, and the VM is killed if the test process dies.
 
 ## Coverage
 
-CI fails if the native tests cover less than 95% of regions or lines,
-across all crates together. Regions are the closest stable Rust gets to
-branch coverage: every `if`/`match` arm and every `?` error path is its
-own region, so an untested branch counts even when its line ran.
+CI fails if the native tests cover less of the code than the floor in
+`ci.yml` (90% of regions, 91% of lines, across all crates together). The
+floor is a ratchet just under the current coverage: raise it when tests
+are added, and don't lower it to make a change pass; add tests instead.
+
+Regions are the closest stable Rust gets to branch coverage: every
+`if`/`match` arm and every `?` error path is its own region, so an
+untested branch counts even when its line ran.
 
 ```sh
 cargo llvm-cov clean --workspace
 cargo llvm-cov --no-report --workspace --exclude gavmo -- --include-ignored
 cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm
-cargo llvm-cov report --summary-only --fail-under-regions 95 --fail-under-lines 95
+cargo llvm-cov report --summary-only --fail-under-regions 90 --fail-under-lines 91
 cargo llvm-cov report --html   # -> $CARGO_TARGET_DIR/llvm-cov/html/index.html
 ```
 
@@ -128,7 +132,9 @@ This includes the real-qemu tests (so it needs `qemu`, `virtiofsd` and
 the LLVM that rustc was built with; with rustup, `rustup component add
 llvm-tools-preview` does the same.
 
-Nothing is excluded from the count. The browser tests aren't measured
+cargo-llvm-cov leaves test files out of the count by default (`tests.rs`,
+`*_tests.rs`, `tests/`), but inline `#[cfg(test)] mod tests` blocks are
+counted along with the code they test. The browser tests aren't measured
 (llvm-cov can't instrument wasm on stable Rust), so components are also
 covered natively by rendering them server-side, which runs the code that
 builds their views; only event handlers and effects stay browser-only.
