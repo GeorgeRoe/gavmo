@@ -123,9 +123,8 @@ struct GavmoMcpHandler<A> {
 fn scope_of(context: &RequestContext<RoleServer>) -> Option<WorkspaceScope> {
     context
         .extensions
-        .get::<http::request::Parts>()?
-        .extensions
-        .get::<WorkspaceScope>()
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<WorkspaceScope>())
         .cloned()
 }
 
@@ -394,9 +393,14 @@ mod tests {
             &self,
             scope: &WorkspaceScope,
             name: &str,
-            _arguments: serde_json::Map<String, serde_json::Value>,
+            arguments: serde_json::Map<String, serde_json::Value>,
         ) -> ToolOutcome {
-            ToolOutcome::Success(format!("{name} from {}", scope.workspace_id))
+            let text = format!("{name} from {}", scope.workspace_id);
+            if arguments.contains_key("fail") {
+                ToolOutcome::Error(text)
+            } else {
+                ToolOutcome::Success(text)
+            }
         }
     }
 
@@ -453,6 +457,20 @@ mod tests {
         extra: &[(&str, &str)],
         body: serde_json::Value,
     ) -> (http::StatusCode, HeaderMap, serde_json::Value) {
+        read(
+            gateway()
+                .oneshot(request(token, extra, &body))
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    fn request(
+        token: Option<&str>,
+        extra: &[(&str, &str)],
+        body: &serde_json::Value,
+    ) -> http::Request<http_body_util::Full<Bytes>> {
         let mut req = http::Request::builder()
             .method("POST")
             .uri("/mcp")
@@ -465,10 +483,11 @@ mod tests {
         for (name, value) in extra {
             req = req.header(*name, *value);
         }
-        let req = req
-            .body(http_body_util::Full::new(Bytes::from(body.to_string())))
-            .unwrap();
-        let res = gateway().oneshot(req).await.unwrap();
+        req.body(http_body_util::Full::new(Bytes::from(body.to_string())))
+            .unwrap()
+    }
+
+    async fn read(res: GatewayResponse) -> (http::StatusCode, HeaderMap, serde_json::Value) {
         let status = res.status();
         let headers = res.headers().clone();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
@@ -549,6 +568,46 @@ mod tests {
         .await;
         assert_eq!(call["id"], 4);
         assert_eq!(call["error"]["code"], -32602, "{call}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_tool_is_an_error_result_not_a_protocol_error() {
+        let (_, _, call) = rpc(
+            Some("good-token"),
+            &[],
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                "params": {"name": "echo", "arguments": {"fail": true}}
+            }),
+        )
+        .await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+        assert_eq!(
+            call["result"]["content"][0]["text"],
+            "echo from /home/user/project"
+        );
+    }
+
+    /// Defense in depth: a request that reached the MCP handler without
+    /// going through the gateway's auth (no scope attached) is refused.
+    #[tokio::test]
+    async fn the_handler_refuses_requests_that_bypassed_the_gateway() {
+        for (id, method) in [(6, "tools/list"), (7, "tools/call")] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": method,
+                "params": {"name": "echo", "arguments": {}}
+            });
+            let res = gateway()
+                .inner
+                .oneshot(request(None, &[], &body))
+                .await
+                .unwrap();
+            let (_, _, reply) = read(res).await;
+            assert_eq!(
+                reply["error"]["message"], "missing workspace authorization",
+                "{reply}"
+            );
+        }
     }
 
     /// Browser pages send `Origin`; guests never do. A page on the host must
