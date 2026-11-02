@@ -310,4 +310,35 @@ VmSize:   123456 kB
         std::fs::write(&path, b"hello").unwrap();
         assert_eq!(file_size_or_zero(&path).unwrap(), 5);
     }
+    #[test]
+    fn sample_reads_a_live_process() {
+        let sample = sample(std::process::id()).unwrap();
+        assert!(sample.rss_bytes > 0 && sample.ncpu > 0);
+        assert!(sample.total_jiffies >= sample.proc_jiffies);
+    }
+
+    #[test]
+    fn parse_pid_stat_jiffies_errors_on_bad_or_overflowing_times() {
+        let stat =
+            |utime: &str, stime: &str| format!("1 (x) S 0 0 0 0 0 0 0 0 0 0 {utime} {stime} 0 0");
+        assert!(parse_pid_stat_jiffies(&stat("1", "x")).is_err());
+        assert!(parse_pid_stat_jiffies(&stat("x", "1")).is_err());
+        assert!(parse_pid_stat_jiffies(&stat(&u64::MAX.to_string(), "1")).is_err());
+        assert!(parse_pid_stat_jiffies("1 (x) S 0 0 0 0 0 0 0 0 0 0 5").is_err());
+    }
+
+    #[test]
+    fn parse_stat_total_errors_on_overflow_or_no_cores() {
+        let max = u64::MAX;
+        assert!(parse_stat_total_and_ncpu(&format!("cpu {max} 1\ncpu0 1\n")).is_err());
+        assert!(parse_stat_total_and_ncpu("cpu 1 2 3\n").is_err());
+    }
+
+    #[test]
+    fn file_size_or_zero_reports_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(file_size_or_zero(&file.join("below-a-file")).is_err());
+    }
 }

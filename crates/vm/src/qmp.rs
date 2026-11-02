@@ -263,4 +263,104 @@ mod tests {
             "{result:?}"
         );
     }
+    use crate::fake_qmp::{FakeQmp, error, ok};
+
+    fn socket() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn lifecycle_commands_are_sent_by_name() {
+        let (_dir, path) = socket();
+        let fake = FakeQmp::serve(&path, |name, _| match name {
+            "query-status" => ok(json!({"running": false, "status": "prelaunch"})),
+            _ => ok(json!({})),
+        });
+
+        let status = query_status(&path).await.unwrap();
+        assert!(!status.running);
+        system_powerdown(&path).await.unwrap();
+        quit(&path).await.unwrap();
+
+        assert_eq!(
+            fake.commands(),
+            ["query-status", "system_powerdown", "quit"]
+        );
+    }
+
+    #[tokio::test]
+    async fn balloon_polling_is_enabled_on_the_balloon_device() {
+        let (_dir, path) = socket();
+        let args = std::sync::Arc::new(std::sync::Mutex::new(json!(null)));
+        let seen = std::sync::Arc::clone(&args);
+        let fake = FakeQmp::serve(&path, move |_, arguments| {
+            *seen.lock().unwrap() = arguments.clone();
+            ok(json!({}))
+        });
+
+        set_balloon_stats_interval(&path, 7).await.unwrap();
+
+        assert_eq!(fake.commands(), ["qom-set"]);
+        assert_eq!(
+            *args.lock().unwrap(),
+            json!({
+                "path": "/machine/peripheral/balloon0",
+                "property": "guest-stats-polling-interval",
+                "value": 7
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_memory_reads_the_balloon_stats() {
+        let (_dir, path) = socket();
+        let fake = FakeQmp::serve(&path, |_, arguments| {
+            assert_eq!(arguments["property"], "guest-stats");
+            ok(json!({
+                "last-update": 1,
+                "stats": {"stat-total-memory": 100, "stat-available-memory": 40}
+            }))
+        });
+
+        let mem = guest_memory(&path).await.unwrap();
+
+        assert_eq!(
+            mem,
+            Some(GuestMemory {
+                total_bytes: 100,
+                available_bytes: 40
+            })
+        );
+        assert_eq!(fake.commands(), ["qom-get"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_is_a_command_error_naming_it() {
+        let (_dir, path) = socket();
+        let _fake = FakeQmp::serve(&path, |_, _| error("no balloon device"));
+
+        for result in [
+            guest_memory(&path).await.map(drop),
+            set_balloon_stats_interval(&path, 2).await,
+            system_powerdown(&path).await,
+            quit(&path).await,
+        ] {
+            let err = result.unwrap_err();
+            assert!(matches!(err, Error::QmpCommand { .. }), "{err:?}");
+        }
+    }
+
+    /// A qemu that dies mid-handshake makes `qapi` panic on the early EOF;
+    /// that must come back as an error, not take the daemon down.
+    #[tokio::test]
+    async fn a_peer_that_hangs_up_before_greeting_is_an_error() {
+        let (_dir, path) = socket();
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || drop(listener.accept()));
+
+        let err = query_status(&path).await.unwrap_err();
+        assert!(matches!(err, Error::QmpTask(_)), "{err:?}");
+    }
 }

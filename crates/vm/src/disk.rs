@@ -209,4 +209,29 @@ mod tests {
         ensure_overlay(&base, &disk, 3).await.unwrap();
         assert_eq!(overlay_virtual_size(&disk).await.unwrap(), 3 * GIB, "grown");
     }
+    /// Real qemu-img: a missing base fails creation without leaving a
+    /// half-made overlay (or its temp file) behind, and a file that isn't
+    /// an image can't be sized.
+    #[tokio::test]
+    #[ignore = "needs qemu-img"]
+    async fn real_qemu_img_failures_are_reported_and_leave_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = tmp.path().join("vm").join("disk.qcow2");
+
+        let err = ensure_overlay(&tmp.path().join("missing.qcow2"), &disk, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::QemuImg { .. }), "{err:?}");
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join("vm")).unwrap().collect();
+        assert_eq!(left.len(), 0, "{left:?}");
+
+        std::fs::write(&disk, b"not an image").unwrap();
+        let err = ensure_overlay(&tmp.path().join("missing.qcow2"), &disk, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::QemuImg { stderr, .. } if !stderr.is_empty()),
+            "{err:?}"
+        );
+    }
 }

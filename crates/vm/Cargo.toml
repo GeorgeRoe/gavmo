@@ -22,5 +22,5 @@ tracing.workspace = true
 [dev-dependencies]
 # Runtime flavours/macros/signal handling are only needed by tests and the
 # `boot` example, not by the library.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "test-util"] }
 tempfile.workspace = true

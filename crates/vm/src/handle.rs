@@ -278,6 +278,9 @@ mod tests {
     use super::*;
     use tokio::process::Command;
 
+    use crate::fake_qmp::{FakeQmp, error, ok};
+    use serde_json::json;
+
     fn sleeper() -> Child {
         Command::new("sleep")
             .arg("600")
@@ -350,23 +353,9 @@ mod tests {
     async fn real_qemu_boot_failure_is_reported_immediately() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = VmConfig {
-            workspace_id: "t".to_owned(),
-            repo_dir: tmp.path().join("repo"),
-            state_dir: tmp.path().join("state"),
-            runtime_dir: tmp.path().join("run"),
-            guest_output_dir: tmp.path().join("repo/.gavmo/vm"),
             base_image: tmp.path().join("missing-base.qcow2"),
-            gcloud_dir: tmp.path().join("gcloud"),
-            mcp_dir: tmp.path().join("mcp"),
-            disk_size_gib: 1,
-            memory_mib: 256,
-            vcpus: 1,
-            host_port: 1,
+            ..real_cfg(tmp.path())
         };
-        for dir in [&cfg.repo_dir, &cfg.gcloud_dir, &cfg.mcp_dir] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        create_private_dir_all(&cfg.state_dir).unwrap();
         // A pre-existing overlay, so only qemu (not qemu-img) sees the
         // missing base.
         let status = std::process::Command::new("qemu-img")
@@ -384,5 +373,253 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(30), "{err}");
         assert!(matches!(err, Error::QemuExited { .. }), "{err}");
         assert!(err.to_string().contains("missing-base.qcow2"), "{err}");
+    }
+    /// A config under `tmp` whose host dirs exist, for real and fake VMs.
+    fn real_cfg(tmp: &std::path::Path) -> VmConfig {
+        let cfg = VmConfig {
+            workspace_id: "t".to_owned(),
+            repo_dir: tmp.join("repo"),
+            state_dir: tmp.join("state"),
+            runtime_dir: tmp.join("run"),
+            guest_output_dir: tmp.join("repo/.gavmo/vm"),
+            base_image: tmp.join("base.qcow2"),
+            gcloud_dir: tmp.join("gcloud"),
+            mcp_dir: tmp.join("mcp"),
+            disk_size_gib: 1,
+            memory_mib: 256,
+            vcpus: 1,
+            host_port: free_port(),
+        };
+        for dir in [&cfg.repo_dir, &cfg.gcloud_dir, &cfg.mcp_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        create_private_dir_all(&cfg.state_dir).unwrap();
+        create_private_dir_all(&cfg.runtime_dir).unwrap();
+        cfg
+    }
+
+    /// A localhost port nothing listens on (just released by the kernel).
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A [`RunningVm`] around stand-in processes instead of qemu/virtiofsd.
+    fn fake_vm(tmp: &std::path::Path, qemu: Child, helpers: Vec<Child>) -> RunningVm {
+        RunningVm {
+            cfg: real_cfg(tmp),
+            qemu,
+            helpers,
+            started: Instant::now(),
+        }
+    }
+
+    /// Answers every connection on `port` like a (very) minimal web server.
+    async fn serve_http(port: u16) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.0 200 OK\r\n\r\n")
+                    .await
+                    .unwrap_or_default();
+            }
+        });
+    }
+
+    /// Kills `pid` from outside, as the guest powering off would end qemu.
+    fn kill(pid: u32) {
+        let status = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn is_gone(pid: u32) -> bool {
+        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[tokio::test]
+    async fn status_is_failed_once_qemu_has_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut qemu = Command::new("true").spawn().unwrap();
+        qemu.wait().await.unwrap();
+        let mut vm = fake_vm(tmp.path(), qemu, Vec::new());
+
+        assert!(matches!(
+            vm.status().await,
+            VmStatus::Failed(VmFailure::QemuExited(exit)) if exit.success()
+        ));
+    }
+
+    #[tokio::test]
+    async fn status_is_booting_until_opencode_answers_then_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vm = fake_vm(tmp.path(), sleeper(), Vec::new());
+        assert_eq!(vm.status().await, VmStatus::Booting);
+
+        serve_http(vm.host_port()).await;
+        assert_eq!(
+            vm.status().await,
+            VmStatus::Running {
+                url: format!("http://127.0.0.1:{}", vm.host_port())
+            }
+        );
+    }
+
+    /// qemu's own run state wins over a port that happens to answer: a VM
+    /// still in `prelaunch` (or paused) isn't running.
+    #[tokio::test]
+    async fn status_follows_qemu_s_run_state_when_qmp_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vm = fake_vm(tmp.path(), sleeper(), Vec::new());
+        serve_http(vm.host_port()).await;
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&running);
+        let _qmp = FakeQmp::serve(&vm.qmp_socket_path(), move |_, _| {
+            let running = flag.load(std::sync::atomic::Ordering::SeqCst);
+            ok(json!({"running": running, "status": if running { "running" } else { "prelaunch" }}))
+        });
+
+        assert_eq!(vm.status().await, VmStatus::Booting);
+        running.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(vm.status().await, VmStatus::Running { .. }));
+    }
+
+    #[tokio::test]
+    async fn accessors_report_the_config_and_the_qemu_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qemu = sleeper();
+        let pid = qemu.id();
+        let vm = fake_vm(tmp.path(), qemu, Vec::new());
+
+        assert_eq!(vm.workspace_id(), "t");
+        assert_eq!(vm.vcpus(), 1);
+        assert_eq!(vm.qemu_pid(), pid);
+        assert!(vm.uptime() < Duration::from_secs(60));
+        assert_eq!(vm.qmp_socket_path(), tmp.path().join("run/qmp.sock"));
+        assert_eq!(vm.disk_path(), tmp.path().join("state/disk.qcow2"));
+    }
+
+    #[tokio::test]
+    async fn stop_powers_off_gracefully_and_kills_the_helpers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qemu = sleeper();
+        let qemu_pid = qemu.id().unwrap();
+        let helper = sleeper();
+        let helper_pid = helper.id().unwrap();
+        let vm = fake_vm(tmp.path(), qemu, vec![helper]);
+        let qmp = FakeQmp::serve(&vm.qmp_socket_path(), move |_, _| {
+            kill(qemu_pid);
+            ok(json!({}))
+        });
+
+        vm.stop().await.unwrap();
+
+        assert_eq!(qmp.commands(), ["system_powerdown"]);
+        assert!(is_gone(qemu_pid) && is_gone(helper_pid));
+    }
+
+    #[tokio::test]
+    async fn stop_falls_back_to_quit_when_powerdown_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qemu = sleeper();
+        let qemu_pid = qemu.id().unwrap();
+        let vm = fake_vm(tmp.path(), qemu, Vec::new());
+        let qmp = FakeQmp::serve(&vm.qmp_socket_path(), move |name, _| {
+            if name == "quit" {
+                kill(qemu_pid);
+                ok(json!({}))
+            } else {
+                error("ACPI unavailable")
+            }
+        });
+
+        vm.stop().await.unwrap();
+
+        assert_eq!(qmp.commands(), ["system_powerdown", "quit"]);
+        assert!(is_gone(qemu_pid));
+    }
+
+    /// A guest that ignores the powerdown gets `quit` after the shutdown
+    /// timeout. (Paused clock: the timeout passes at once.)
+    #[tokio::test(start_paused = true)]
+    async fn stop_forces_quit_when_the_guest_ignores_powerdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qemu = sleeper();
+        let qemu_pid = qemu.id().unwrap();
+        let vm = fake_vm(tmp.path(), qemu, Vec::new());
+        let qmp = FakeQmp::serve(&vm.qmp_socket_path(), move |name, _| {
+            if name == "quit" {
+                kill(qemu_pid);
+            }
+            ok(json!({}))
+        });
+
+        vm.stop().await.unwrap();
+
+        assert_eq!(qmp.commands(), ["system_powerdown", "quit"]);
+        assert!(is_gone(qemu_pid));
+    }
+
+    /// No QMP at all (qemu wedged before creating its socket): SIGKILL
+    /// after the quit timeout, and still no error.
+    #[tokio::test(start_paused = true)]
+    async fn stop_sigkills_a_qemu_without_qmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qemu = sleeper();
+        let qemu_pid = qemu.id().unwrap();
+        let vm = fake_vm(tmp.path(), qemu, Vec::new());
+
+        vm.stop().await.unwrap();
+
+        assert!(is_gone(qemu_pid));
+    }
+
+    /// Real qemu + virtiofsd booting a blank disk: the whole spawn path
+    /// works, and a guest's failed `gavmo.nix` rebuild (its marker file)
+    /// fails the boot with the log's name instead of waiting for opencode.
+    #[tokio::test]
+    #[ignore = "needs qemu, virtiofsd and /dev/kvm"]
+    async fn real_qemu_boot_reports_a_failed_gavmo_nix_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = real_cfg(tmp.path());
+        let status = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2"])
+            .arg(&cfg.base_image)
+            .arg("64M")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(&cfg.guest_output_dir).unwrap();
+        // A stale marker from an earlier boot must not count...
+        let marker = cfg.rebuild_failed_marker_path();
+        std::fs::write(&marker, "rebuild-old.log").unwrap();
+        // ...but one written once qemu is up does.
+        let qemu_log = cfg.qemu_log_path();
+        let writer = tokio::spawn(async move {
+            while !qemu_log.exists() || marker.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::fs::write(&marker, "rebuild-new.log\n").unwrap();
+        });
+
+        let Err(err) = RunningVm::boot(cfg).await else {
+            panic!("boot must fail");
+        };
+        writer.await.unwrap();
+        assert!(
+            matches!(&err, Error::RebuildFailed { log_file } if log_file == "rebuild-new.log"),
+            "{err}"
+        );
     }
 }

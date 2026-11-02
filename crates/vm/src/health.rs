@@ -216,4 +216,18 @@ mod tests {
             .expect("must not hang");
         assert!(matches!(result, Err(Error::ReadMarker { .. })));
     }
+    #[tokio::test]
+    async fn wait_for_ready_returns_once_the_port_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+
+        wait_for_ready(port, &dir.path().join("no-marker"), Duration::from_secs(10))
+            .await
+            .unwrap();
+    }
 }

@@ -8,6 +8,8 @@
 mod config;
 mod disk;
 mod error;
+#[cfg(test)]
+mod fake_qmp;
 mod fsutil;
 mod handle;
 mod health;
