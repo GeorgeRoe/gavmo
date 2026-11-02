@@ -331,11 +331,18 @@ mod tests {
         FakeKeys(Mutex::new(None))
     }
 
-    /// Simulates an unreachable keystore.
-    struct UnavailableKey;
+    /// Simulates an unreachable keystore: entirely, or (`reads`) only for
+    /// storing a new key.
+    struct UnavailableKey {
+        reads: bool,
+    }
     impl KeyProvider for UnavailableKey {
         fn load_key(&self) -> Result<Option<DataKey>, SecretError> {
-            Err(SecretError::Backend("no keystore".to_owned()))
+            if self.reads {
+                Ok(None)
+            } else {
+                Err(SecretError::Backend("no keystore".to_owned()))
+            }
         }
         fn create_key(&self) -> Result<DataKey, SecretError> {
             Err(SecretError::Backend("no keystore".to_owned()))
@@ -504,7 +511,8 @@ mod tests {
     #[test]
     fn lazy_vault_defers_open_and_fails_closed_without_a_key() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LazyVaultStore::new(vault_path(&dir), Box::new(UnavailableKey));
+        let store =
+            LazyVaultStore::new(vault_path(&dir), Box::new(UnavailableKey { reads: false }));
         // An error, not `Ok(None)`: fail closed.
         assert!(store.get("k").is_err());
         assert!(store.set("k", "v").is_err());
@@ -517,5 +525,241 @@ mod tests {
             std::sync::Arc::new(LazyVaultStore::new(vault_path(&dir), Box::new(fixed(4))));
         store.set("k", "v").unwrap();
         assert_eq!(store.get("k").unwrap().as_deref(), Some("v"));
+    }
+    #[test]
+    fn lazy_vault_deletes_through_the_opened_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LazyVaultStore::new(vault_path(&dir), Box::new(fixed(4)));
+        store.set("k", "v").unwrap();
+        store.delete("k").unwrap();
+        assert_eq!(store.get("k").unwrap(), None);
+    }
+
+    /// A keystore that can be read but refuses a new key fails the open,
+    /// rather than leaving a vault that can't be decrypted later.
+    #[test]
+    fn a_key_that_cannot_be_stored_fails_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = VaultStore::open(vault_path(&dir), &UnavailableKey { reads: true })
+            .err()
+            .unwrap();
+        assert!(matches!(err, SecretError::Backend(_)), "{err:?}");
+        assert!(!vault_path(&dir).exists());
+    }
+
+    #[test]
+    fn an_existing_vault_with_an_unreachable_keystore_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        VaultStore::open(vault_path(&dir), &fixed(1))
+            .unwrap()
+            .set("k", "v")
+            .unwrap();
+        let err = VaultStore::open(vault_path(&dir), &UnavailableKey { reads: false })
+            .err()
+            .unwrap();
+        assert!(matches!(err, SecretError::Backend(_)), "{err:?}");
+    }
+
+    /// Anything but "not found" is an error, never an empty vault that the
+    /// next write would replace.
+    #[test]
+    fn an_unreadable_vault_is_an_error_not_an_empty_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(vault_path(&dir)).unwrap();
+        let err = VaultStore::open(vault_path(&dir), &fixed(1)).err().unwrap();
+        assert!(
+            matches!(
+                err,
+                SecretError::Io {
+                    action: "reading vault",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_vault_path_without_a_usable_parent_is_refused() {
+        let err = VaultStore::open("", &fixed(1)).err().unwrap();
+        assert!(matches!(err, SecretError::Backend(_)), "{err:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let err = VaultStore::open(file.join("secrets.vault"), &fixed(1))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                SecretError::Io {
+                    action: "creating",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Runs `f` with `dir` read-only, restoring it after so the temp dir can
+    /// be cleaned up.
+    #[cfg(unix)]
+    fn with_read_only_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = f();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_that_cannot_be_created_fails_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = with_read_only_dir(dir.path(), || {
+            VaultStore::open(vault_path(&dir), &fixed(1)).err().unwrap()
+        });
+        assert!(
+            matches!(
+                err,
+                SecretError::Io {
+                    action: "opening lock file",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    fn write_v1_vault(path: &Path) -> Vec<u8> {
+        let key = DataKey::from_bytes([3; KEY_LEN]);
+        let v1 = format::tests::encrypt_v1(
+            &key,
+            &SecretMap([("k".to_owned(), "v".to_owned())].into_iter().collect()),
+        );
+        std::fs::write(path, &v1).unwrap();
+        v1
+    }
+
+    /// An existing backup is from an earlier migration attempt: it is kept.
+    #[test]
+    fn an_existing_v1_backup_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(&dir);
+        write_v1_vault(&path);
+        let backup = dir.path().join("secrets.vault.v1.bak");
+        std::fs::write(&backup, b"earlier").unwrap();
+
+        let store = VaultStore::open(&path, &fixed(3)).unwrap();
+        assert_eq!(store.get("k").unwrap().as_deref(), Some("v"));
+        assert_eq!(std::fs::read(&backup).unwrap(), b"earlier");
+    }
+
+    /// A migration that can't write its backup, or the upgraded vault, fails
+    /// and leaves the v1 file as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_migration_that_cannot_write_fails_and_keeps_the_v1_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(&dir);
+        let v1 = write_v1_vault(&path);
+        // Created up front: the lock file must open in the read-only dir.
+        drop(VaultStore::open(dir.path().join("other.vault"), &fixed(1)));
+        std::fs::write(with_suffix(&path, ".lock"), b"").unwrap();
+
+        let err = with_read_only_dir(dir.path(), || {
+            VaultStore::open(&path, &fixed(3)).err().unwrap()
+        });
+        assert!(
+            matches!(
+                err,
+                SecretError::Io {
+                    action: "creating backup",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        std::fs::write(with_suffix(&path, ".v1.bak"), &v1).unwrap();
+        let err = with_read_only_dir(dir.path(), || {
+            VaultStore::open(&path, &fixed(3)).err().unwrap()
+        });
+        assert!(
+            matches!(
+                err,
+                SecretError::Io {
+                    action: "creating temp file for",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), v1);
+    }
+
+    #[test]
+    fn a_vault_that_cannot_be_replaced_keeps_memory_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(&dir);
+        let store = VaultStore::open(&path, &fixed(1)).unwrap();
+        // Renaming a file over a directory fails.
+        std::fs::create_dir(&path).unwrap();
+        let err = store.set("k", "v").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SecretError::Io {
+                    action: "replacing",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(store.get("k").unwrap(), None);
+    }
+
+    /// Set in the child process of the keyring test below.
+    const NO_BUS_CHILD: &str = "GAVMO_SECRETS_TEST_NO_BUS_CHILD";
+
+    /// Without a reachable Secret Service, the keyring-backed vaults fail
+    /// closed. The real work runs in a child process whose session bus
+    /// points at nothing, so the keyring of whoever runs the tests is never
+    /// touched (the environment can't be changed safely in-process).
+    #[test]
+    fn keyring_backed_vaults_fail_closed_without_a_secret_service() {
+        let dir = tempfile::tempdir().unwrap();
+        if std::env::var_os(NO_BUS_CHILD).is_some() {
+            let unavailable =
+                |r: Result<_, SecretError>| matches!(r, Err(SecretError::KeyUnavailable(_)));
+            assert!(unavailable(KeyringKeyProvider.load_key().map(drop)));
+            assert!(unavailable(KeyringKeyProvider.create_key().map(drop)));
+            assert!(unavailable(
+                VaultStore::open_keyring_backed(vault_path(&dir)).map(drop)
+            ));
+            let lazy = LazyVaultStore::keyring_backed(vault_path(&dir));
+            assert!(unavailable(lazy.get("k").map(drop)));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vault::store::tests::keyring_backed_vaults_fail_closed_without_a_secret_service",
+                "--nocapture",
+            ])
+            .env(NO_BUS_CHILD, "1")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", dir.path().join("no-bus").display()),
+            )
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

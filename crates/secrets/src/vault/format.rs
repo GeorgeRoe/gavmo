@@ -69,11 +69,7 @@ pub(super) fn decrypt(key: &DataKey, bytes: &[u8]) -> Result<(SecretMap, u8), Se
         .split_first_chunk::<3>()
         .ok_or(SecretError::Truncated)?;
     if header[..2] != MAGIC {
-        return Err(if bytes.len() < MAGIC.len() {
-            SecretError::Truncated
-        } else {
-            SecretError::NotAVault
-        });
+        return Err(SecretError::NotAVault);
     }
     let version = header[2];
     let aad: &[u8] = match version {
@@ -202,6 +198,26 @@ pub(super) mod tests {
         assert!(matches!(
             decrypt(&key(1), &future),
             Err(SecretError::UnsupportedVersion(3))
+        ));
+    }
+
+    /// Authentic ciphertext whose plaintext isn't the JSON map: a bug in a
+    /// writer, not tampering, so it is `Corrupt` rather than `Decrypt`.
+    #[test]
+    fn authentic_but_non_json_contents_are_corrupt() {
+        let header = [MAGIC[0], MAGIC[1], VERSION];
+        let nonce = XNonce::generate();
+        let payload = Payload {
+            msg: b"not json",
+            aad: &header,
+        };
+        let ciphertext = cipher(&key(1)).encrypt(&nonce, payload).unwrap();
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(nonce.as_slice());
+        bytes.extend_from_slice(&ciphertext);
+        assert!(matches!(
+            decrypt(&key(1), &bytes),
+            Err(SecretError::Corrupt(_))
         ));
     }
 
