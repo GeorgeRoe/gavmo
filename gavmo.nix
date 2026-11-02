@@ -23,6 +23,15 @@ let
   # reverse), so bump the pin to match.
   rustPin = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
   rustVm = pkgs.rustc.version;
+
+  # cargo-llvm-cov reads rustc's coverage profiles with llvm-profdata and
+  # llvm-cov, which must come from the same LLVM major version rustc uses.
+  # nixpkgs' rustc doesn't ship them (no `llvm-tools-preview`), so take them
+  # from the LLVM it was built against. If that attribute ever disappears,
+  # fall back to the default LLVM (with a warning) rather than fail the
+  # rebuild, since that would keep opencode from starting.
+  rustLlvm = pkgs.rustc.llvmPackages.llvm or null;
+  llvmTools = if rustLlvm != null then rustLlvm else pkgs.llvm;
 in
 {
   warnings =
@@ -34,6 +43,11 @@ in
       gavmo.nix: this VM's rustc is ${rustVm} but rust-toolchain.toml pins ${rustPin},
       which CI uses; lints can differ between them. Set the pin to ${rustVm}, in its
       own commit with any new lint fixes (see CONTRIBUTING.md).
+    ''
+    ++ lib.optional (rustLlvm == null) ''
+      gavmo.nix: pkgs.rustc.llvmPackages is gone, so coverage uses the default LLVM
+      (${llvmTools.version}); if its major version differs from `rustc -vV`'s,
+      `cargo llvm-cov` fails to read the profiles. Find rustc's LLVM another way.
     '';
 
   environment.systemPackages = with pkgs; [
@@ -66,6 +80,10 @@ in
     qemu
     virtiofsd
 
+    # Test coverage (TESTING.md, "Coverage"). Its LLVM tools are passed
+    # through LLVM_COV/LLVM_PROFDATA below rather than put on PATH.
+    cargo-llvm-cov
+
     pkg-config
     openssl
     git
@@ -82,5 +100,9 @@ in
     CARGO_INCREMENTAL = "0";
     CARGO_PROFILE_DEV_DEBUG = "0";
     CARGO_PROFILE_TEST_DEBUG = "0";
+
+    # For cargo-llvm-cov, which otherwise looks for rustup's llvm-tools.
+    LLVM_COV = "${llvmTools}/bin/llvm-cov";
+    LLVM_PROFDATA = "${llvmTools}/bin/llvm-profdata";
   };
 }
