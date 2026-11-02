@@ -100,3 +100,34 @@ pub(crate) fn run_action<T: 'static>(
         done(outcome);
     });
 }
+
+#[cfg(test)]
+#[cfg(feature = "ssr")]
+mod tests {
+    use super::*;
+
+    /// `busy` covers exactly the call, and `done` gets its outcome; an
+    /// expired session also sends the browser to log in (a no-op here).
+    #[tokio::test]
+    async fn run_action_marks_busy_until_the_call_finishes() {
+        _ = any_spawner::Executor::init_tokio();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let owner = Owner::new();
+                owner.set();
+                for outcome in [Ok(7), Err(AppError::Unauthorized)] {
+                    let busy = RwSignal::new(false);
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let expected = outcome.clone();
+                    run_action(busy, async move { outcome }, move |got| {
+                        tx.send(got).unwrap();
+                    });
+                    assert!(busy.get_untracked());
+                    assert_eq!(rx.await.unwrap(), expected);
+                    assert!(!busy.get_untracked());
+                }
+            })
+            .await;
+    }
+}
