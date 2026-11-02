@@ -97,7 +97,7 @@ pub(crate) fn WorkspaceModal(
 
 /// Which destructive action is waiting for confirmation (at most one).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Confirming {
+pub(super) enum Confirming {
     Reset,
     Remove,
 }
@@ -195,7 +195,7 @@ fn ActionsBar(
 
 /// A button that asks for confirmation inline before running `on_confirm`.
 #[component]
-fn ConfirmButton(
+pub(super) fn ConfirmButton(
     which: Confirming,
     confirming: RwSignal<Option<Confirming>>,
     label: &'static str,
@@ -344,7 +344,7 @@ pub(super) fn StatsPanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>)
 }
 
 #[component]
-fn StatsView(stats: VmStats) -> impl IntoView {
+pub(super) fn StatsView(stats: VmStats) -> impl IntoView {
     let s = stats;
     let cpu_bar = percent_of(f64::from(s.cpu_percent), f64::from(s.vcpus.max(1)) * 100.0);
     view! {
@@ -399,7 +399,10 @@ fn StatsView(stats: VmStats) -> impl IntoView {
 
 /// "View build log" for a `BuildFailed` workspace, and the log itself.
 #[component]
-fn BuildLogPanel(id: StoredValue<String>, status: Memo<WorkspaceStatus>) -> impl IntoView {
+pub(super) fn BuildLogPanel(
+    id: StoredValue<String>,
+    status: Memo<WorkspaceStatus>,
+) -> impl IntoView {
     let open = RwSignal::new(false);
     // `None` while loading.
     let content = RwSignal::new(None::<Result<String, String>>);

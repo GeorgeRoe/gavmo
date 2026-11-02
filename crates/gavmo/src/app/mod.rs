@@ -13,6 +13,9 @@ mod hooks;
 mod modal;
 mod polling;
 mod resources;
+#[cfg(test)]
+#[cfg(feature = "ssr")]
+mod ssr_tests;
 mod tools;
 mod transitions;
 mod workspace_modal;

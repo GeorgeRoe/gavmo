@@ -185,4 +185,50 @@ mod tests {
         assert_eq!(field_text(None), "");
         assert_eq!(field_text(Some(8)), "8");
     }
+    #[cfg(feature = "ssr")]
+    fn resources(disk_current_gib: Option<u32>) -> ResourcesView {
+        use crate::types::{ResourceValues, Resources};
+        let values = |disk_gib, memory_gib, vcpus| ResourceValues {
+            disk_gib,
+            memory_gib,
+            vcpus,
+        };
+        ResourcesView {
+            saved: Resources::default(),
+            defaults: values(32, 4, 2),
+            min: values(8, 1, 1),
+            max: values(512, 64, 16),
+            disk_current_gib,
+        }
+    }
+
+    /// Server-rendered (see `app::ssr_tests`).
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn resource_fields_show_defaults_and_allowed_ranges() {
+        let fields = |data: ResourcesView, locked: bool| {
+            crate::app::ssr_tests::render(move || {
+                view! {
+                    <ResourceFields
+                        data
+                        disk=RwSignal::new(String::new())
+                        memory=RwSignal::new("8".to_owned())
+                        vcpus=RwSignal::new(String::new())
+                        busy=RwSignal::new(false)
+                        disk_locked=Signal::derive(move || locked)
+                    />
+                }
+            })
+        };
+        let fresh = fields(resources(None), false);
+        assert!(
+            fresh.contains("32 (default)") && fresh.contains("8-512"),
+            "{fresh}"
+        );
+        assert!(fresh.contains("1-64") && fresh.contains("1-16"), "{fresh}");
+
+        let grown = fields(resources(Some(40)), true);
+        assert!(grown.contains("now 40 GiB; 40-512 (grow only)"), "{grown}");
+        assert!(grown.contains("disabled"), "{grown}");
+    }
 }

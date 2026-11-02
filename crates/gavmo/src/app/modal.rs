@@ -17,12 +17,17 @@ pub(crate) fn Modal(
     children: Children,
 ) -> impl IntoView {
     // Escape-to-close; the listener is removed when the modal unmounts.
-    let handle = window_event_listener(leptos::ev::keydown, move |ev| {
-        if ev.key() == "Escape" {
-            on_close.run(());
-        }
-    });
-    on_cleanup(move || handle.remove());
+    // Browser only: there is no `window` to listen on when rendering on the
+    // server (natively, the call aborts the process).
+    #[cfg(feature = "hydrate")]
+    {
+        let handle = window_event_listener(leptos::ev::keydown, move |ev| {
+            if ev.key() == "Escape" {
+                on_close.run(());
+            }
+        });
+        on_cleanup(move || handle.remove());
+    }
 
     // Without a card to morph from, use the plain CSS mount animation.
     let morphing = vt_name.is_some();

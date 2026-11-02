@@ -76,6 +76,10 @@ tower = { workspace = true, features = ["util"] }
 secrets = { workspace = true, features = ["test-util"] }
 # `Channel`: request bodies that stall, for the body-limit tests.
 http-body-util = { version = "0.1", features = ["channel"] }
+# `StreamExt::collect` for rendering components with async data (app::ssr_tests).
+futures = "0.3"
+# The task executor Leptos spawns resource fetches on, for those tests.
+any_spawner = { version = "0.3", features = ["tokio"] }
 
 [features]
 hydrate = [

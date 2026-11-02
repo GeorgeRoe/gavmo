@@ -109,7 +109,7 @@ pub(crate) fn WorkspaceTools(id: String) -> impl IntoView {
 /// One tool's row: details, status, warnings, and the credential form.
 /// `tool` is `None` only in the instant before a removed tool's row unmounts.
 #[component]
-fn ToolRow(
+pub(super) fn ToolRow(
     tool: Memo<Option<ToolConfig>>,
     workspace_id: StoredValue<String>,
     on_changed: Callback<()>,
@@ -204,7 +204,7 @@ fn ToolWarnings(tool: ToolConfig) -> impl IntoView {
 /// Save / update / test / clear a tool's credential. Mounted once per row,
 /// so its inputs and last result survive the panel's reloads.
 #[component]
-fn CredentialForm(
+pub(super) fn CredentialForm(
     tool: Memo<Option<ToolConfig>>,
     workspace_id: StoredValue<String>,
     on_changed: Callback<()>,

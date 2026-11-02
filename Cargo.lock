@@ -992,10 +992,12 @@ dependencies = [
 name = "gavmo"
 version = "0.1.0"
 dependencies = [
+ "any_spawner",
  "anyhow",
  "axum",
  "console_error_panic_hook",
  "dirs",
+ "futures",
  "http-body-util",
  "js-sys",
  "leptos",
