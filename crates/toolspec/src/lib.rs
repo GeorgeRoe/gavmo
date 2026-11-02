@@ -521,11 +521,14 @@ tools:
 
     #[test]
     fn more_than_max_tools_is_an_error() {
+        use std::fmt::Write as _;
         let mut yaml = String::from("tools:\n");
         for i in 0..=MAX_TOOLS {
-            yaml.push_str(&format!(
-                "  t{i}:\n    type: http\n    base_url: \"https://a.example.com\"\n    auth: bearer\n    secret: s\n"
-            ));
+            writeln!(
+                yaml,
+                "  t{i}:\n    type: http\n    base_url: \"https://a.example.com\"\n    auth: bearer\n    secret: s"
+            )
+            .unwrap();
         }
         let err = parse_config(&yaml).unwrap_err().to_string();
         assert!(err.contains(&MAX_TOOLS.to_string()), "{err}");
