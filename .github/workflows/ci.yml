@@ -76,17 +76,25 @@ jobs:
       - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-llvm-cov@${{ env.CARGO_LLVM_COV_VERSION }}
-      # Ubuntu installs virtiofsd in /usr/libexec, and /dev/kvm is root-only
-      # until a udev rule opens it up.
-      - name: Install qemu and virtiofsd, enable KVM
+      # /dev/kvm is root-only until a udev rule opens it up.
+      - name: Install qemu, enable KVM
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils virtiofsd
-          echo /usr/libexec >> "$GITHUB_PATH"
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # Ubuntu's virtiofsd predates 1.13 (no --translate-uid or --readonly),
+      # so take it from the nixpkgs that nix/base/flake.lock pins: the same
+      # build the VM image ships, fetched from the binary cache.
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: Install virtiofsd from the base image's nixpkgs
+        run: |
+          rev=$(jq -er '.nodes.nixpkgs.locked.rev' nix/base/flake.lock)
+          out=$(nix build --no-link --print-out-paths "github:NixOS/nixpkgs/$rev#virtiofsd")
+          echo "$out/bin" >> "$GITHUB_PATH"
+          "$out/bin/virtiofsd" --version
       - run: cargo llvm-cov --no-report --workspace --exclude gavmo -- --include-ignored
       - run: cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm
       - run: cargo llvm-cov report --summary-only --fail-under-regions "$COVERAGE_FLOOR" --fail-under-lines "$COVERAGE_FLOOR"
