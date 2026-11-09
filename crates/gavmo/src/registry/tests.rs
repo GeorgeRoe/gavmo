@@ -345,7 +345,7 @@ fn scripted_app_state() -> (
     std::fs::write(&base_image, b"fake base image").unwrap();
     let state = AppState::with_data_dir(
         base_image,
-        PathBuf::from("/nonexistent/gavmo-test-gcloud"),
+        Path::new("/nonexistent/gavmo-test-gcloud"),
         data.path(),
         Some(Path::new("/nonexistent/gavmo-test-home")),
         &data.path().join("run"),
@@ -1630,7 +1630,7 @@ async fn an_unreadable_secret_store_is_an_error_not_unconfigured() {
     let data = tempfile::tempdir().unwrap();
     let state = AppState::with_data_dir(
         PathBuf::from("/nonexistent/base.qcow2"),
-        PathBuf::from("/nonexistent/gcloud"),
+        Path::new("/nonexistent/gcloud"),
         data.path(),
         Some(Path::new("/nonexistent/home")),
         &data.path().join("run"),

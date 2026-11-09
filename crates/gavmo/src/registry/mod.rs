@@ -110,7 +110,7 @@ impl AppState {
     /// `base_image` is the read-only NixOS qcow2 (from `GAVMO_BASE_IMAGE`);
     /// `gcloud_dir` holds the user's Google credentials (used by the model
     /// gateway on the host, never shared into VMs); no workspace may overlap it.
-    pub fn new(base_image: PathBuf, gcloud_dir: PathBuf) -> io::Result<Self> {
+    pub fn new(base_image: PathBuf, gcloud_dir: &Path) -> io::Result<Self> {
         let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
             .join("gavmo");
@@ -135,7 +135,7 @@ impl AppState {
     /// never touch the user's real `~/.local/share/gavmo` or keyring.
     pub(crate) fn with_data_dir(
         base_image: PathBuf,
-        gcloud_dir: PathBuf,
+        gcloud_dir: &Path,
         gavmo_data_dir: &Path,
         home_dir: Option<&Path>,
         runtime_base_dir: &Path,
@@ -145,7 +145,7 @@ impl AppState {
         std::fs::create_dir_all(gavmo_data_dir)?;
         vm::create_private_dir_all(runtime_base_dir).map_err(io::Error::other)?;
         reap_stale_vm_processes(runtime_base_dir);
-        let protected_dirs = [gavmo_data_dir, gcloud_dir.as_path(), runtime_base_dir]
+        let protected_dirs = [gavmo_data_dir, gcloud_dir, runtime_base_dir]
             .into_iter()
             .map(canonical_or_self)
             .collect();

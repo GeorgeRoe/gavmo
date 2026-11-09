@@ -31,7 +31,7 @@ async fn a_real_vm_boots_reports_stops_and_resets() {
     std::fs::create_dir_all(&gcloud_dir).unwrap();
     let state = AppState::with_data_dir(
         base_image,
-        gcloud_dir,
+        &gcloud_dir,
         &data_dir,
         None,
         &tmp.path().join("run"),

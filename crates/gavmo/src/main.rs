@@ -76,7 +76,7 @@ mod daemon {
 
     async fn run() -> Result<()> {
         let config = Config::from_env()?;
-        let app_state = AppState::new(config.base_image, config.gcloud_dir.clone())
+        let app_state = AppState::new(config.base_image, &config.gcloud_dir)
             .context("failed to initialize GAVMO state")?;
 
         warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);

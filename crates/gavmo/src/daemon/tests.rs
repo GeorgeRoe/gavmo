@@ -2,7 +2,7 @@
 //! real server functions and registry, with a fake VM launcher and an
 //! in-memory secret store.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ impl Daemon {
         std::fs::write(&base_image, b"fake base image").unwrap();
         let state = AppState::with_data_dir(
             base_image,
-            PathBuf::from("/nonexistent/gcloud"),
+            Path::new("/nonexistent/gcloud"),
             data.path(),
             Some(Path::new("/nonexistent/home")),
             &data.path().join("run"),
