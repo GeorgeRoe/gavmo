@@ -43,9 +43,12 @@ toolspec = { workspace = true, optional = true }
 # `LengthLimitError`, to tell an oversized control-panel request body from
 # other read errors. Already in the tree via axum.
 http-body-util = { version = "0.1", optional = true }
+# Implementing a streamed response body (see `daemon::llm`). Already in the
+# tree via axum.
+http-body = { version = "1", optional = true }
 # Host-side HTTP forwarder. rustls (not native-tls) avoids an OpenSSL
 # build/system dependency.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 # hydrate-only (wasm32 browser build) dependencies.
 console_error_panic_hook = { version = "0.1", optional = true }
@@ -109,6 +112,7 @@ ssr = [
     "dep:toolspec",
     "dep:reqwest",
     "dep:http-body-util",
+    "dep:http-body",
     "dep:web-sys",
     "leptos/ssr",
     "leptos_meta/ssr",

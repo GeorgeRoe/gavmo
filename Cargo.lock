@@ -998,6 +998,7 @@ dependencies = [
  "console_error_panic_hook",
  "dirs",
  "futures",
+ "http-body",
  "http-body-util",
  "js-sys",
  "leptos",

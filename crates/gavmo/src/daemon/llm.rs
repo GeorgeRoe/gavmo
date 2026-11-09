@@ -183,14 +183,49 @@ async fn forward(State(llm): State<Llm>, request: Request) -> Response {
             out = out.header(name, value);
         }
     }
-    out.body(Body::from_stream(response.bytes_stream()))
-        .unwrap_or_else(|_| {
-            error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "bad upstream response",
-            )
-        })
+    out.body(stream_body(response)).unwrap_or_else(|_| {
+        error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "bad upstream response",
+        )
+    })
+}
+
+/// The response body, streamed chunk by chunk as it arrives. (Not
+/// reqwest's `stream` feature: that would add a duplicate `wasm-streams` to
+/// the lockfile.) A task pulls chunks into a small channel; if the guest
+/// goes away the channel closes, the task drops the response, and the
+/// upstream request is cancelled.
+fn stream_body(mut response: reqwest::Response) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        loop {
+            let next = response.chunk().await.transpose();
+            let Some(item) = next else { return };
+            let failed = item.is_err();
+            if tx.send(item).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    Body::new(ChannelBody(rx))
+}
+
+struct ChannelBody(tokio::sync::mpsc::Receiver<reqwest::Result<axum::body::Bytes>>);
+
+impl http_body::Body for ChannelBody {
+    type Data = axum::body::Bytes;
+    type Error = reqwest::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|item| item.map(|chunk| chunk.map(http_body::Frame::data)))
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +324,55 @@ mod tests {
         ] {
             assert!(!seen.contains(&format!("{gone}=")), "{gone} leaked: {seen}");
         }
+    }
+
+    /// Chunks reach the guest as the upstream sends them, not at the end.
+    #[tokio::test]
+    async fn responses_are_streamed_as_they_arrive() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+        let upstream = Router::new().fallback(move || {
+            let released = Arc::clone(&released);
+            async move {
+                let (tx, rx) = tokio::sync::mpsc::channel::<reqwest::Result<axum::body::Bytes>>(4);
+                tokio::spawn(async move {
+                    tx.send(Ok("event: one\n\n".into())).await.unwrap();
+                    if let Some(released) = released.lock().await.take() {
+                        released.await.unwrap();
+                    }
+                    tx.send(Ok("event: two\n\n".into())).await.unwrap();
+                });
+                Body::new(ChannelBody(rx))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let request = post("/anthropic/v1/messages")
+            .header("x-api-key", "good")
+            .body(Body::empty())
+            .unwrap();
+        let response = app(upstream_at(&base).await)
+            .oneshot(request)
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            http_body_util::BodyExt::frame(&mut body),
+        )
+        .await
+        .expect("the first chunk must arrive before the upstream finishes")
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.into_data().unwrap(), "event: one\n\n");
+        release.send(()).unwrap();
+        let rest = http_body_util::BodyExt::collect(body)
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(rest, "event: two\n\n");
     }
 
     #[tokio::test]
