@@ -24,5 +24,5 @@ pub use disk::overlay_virtual_size;
 pub use error::{Error, Result};
 pub use fsutil::create_private_dir_all;
 pub use handle::{RunningVm, VmFailure, VmStatus};
-pub use process::reap_stale;
+pub use process::{die_with_parent, reap_stale};
 pub use qmp::{GuestMemory, guest_memory};

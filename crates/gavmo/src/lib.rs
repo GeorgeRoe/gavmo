@@ -15,6 +15,9 @@ mod atomic_file;
 pub mod auth;
 
 #[cfg(feature = "ssr")]
+pub mod bifrost;
+
+#[cfg(feature = "ssr")]
 pub mod daemon;
 
 #[cfg(feature = "ssr")]

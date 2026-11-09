@@ -10,6 +10,7 @@ mod daemon {
 
     use anyhow::{Context as _, Result, anyhow, bail};
     use gavmo::auth;
+    use gavmo::bifrost::{BifrostConfig, GcpSettings, Supervisor, Upstream};
     use gavmo::registry::AppState;
     use leptos::prelude::get_configuration;
 
@@ -75,7 +76,7 @@ mod daemon {
 
     async fn run() -> Result<()> {
         let config = Config::from_env()?;
-        let app_state = AppState::new(config.base_image, config.gcloud_dir)
+        let app_state = AppState::new(config.base_image, config.gcloud_dir.clone())
             .context("failed to initialize GAVMO state")?;
 
         warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);
@@ -91,9 +92,11 @@ mod daemon {
         let ui_addr = conf.leptos_options.site_addr;
         let ui_router = gavmo::daemon::ui_router(conf.leptos_options, &app_state, &auth);
 
+        let llm = start_model_gateway(&config.gcloud_dir);
+
         // Separate port from the UI: guests must reach the bearer-authenticated
         // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
-        let mcp_router = gavmo::daemon::mcp_router(&app_state);
+        let mcp_router = gavmo::daemon::mcp_router(&app_state, llm.clone());
         let mcp_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, mcp::GAVMO_MCP_PORT));
 
         // Bind both before announcing anything, so a port clash fails fast.
@@ -121,7 +124,66 @@ mod daemon {
             }
         };
         app_state.shutdown(VM_SHUTDOWN_LIMIT).await;
+        llm.shutdown().await;
         outcome
+    }
+
+    /// Starts Bifrost, the host-side model gateway, if configured:
+    /// `GAVMO_BIFROST` (the `bifrost-http` binary) and `GAVMO_GCP_PROJECT`
+    /// are required, `GAVMO_GCP_REGION` defaults to `global`, and
+    /// `GAVMO_BIFROST_DATA_DIR` optionally holds its datasheets. Otherwise
+    /// the daemon runs without one and guests' model requests fail with the
+    /// reason (logged here too).
+    fn start_model_gateway(gcloud_dir: &std::path::Path) -> Upstream {
+        match model_gateway_config(gcloud_dir).and_then(|cfg| {
+            Supervisor::start(cfg).map_err(|e| format!("cannot start Bifrost: {e}"))
+        }) {
+            Ok(supervisor) => Upstream::Bifrost(supervisor),
+            Err(why) => {
+                tracing::warn!("model gateway disabled: {why}");
+                Upstream::NotConfigured(why)
+            }
+        }
+    }
+
+    fn model_gateway_config(
+        gcloud_dir: &std::path::Path,
+    ) -> std::result::Result<BifrostConfig, String> {
+        let absolute = |var: &str| -> std::result::Result<Option<PathBuf>, String> {
+            match std::env::var_os(var).map(PathBuf::from) {
+                Some(p) if p.is_absolute() => Ok(Some(p)),
+                Some(p) => Err(format!(
+                    "{var} must be an absolute path, got {}",
+                    p.display()
+                )),
+                None => Ok(None),
+            }
+        };
+        let binary = absolute("GAVMO_BIFROST")?
+            .ok_or("GAVMO_BIFROST is not set (path to the bifrost-http binary)")?;
+        let project = std::env::var("GAVMO_GCP_PROJECT").map_err(|e| {
+            format!("GAVMO_GCP_PROJECT (the Google Cloud project for Vertex AI): {e}")
+        })?;
+        let region = std::env::var("GAVMO_GCP_REGION").unwrap_or_else(|_| "global".to_owned());
+        let gcp = GcpSettings::new(&project, &region)?;
+        let credentials_file = gcloud_dir.join("application_default_credentials.json");
+        if !credentials_file.is_file() {
+            return Err(format!(
+                "{} not found; run `gcloud auth application-default login`",
+                credentials_file.display()
+            ));
+        }
+        let app_dir = dirs::data_dir()
+            .ok_or("no data dir")?
+            .join("gavmo")
+            .join("bifrost");
+        Ok(BifrostConfig {
+            binary,
+            app_dir,
+            gcp,
+            credentials_file,
+            data_dir: absolute("GAVMO_BIFROST_DATA_DIR")?,
+        })
     }
 
     /// Upper bound on stopping all VMs at exit: one VM's graceful (30s) plus

@@ -109,7 +109,13 @@ impl Daemon {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(body.to_string()))
             .unwrap();
-        let res = super::mcp_router(&self.state).oneshot(req).await.unwrap();
+        let res = super::mcp_router(
+            &self.state,
+            crate::bifrost::Upstream::NotConfigured("test".to_owned()),
+        )
+        .oneshot(req)
+        .await
+        .unwrap();
         let status = res.status();
         let bytes = axum::body::to_bytes(res.into_body(), 4 << 20)
             .await

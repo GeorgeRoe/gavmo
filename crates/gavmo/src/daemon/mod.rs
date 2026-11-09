@@ -15,6 +15,7 @@ use crate::auth;
 use crate::registry::AppState;
 
 mod body_limit;
+mod llm;
 
 #[cfg(test)]
 mod boot_tests;
@@ -74,8 +75,11 @@ pub fn ui_router(
         ))
 }
 
-/// The MCP tool gateway, on its own port: guests reach it (at 10.0.2.2) with
-/// a bearer token, while the UI port stays session-gated.
-pub fn mcp_router(app_state: &AppState) -> Router {
-    Router::new().nest_service("/mcp", mcp::service(app_state.clone()))
+/// The guest-facing gateway, on its own port: guests reach it (at 10.0.2.2)
+/// with their workspace token, while the UI port stays session-gated.
+/// `/mcp` is the tool gateway; `/llm` forwards model requests to `llm`.
+pub fn mcp_router(app_state: &AppState, llm: crate::bifrost::Upstream) -> Router {
+    Router::new()
+        .nest_service("/mcp", mcp::service(app_state.clone()))
+        .nest("/llm", llm::router(Arc::new(app_state.clone()), llm))
 }

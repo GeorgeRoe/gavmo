@@ -45,7 +45,7 @@ toolspec = { workspace = true, optional = true }
 http-body-util = { version = "0.1", optional = true }
 # Host-side HTTP forwarder. rustls (not native-tls) avoids an OpenSSL
 # build/system dependency.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
 
 # hydrate-only (wasm32 browser build) dependencies.
 console_error_panic_hook = { version = "0.1", optional = true }

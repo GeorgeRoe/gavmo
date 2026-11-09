@@ -29,7 +29,7 @@ const DEATH_SIGNAL: libc::c_int = libc::SIGTERM;
 /// Linux delivers this when the *thread* that spawned the child exits, not
 /// the process. Children are spawned from tokio worker threads, which live
 /// as long as the runtime, i.e. the daemon.
-pub(crate) fn die_with_parent(command: &mut tokio::process::Command) {
+pub fn die_with_parent(command: &mut tokio::process::Command) {
     let parent = std::process::id();
     let in_child = move || {
         // SAFETY: plain syscall with integer arguments.
