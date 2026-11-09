@@ -49,6 +49,13 @@ pub struct VmConfig {
     /// overlay disk is what persists state across restarts.
     pub base_image: PathBuf,
 
+    /// Content identity of `base_image` (the daemon uses its hex SHA-256).
+    /// A new overlay records it in [`Self::base_record_path`]; an existing
+    /// overlay recorded against a different id is refused with
+    /// [`crate::Error::BaseImageChanged`], since an overlay is only valid on
+    /// the exact base it was created from.
+    pub base_image_id: String,
+
     /// Host path to the gcloud ADC config directory, shared read-only into
     /// the guest so `opencode` can authenticate to Vertex AI.
     pub gcloud_dir: PathBuf,
@@ -102,6 +109,12 @@ impl VmConfig {
     /// Path to this VM's persistent, copy-on-write overlay disk.
     pub fn disk_path(&self) -> PathBuf {
         self.state_dir.join("disk.qcow2")
+    }
+
+    /// Path to the record of which base image the overlay was created from
+    /// (see [`Self::base_image_id`]).
+    pub fn base_record_path(&self) -> PathBuf {
+        self.state_dir.join("base.json")
     }
 
     /// Path to the file the guest's serial console is redirected to.

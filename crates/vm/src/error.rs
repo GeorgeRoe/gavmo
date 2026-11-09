@@ -84,6 +84,36 @@ pub enum Error {
     #[error("qemu-img info returned no virtual-size")]
     QemuImgOutput,
 
+    #[error("cannot read the base image {path}: {source}")]
+    BaseImage {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to access the base image record {path}: {source}")]
+    BaseRecord {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// The overlay was created from a different base image than the current
+    /// one (or its record is unreadable), so booting it would pair its
+    /// blocks with the wrong base. Resetting the workspace rebuilds it.
+    #[error(
+        "the base image has changed since this VM's disk was created \
+         ({}, now {}); reset the workspace to rebuild its disk from the new image",
+        recorded.as_deref().map_or_else(|| "unknown image".to_owned(), |r| format!("was {}", short_id(r))),
+        short_id(current)
+    )]
+    BaseImageChanged {
+        /// The id recorded with the overlay; `None` if the record is
+        /// unreadable.
+        recorded: Option<String>,
+        current: String,
+    },
+
     #[error("failed to connect to QMP socket {path}: {source}")]
     QmpConnect {
         path: PathBuf,
@@ -146,6 +176,11 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The first 12 characters of an image id, for messages.
+fn short_id(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
 
 fn fmt_tail(tail: &str) -> String {
     if tail.is_empty() {

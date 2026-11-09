@@ -323,6 +323,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/user/1000/gavmo/abc"),
             guest_output_dir: PathBuf::from("/home/user/project/.gavmo/vm"),
             base_image: PathBuf::from("/var/lib/gavmo/base.qcow2"),
+            base_image_id: "test-base".to_owned(),
             gcloud_dir: PathBuf::from("/home/user/.config/gcloud"),
             mcp_dir: PathBuf::from("/var/lib/gavmo/mcp/test-workspace"),
             disk_size_gib: 32,

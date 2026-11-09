@@ -53,8 +53,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_dir = scratch.join("mcp");
     std::fs::create_dir_all(&mcp_dir)?;
 
+    // The daemon identifies the base by content hash; this debug runner just
+    // uses its resolved path, so a rebuilt (new store path) image is still
+    // refused against an old overlay.
+    let base_image_id = std::fs::canonicalize(&base_image)?
+        .to_string_lossy()
+        .into_owned();
+
     let cfg = VmConfig {
         workspace_id,
+        base_image_id,
         repo_dir: repo_dir.clone(),
         state_dir,
         runtime_dir,

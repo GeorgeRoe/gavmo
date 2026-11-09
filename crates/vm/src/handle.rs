@@ -71,7 +71,14 @@ impl RunningVm {
         // Owner-only, so other local users can't read the disk or reach the
         // sockets. (`ensure_overlay` does the same for `state_dir`.)
         create_private_dir_all(&cfg.runtime_dir)?;
-        ensure_overlay(&cfg.base_image, &cfg.disk_path(), cfg.disk_size_gib).await?;
+        ensure_overlay(
+            &cfg.base_image,
+            &cfg.base_image_id,
+            &cfg.disk_path(),
+            &cfg.base_record_path(),
+            cfg.disk_size_gib,
+        )
+        .await?;
 
         // Clear a stale rebuild-failure marker so a previous boot's result
         // isn't mistaken for this one's. NotFound is the common case; any
@@ -354,6 +361,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = VmConfig {
             base_image: tmp.path().join("missing-base.qcow2"),
+            base_image_id: "test-base".to_owned(),
             ..real_cfg(tmp.path())
         };
         // A pre-existing overlay, so only qemu (not qemu-img) sees the
@@ -383,6 +391,7 @@ mod tests {
             runtime_dir: tmp.join("run"),
             guest_output_dir: tmp.join("repo/.gavmo/vm"),
             base_image: tmp.join("base.qcow2"),
+            base_image_id: "test-base".to_owned(),
             gcloud_dir: tmp.join("gcloud"),
             mcp_dir: tmp.join("mcp"),
             disk_size_gib: 1,
