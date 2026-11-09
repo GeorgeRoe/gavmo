@@ -392,14 +392,13 @@ mod tests {
             guest_output_dir: tmp.join("repo/.gavmo/vm"),
             base_image: tmp.join("base.qcow2"),
             base_image_id: "test-base".to_owned(),
-            gcloud_dir: tmp.join("gcloud"),
             mcp_dir: tmp.join("mcp"),
             disk_size_gib: 1,
             memory_mib: 256,
             vcpus: 1,
             host_port: free_port(),
         };
-        for dir in [&cfg.repo_dir, &cfg.gcloud_dir, &cfg.mcp_dir] {
+        for dir in [&cfg.repo_dir, &cfg.mcp_dir] {
             std::fs::create_dir_all(dir).unwrap();
         }
         create_private_dir_all(&cfg.state_dir).unwrap();

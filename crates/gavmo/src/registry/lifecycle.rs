@@ -588,7 +588,6 @@ impl AppState {
             repo_dir,
             base_image: self.inner.base_image.path().to_path_buf(),
             base_image_id,
-            gcloud_dir: self.inner.gcloud_dir.clone(),
             mcp_dir,
             disk_size_gib: resources.disk_gib,
             memory_mib: resources.memory_gib.saturating_mul(1024),

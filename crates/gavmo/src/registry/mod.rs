@@ -55,7 +55,6 @@ struct Inner {
     running: Mutex<HashMap<String, VmSlot>>,
     /// The read-only base image and its cached identity.
     base_image: BaseImage,
-    gcloud_dir: PathBuf,
 
     /// Root dir for every workspace's MCP token share
     /// (`~/.local/share/gavmo/mcp`), deliberately outside any repo.
@@ -109,7 +108,8 @@ impl AppState {
     /// Builds the app state, loading the persisted registry if present.
     ///
     /// `base_image` is the read-only NixOS qcow2 (from `GAVMO_BASE_IMAGE`);
-    /// `gcloud_dir` is the ADC config dir mounted read-only into every VM.
+    /// `gcloud_dir` holds the user's Google credentials (used by the model
+    /// gateway on the host, never shared into VMs); no workspace may overlap it.
     pub fn new(base_image: PathBuf, gcloud_dir: PathBuf) -> io::Result<Self> {
         let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
@@ -164,7 +164,6 @@ impl AppState {
                 registry: Mutex::new(registry),
                 running: Mutex::new(HashMap::new()),
                 base_image: BaseImage::new(base_image, gavmo_data_dir.join("base-image.json")),
-                gcloud_dir,
                 mcp_base_dir,
                 vms_base_dir,
                 runtime_base_dir: runtime_base_dir.to_path_buf(),

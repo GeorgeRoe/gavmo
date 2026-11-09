@@ -32,7 +32,7 @@ mod daemon {
                 )?;
 
             // No relative fallback: it would resolve against the daemon's
-            // working directory and mount whatever lives there into every VM.
+            // working directory and hand whatever lives there to the model gateway.
             let gcloud_dir = match std::env::var_os("GAVMO_GCLOUD_DIR") {
                 Some(dir) => PathBuf::from(dir),
                 None => dirs::config_dir()

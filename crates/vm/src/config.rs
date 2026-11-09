@@ -56,10 +56,6 @@ pub struct VmConfig {
     /// the exact base it was created from.
     pub base_image_id: String,
 
-    /// Host path to the gcloud ADC config directory, shared read-only into
-    /// the guest so `opencode` can authenticate to Vertex AI.
-    pub gcloud_dir: PathBuf,
-
     /// Host path to this workspace's MCP token dir, holding a `token.env` the
     /// guest loads as `GAVMO_MCP_TOKEN`. Shared read-only at `/etc/gavmo/mcp`.
     /// A dedicated share outside `repo_dir` keeps the capability token out
@@ -83,8 +79,8 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
-    /// The guest's virtiofs shares: the repo read-write, the gcloud and MCP
-    /// dirs read-only. Tags must match the mounts in
+    /// The guest's virtiofs shares: the repo read-write, the MCP dir
+    /// read-only. (No credentials are shared: models are served by the host.) Tags must match the mounts in
     /// `nix/base/configuration.nix`.
     pub(crate) fn shares(&self) -> Vec<ShareSpec> {
         vec![
@@ -92,11 +88,6 @@ impl VmConfig {
                 host_path: self.repo_dir.clone(),
                 mount_tag: "workspace",
                 read_only: false,
-            },
-            ShareSpec {
-                host_path: self.gcloud_dir.clone(),
-                mount_tag: "gcloud",
-                read_only: true,
             },
             ShareSpec {
                 host_path: self.mcp_dir.clone(),

@@ -4,16 +4,17 @@
 //!
 //! Usage:
 //!   cargo run -p vm --example boot -- \
-//!       <base-image.qcow2> <repo-dir> <gcloud-dir> <host-port>
+//!       <base-image.qcow2> <repo-dir> <host-port>
 //!
 //! Then open `http://127.0.0.1:<host-port>`. Requires `virtiofsd` on `PATH`.
+//! Models need a running GAVMO daemon (the guest calls its `/llm` route).
 //! Ctrl-C requests a graceful shutdown.
 
 use std::path::PathBuf;
 
 use vm::{RunningVm, VmConfig};
 
-const USAGE: &str = "usage: boot <base-image.qcow2> <repo-dir> <gcloud-dir> <host-port>";
+const USAGE: &str = "usage: boot <base-image.qcow2> <repo-dir> <host-port>";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,18 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base_image = PathBuf::from(args.next().ok_or(USAGE)?);
     let repo_dir = PathBuf::from(args.next().ok_or(USAGE)?);
-    let gcloud_dir = PathBuf::from(args.next().ok_or(USAGE)?);
     let host_port: u16 = args
         .next()
         .ok_or(USAGE)?
         .parse()
         .map_err(|e| format!("host-port must be a valid u16: {e}"))?;
 
-    for (label, path) in [
-        ("base image", &base_image),
-        ("repo dir", &repo_dir),
-        ("gcloud dir", &gcloud_dir),
-    ] {
+    for (label, path) in [("base image", &base_image), ("repo dir", &repo_dir)] {
         if !path.exists() {
             return Err(format!("{label} does not exist: {}", path.display()).into());
         }
@@ -68,7 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime_dir,
         guest_output_dir,
         base_image,
-        gcloud_dir,
         mcp_dir,
         disk_size_gib: 32,
         memory_mib: 4096,

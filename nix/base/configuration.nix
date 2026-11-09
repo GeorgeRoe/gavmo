@@ -366,24 +366,13 @@ in
   # `nix.settings.allowed-users = [ "agent" ]` (list options concatenate).
   nix.settings.allowed-users = lib.mkDefault [ "root" ];
 
-  # Rust <-> image contract: the virtiofs mount tags ("workspace",
-  # "gcloud", "mcp") must match the MOUNT_TAG_* constants in
+  # Rust <-> image contract: the virtiofs mount tags ("workspace", "mcp") must match the MOUNT_TAG_* constants in
   # crates/vm/src/handle.rs.
   fileSystems."/workspace" = {
     device = "workspace";
     fsType = "virtiofs";
     options = [
       "rw"
-      "nofail"
-      "x-systemd.device-timeout=10s"
-    ];
-  };
-
-  fileSystems."/etc/gavmo/gcloud" = {
-    device = "gcloud";
-    fsType = "virtiofs";
-    options = [
-      "ro"
       "nofail"
       "x-systemd.device-timeout=10s"
     ];
@@ -455,11 +444,46 @@ in
     # Start in read-only Plan mode; the user can still switch to Build.
     default_agent = "plan";
 
-    model = "google-vertex-anthropic/claude-sonnet-5-5@default";
-    small_model = "google-vertex-anthropic/claude-haiku-5-5@default";
-    # The provider pin is the security boundary; no model allowlist, so every
-    # Claude model Vertex offers is selectable.
-    enabled_providers = [ "google-vertex-anthropic" ];
+    # Models are served by the host: the `gavmo` provider talks to the
+    # daemon's /llm route (10.0.2.2 is the host under QEMU user-mode
+    # networking; 7071 must match `mcp::GAVMO_MCP_PORT`), authenticated with
+    # this boot's workspace token. The daemon forwards to its model gateway
+    # (Bifrost), which holds the user's provider credentials - the guest has
+    # none. `id` is the model name Bifrost routes (provider/model).
+    model = "gavmo/claude-sonnet-5-5";
+    small_model = "gavmo/claude-haiku-5-5";
+    # The provider pin is the security boundary: only the host-served
+    # provider can be used, whatever a repo's own opencode.json says.
+    enabled_providers = [ "gavmo" ];
+    provider.gavmo =
+      let
+        claude = id: name: {
+          inherit id name;
+          reasoning = true;
+          tool_call = true;
+          attachment = true;
+          temperature = true;
+          # Conservative; drives opencode's auto-compaction threshold.
+          limit = {
+            context = 200000;
+            output = 64000;
+          };
+        };
+      in
+      {
+        name = "GAVMO";
+        # Bundled with opencode: nothing is fetched at runtime.
+        npm = "@ai-sdk/anthropic";
+        options = {
+          baseURL = "http://10.0.2.2:7071/llm/anthropic/v1";
+          apiKey = "{env:GAVMO_MCP_TOKEN}";
+        };
+        models = {
+          claude-sonnet-5-5 = claude "vertex/claude-sonnet-5-5@default" "Claude Sonnet 5.5";
+          claude-haiku-5-5 = claude "vertex/claude-haiku-5-5@default" "Claude Haiku 5.5";
+          claude-opus-5-5 = claude "vertex/claude-opus-5-5@default" "Claude Opus 5.5";
+        };
+      };
 
     # Host-side tool gateway. 10.0.2.2 is the host under QEMU user-mode
     # networking; 7071 must match `mcp::GAVMO_MCP_PORT` (kept in sync by hand).
@@ -635,12 +659,8 @@ in
     ];
     wantedBy = [ "multi-user.target" ];
     # sessionVariables are delivered via PAM, which this service bypasses, so
-    # merge them here. Managed vars come second so they win on collision
-    # (gavmo.nix must not redirect GOOGLE_APPLICATION_CREDENTIALS).
+    # merge them here. Managed vars come second so they win on collision.
     environment = config.environment.sessionVariables // {
-      GOOGLE_CLOUD_PROJECT = "redacted-gcp-project";
-      GOOGLE_APPLICATION_CREDENTIALS = "/etc/gavmo/gcloud/application_default_credentials.json";
-      VERTEX_LOCATION = "global";
       # safe.directory=* via env, since nixpkgs' git doesn't reliably read
       # /etc/gitconfig. Covers paths whose host uid doesn't map to `agent`.
       GIT_CONFIG_COUNT = "1";
@@ -688,7 +708,7 @@ in
       # Not mkDefault: only blocks creating setuid files, not running sudo.
       RestrictSUIDSGID = true;
 
-      # GAVMO_MCP_TOKEN, read as root before dropping privileges. `-` makes a
+      # GAVMO_MCP_TOKEN (for both the tool gateway and the model provider), read as root before dropping privileges. `-` makes a
       # missing file non-fatal: there's no ordering on the mcp mount, so the
       # service may start tokenless and pick it up on a later restart.
       EnvironmentFile = "-/etc/gavmo/mcp/token.env";

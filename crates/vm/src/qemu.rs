@@ -324,7 +324,6 @@ mod tests {
             guest_output_dir: PathBuf::from("/home/user/project/.gavmo/vm"),
             base_image: PathBuf::from("/var/lib/gavmo/base.qcow2"),
             base_image_id: "test-base".to_owned(),
-            gcloud_dir: PathBuf::from("/home/user/.config/gcloud"),
             mcp_dir: PathBuf::from("/var/lib/gavmo/mcp/test-workspace"),
             disk_size_gib: 32,
             memory_mib: 4096,
@@ -449,8 +448,7 @@ mod tests {
         ));
     }
 
-    /// Only the repo is writable from the guest; the gcloud credentials and
-    /// the MCP token are read-only.
+    /// Only the repo is writable from the guest; the MCP token is read-only.
     #[test]
     fn shares_are_the_repo_read_write_and_the_rest_read_only() {
         let cfg = test_cfg();
@@ -463,7 +461,6 @@ mod tests {
             shares,
             [
                 ("workspace", cfg.repo_dir.clone(), false),
-                ("gcloud", cfg.gcloud_dir.clone(), true),
                 ("mcp", cfg.mcp_dir.clone(), true),
             ]
         );
@@ -483,8 +480,8 @@ mod tests {
                 .any(|a| a == "vhost-user-fs-pci,chardev=char-workspace,tag=workspace")
         );
         assert!(
-            args.iter()
-                .any(|a| a == "vhost-user-fs-pci,chardev=char-gcloud,tag=gcloud")
+            !args.iter().any(|a| a.contains("gcloud")),
+            "no credentials share"
         );
         assert!(
             args.iter()
@@ -567,12 +564,11 @@ mod tests {
         cfg.state_dir = tmp.path().join("state");
         cfg.runtime_dir = tmp.path().join("run");
         cfg.guest_output_dir = cfg.repo_dir.join(".gavmo").join("vm");
-        cfg.gcloud_dir = tmp.path().join("gcloud");
         cfg.mcp_dir = tmp.path().join("mcp");
         cfg.base_image = base;
         cfg.memory_mib = 256;
         cfg.vcpus = 1;
-        for dir in [&cfg.repo_dir, &cfg.gcloud_dir, &cfg.mcp_dir] {
+        for dir in [&cfg.repo_dir, &cfg.mcp_dir] {
             std::fs::create_dir_all(dir).unwrap();
         }
         crate::fsutil::create_private_dir_all(&cfg.runtime_dir).unwrap();
