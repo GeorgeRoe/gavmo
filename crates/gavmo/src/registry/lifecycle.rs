@@ -62,6 +62,9 @@ pub(super) enum VmSlot {
     /// guest's failure marker). `log` is the log filename relative to the
     /// workspace's `.gavmo/vm` dir, readable via [`AppState::read_build_log`].
     BuildFailed { log: String },
+    /// The VM's disk was made from a different base image than the current
+    /// one, so it was not booted; a reset rebuilds it. `reason` names both.
+    BaseImageChanged { reason: String },
 }
 
 /// A booted VM, watched by a background monitor task.
@@ -103,7 +106,10 @@ impl VmSlot {
         match self {
             Self::Booting { token, .. } => Some(token),
             Self::Running(running) => Some(&running.token),
-            Self::Stopping | Self::Failed(_) | Self::BuildFailed { .. } => None,
+            Self::Stopping
+            | Self::Failed(_)
+            | Self::BuildFailed { .. }
+            | Self::BaseImageChanged { .. } => None,
         }
     }
 
@@ -233,7 +239,6 @@ impl AppState {
 
         // Read before the `running` lock (lock order: registry, then running).
         let resources = self.saved_resources(id).await.resolve(DEFAULTS);
-        let cfg = self.vm_config(id, mcp_dir, host_port, resources);
         let generation = self
             .inner
             .boot_generation
@@ -245,9 +250,20 @@ impl AppState {
         let state = self.clone();
         let task_id = id.to_owned();
         let task_token = token.clone();
-        let boot = self.inner.launcher.boot(cfg);
         let task = tokio::spawn(async move {
-            let result = boot.await;
+            // In the task, not before it: the first identification of an
+            // image hashes it, which takes seconds; the slot shows `Booting`.
+            let result = match state.inner.base_image.id().await {
+                Ok(base_image_id) => {
+                    let cfg =
+                        state.vm_config(&task_id, mcp_dir, host_port, resources, base_image_id);
+                    state.inner.launcher.boot(cfg).await
+                }
+                Err(source) => Err(VmError::BaseImage {
+                    path: state.inner.base_image.path().to_path_buf(),
+                    source,
+                }),
+            };
             state
                 .finish_boot(&task_id, generation, task_token, result)
                 .await;
@@ -411,11 +427,11 @@ impl AppState {
         result
     }
 
-    /// Stops the VM and deletes its host state (overlay disk, console log),
-    /// its sockets, and `<repo>/.gavmo/vm` (rebuild logs), so the next open
-    /// builds a fresh overlay from the current base image - needed after a
-    /// base-image rebuild, since an overlay only makes sense on the exact base
-    /// it was created from.
+    /// Stops the VM and deletes its host state (overlay disk and its base
+    /// image record, console log), its sockets, and `<repo>/.gavmo/vm`
+    /// (rebuild logs), so the next open builds a fresh overlay from the
+    /// current base image - the way out of `BaseImageChanged`, since an
+    /// overlay only makes sense on the exact base it was created from.
     ///
     /// Destructive (the guest's `/nix` cache is lost; opencode sessions in
     /// `<repo>/.gavmo/opencode` are kept); the caller must have obtained user
@@ -556,6 +572,7 @@ impl AppState {
         mcp_dir: PathBuf,
         host_port: u16,
         resources: ResourceValues,
+        base_image_id: String,
     ) -> VmConfig {
         let repo_dir = PathBuf::from(id);
         let workspace_id = repo_dir.file_name().map_or_else(
@@ -569,7 +586,8 @@ impl AppState {
             state_dir: self.host_state_dir_for(id),
             runtime_dir: self.runtime_dir_for(id),
             repo_dir,
-            base_image: self.inner.base_image.clone(),
+            base_image: self.inner.base_image.path().to_path_buf(),
+            base_image_id,
             gcloud_dir: self.inner.gcloud_dir.clone(),
             mcp_dir,
             disk_size_gib: resources.disk_gib,
@@ -606,11 +624,15 @@ pub(super) async fn mint_mcp_token(dir: &Path) -> io::Result<String> {
     Ok(token)
 }
 
-/// The slot for a failed boot: `BuildFailed` for a `gavmo.nix` failure.
+/// The slot for a failed boot: `BuildFailed` for a `gavmo.nix` failure,
+/// `BaseImageChanged` for a disk made from another base image.
 pub(super) fn slot_for_boot_error(e: &VmError) -> VmSlot {
     match e {
         VmError::RebuildFailed { log_file } => VmSlot::BuildFailed {
             log: log_file.clone(),
+        },
+        VmError::BaseImageChanged { .. } => VmSlot::BaseImageChanged {
+            reason: e.to_string(),
         },
         _ => VmSlot::Failed(e.to_string()),
     }
@@ -646,6 +668,9 @@ pub(super) fn slot_status(slot: &VmSlot) -> WorkspaceStatus {
             reason: reason.clone(),
         },
         VmSlot::BuildFailed { log } => WorkspaceStatus::BuildFailed { log: log.clone() },
+        VmSlot::BaseImageChanged { reason } => WorkspaceStatus::BaseImageChanged {
+            reason: reason.clone(),
+        },
     }
 }
 

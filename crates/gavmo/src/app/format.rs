@@ -29,6 +29,10 @@ pub(crate) fn status_view(status: &WorkspaceStatus) -> (&'static str, String, Op
         WorkspaceStatus::Failed { reason } => ("failed", format!("failed: {reason}"), None),
         // Same badge color as "failed"; the modal offers the build log.
         WorkspaceStatus::BuildFailed { .. } => ("failed", "gavmo.nix build failed".into(), None),
+        // The modal explains and points at Reset.
+        WorkspaceStatus::BaseImageChanged { .. } => {
+            ("failed", "base image updated - reset needed".into(), None)
+        }
     }
 }
 

@@ -86,6 +86,27 @@ pub(crate) fn WorkspaceModal(
                     " needs to fetch or build new packages."
                 </p>
             })}
+            {move || match status.get() {
+                WorkspaceStatus::BaseImageChanged { reason } => Some(view! {
+                    <div class="base-image-changed">
+                        <p>
+                            "GAVMO's base image has changed since this workspace's VM disk \
+                             was created, so the VM can't start on it. Reset the workspace \
+                             to rebuild its disk from the new image."
+                        </p>
+                        <p class="hint">
+                            "Your repo and opencode sessions are kept. Anything else inside \
+                             the VM (installed tools, files outside "
+                            <code>"/workspace"</code>
+                            ") is lost; "
+                            <code>"gavmo.nix"</code>
+                            " is re-applied on the next start."
+                        </p>
+                        <p class="hint">{reason}</p>
+                    </div>
+                }),
+                _ => None,
+            }}
             <ConsolePanel id status />
             <StatsPanel id status />
             <BuildLogPanel id status />

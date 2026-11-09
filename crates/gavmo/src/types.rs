@@ -54,8 +54,9 @@ pub struct WorkspaceInfo {
     pub status: WorkspaceStatus,
 }
 
-/// Browser-facing mirror of `vm::VmStatus`, plus a `BuildFailed` case
-/// (from `vm::Error::RebuildFailed`) that `vm::VmStatus` doesn't have.
+/// Browser-facing mirror of `vm::VmStatus`, plus `BuildFailed` and
+/// `BaseImageChanged` cases (from `vm::Error::RebuildFailed` and
+/// `vm::Error::BaseImageChanged`) that `vm::VmStatus` doesn't have.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceStatus {
     Stopped,
@@ -73,6 +74,12 @@ pub enum WorkspaceStatus {
     /// filename, fetchable via [`read_build_log`].
     BuildFailed {
         log: String,
+    },
+    /// The VM's disk was made from a different base image than the one GAVMO
+    /// now uses (e.g. after an update), so it was not booted. A reset
+    /// rebuilds the disk from the current image. `reason` is the detail.
+    BaseImageChanged {
+        reason: String,
     },
 }
 

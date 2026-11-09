@@ -33,8 +33,11 @@ impl Daemon {
     pub(super) async fn start() -> Self {
         let data = tempfile::tempdir().unwrap();
         let script = Script::new();
+        // A real file: boots identify it (the fake launcher never reads it).
+        let base_image = data.path().join("base.qcow2");
+        std::fs::write(&base_image, b"fake base image").unwrap();
         let state = AppState::with_data_dir(
-            PathBuf::from("/nonexistent/base.qcow2"),
+            base_image,
             PathBuf::from("/nonexistent/gcloud"),
             data.path(),
             Some(Path::new("/nonexistent/home")),

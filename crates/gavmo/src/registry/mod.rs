@@ -5,6 +5,7 @@
 //! only place that touches the `vm` crate, keeping all VM-management
 //! mechanism behind the daemon's server functions.
 
+mod base_image;
 mod error;
 mod lifecycle;
 mod logs;
@@ -31,6 +32,7 @@ use tokio::sync::Mutex;
 
 use secrets::SecretStore;
 
+use self::base_image::BaseImage;
 use self::lifecycle::{VmSlot, reap_stale_vm_processes, slot_status};
 use self::paths::{
     canonical_or_self, check_workspace_path, default_runtime_base, warn_about_legacy_vm_state,
@@ -51,7 +53,8 @@ struct Inner {
     registry_path: PathBuf,
     registry: Mutex<Registry>,
     running: Mutex<HashMap<String, VmSlot>>,
-    base_image: PathBuf,
+    /// The read-only base image and its cached identity.
+    base_image: BaseImage,
     gcloud_dir: PathBuf,
 
     /// Root dir for every workspace's MCP token share
@@ -160,7 +163,7 @@ impl AppState {
                 registry_path,
                 registry: Mutex::new(registry),
                 running: Mutex::new(HashMap::new()),
-                base_image,
+                base_image: BaseImage::new(base_image, gavmo_data_dir.join("base-image.json")),
                 gcloud_dir,
                 mcp_base_dir,
                 vms_base_dir,

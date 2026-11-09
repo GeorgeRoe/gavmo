@@ -340,8 +340,11 @@ fn scripted_app_state() -> (
 ) {
     let script = crate::vm_handle::fake::Script::new();
     let data = tempfile::tempdir().unwrap();
+    // A real file: boots identify it (the fake launcher never reads it).
+    let base_image = data.path().join("base.qcow2");
+    std::fs::write(&base_image, b"fake base image").unwrap();
     let state = AppState::with_data_dir(
-        PathBuf::from("/nonexistent/gavmo-test-base.qcow2"),
+        base_image,
         PathBuf::from("/nonexistent/gavmo-test-gcloud"),
         data.path(),
         Some(Path::new("/nonexistent/gavmo-test-home")),
@@ -699,7 +702,13 @@ async fn an_invalid_gavmo_yaml_is_reported_in_the_tool_list() {
 fn vm_config_keeps_host_state_out_of_the_repo() {
     let (data, state) = test_app_state();
     let id = "/home/u/src/project";
-    let cfg = state.vm_config(id, state.mcp_dir_for(id), 40000, resources::DEFAULTS);
+    let cfg = state.vm_config(
+        id,
+        state.mcp_dir_for(id),
+        40000,
+        resources::DEFAULTS,
+        "test-base".to_owned(),
+    );
     let hash = workspace_hash(id);
 
     assert_eq!(cfg.state_dir, data.path().join("vms").join(&hash));
@@ -710,6 +719,7 @@ fn vm_config_keeps_host_state_out_of_the_repo() {
     assert_eq!(cfg.guest_output_dir, Path::new(id).join(".gavmo/vm"));
     for host_path in [
         cfg.disk_path(),
+        cfg.base_record_path(),
         cfg.console_log_path(),
         cfg.qmp_socket_path(),
     ] {
@@ -1030,7 +1040,13 @@ async fn a_superseded_boot_result_is_stopped_not_published() {
         let mut running = state.inner.running.lock().await;
         state.replace_slot(&mut running, &id, Some(VmSlot::Stopping));
     }
-    let cfg = state.vm_config(&id, state.mcp_dir_for(&id), 1, resources::DEFAULTS);
+    let cfg = state.vm_config(
+        &id,
+        state.mcp_dir_for(&id),
+        1,
+        resources::DEFAULTS,
+        "test-base".to_owned(),
+    );
     script.release_boots(1);
     let vm = state.inner.launcher.boot(cfg).await.unwrap();
 
@@ -1097,6 +1113,88 @@ async fn a_build_failure_shows_its_log_and_can_be_reopened() {
     assert_eq!(script.boots(), 1);
 }
 
+/// A disk made from another base image is reported as such (so the UI can
+/// offer a reset), and after a reset the workspace boots again.
+#[tokio::test]
+async fn a_changed_base_image_is_reported_and_a_reset_clears_it() {
+    let (_data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    install_slot(&state, &id, never_finishing_boot_slot()).await;
+
+    let err = VmError::BaseImageChanged {
+        recorded: Some("a".repeat(64)),
+        current: "b".repeat(64),
+    };
+    let slot = slot_for_boot_error(&err);
+    assert!(matches!(&slot, VmSlot::BaseImageChanged { .. }));
+    assert_eq!(slot.token(), None);
+    assert!(!slot.is_active());
+    state
+        .finish_boot(&id, u64::MAX, "test-token".to_owned(), Err(err))
+        .await;
+
+    let WorkspaceStatus::BaseImageChanged { reason } = state.status(&id).await else {
+        panic!(
+            "expected BaseImageChanged, got {:?}",
+            state.status(&id).await
+        );
+    };
+    assert!(
+        reason.contains("aaaaaaaaaaaa") && reason.contains("reset"),
+        "{reason}"
+    );
+    assert_eq!(TokenAuthority::resolve(&state, "test-token"), None);
+
+    state.reset_workspace(&id).await.unwrap();
+    assert_eq!(state.status(&id).await, WorkspaceStatus::Stopped);
+    open_and_run(&state, &script, &id).await;
+}
+
+/// Each boot is given the base image and its content hash, which the `vm`
+/// crate records with (and checks against) the overlay.
+#[tokio::test]
+async fn boots_are_given_the_base_image_identity() {
+    use sha2::Digest as _;
+
+    let (data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+
+    open_and_run(&state, &script, &id).await;
+
+    let booted = script.booted.lock().unwrap().clone();
+    let cfg = booted.first().expect("one boot");
+    assert_eq!(cfg.base_image, data.path().join("base.qcow2"));
+    assert_eq!(
+        cfg.base_image_id,
+        format!("{:x}", sha2::Sha256::digest(b"fake base image"))
+    );
+    assert!(data.path().join("base-image.json").exists(), "id cached");
+}
+
+/// A base image that can't be read fails the boot with a reason naming it,
+/// without launching anything.
+#[tokio::test]
+async fn a_missing_base_image_fails_the_boot_clearly() {
+    let (data, state, script) = scripted_app_state();
+    let (_repo, id) = registered_repo(&state).await;
+    std::fs::remove_file(data.path().join("base.qcow2")).unwrap();
+
+    state.open_workspace(&id).await.unwrap();
+
+    eventually("Failed", async || {
+        matches!(state.status(&id).await, WorkspaceStatus::Failed { .. })
+    })
+    .await;
+    let status = state.status(&id).await;
+    let WorkspaceStatus::Failed { reason } = status else {
+        panic!("expected Failed, got {status:?}");
+    };
+    assert!(reason.starts_with("cannot read the base image"), "{reason}");
+    assert!(reason.contains("base.qcow2"), "{reason}");
+    assert_eq!(script.boots(), 0);
+    assert!(current_token(&state, &id).is_none());
+}
+
 /// A boot result for an older boot than the one in flight is stopped; the
 /// current boot and its token are untouched.
 #[tokio::test]
@@ -1104,7 +1202,13 @@ async fn a_boot_result_from_an_older_generation_is_stopped() {
     let (_data, state, script) = scripted_app_state();
     let (_repo, id) = registered_repo(&state).await;
     install_slot(&state, &id, never_finishing_boot_slot()).await;
-    let cfg = state.vm_config(&id, state.mcp_dir_for(&id), 1, resources::DEFAULTS);
+    let cfg = state.vm_config(
+        &id,
+        state.mcp_dir_for(&id),
+        1,
+        resources::DEFAULTS,
+        "test-base".to_owned(),
+    );
     script.release_boots(1);
     let vm = state.inner.launcher.boot(cfg).await.unwrap();
 

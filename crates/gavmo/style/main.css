@@ -262,6 +262,25 @@ button.danger:hover:not(:disabled) {
   background: var(--border);
 }
 
+/* Base image changed: why the VM won't start and what Reset does. */
+
+.base-image-changed {
+  border: 1px solid var(--err);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.base-image-changed p {
+  margin: 0;
+}
+
+.base-image-changed .hint {
+  margin-top: 0.5rem;
+  word-break: break-word;
+}
+
 /* Build log viewer */
 
 .build-log-panel {

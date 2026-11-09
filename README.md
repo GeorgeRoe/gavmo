@@ -29,10 +29,17 @@ Workspaces and VMs:
   on a read-only base image built from `nix/base` (`GAVMO_BASE_IMAGE`); its
   QMP and virtiofsd sockets are in `$XDG_RUNTIME_DIR/gavmo/<id>/` (else
   `/tmp/gavmo-<uid>/`). qemu is given the base image explicitly rather than
-  trusting the overlay's header. An overlay only fits the base it was created
-  on, so a rebuilt base image needs "Reset". `<repo>/.gavmo/vm/` now holds
-  only guest build output; VM files left there by older versions are unused
-  (the daemon logs a hint) and can be deleted.
+  trusting the overlay's header.
+- An overlay only fits the base it was created on. The base image is
+  identified by its SHA-256 (hashed once per image; cached against its
+  path/inode/size/mtime in `~/.local/share/gavmo/base-image.json`), and each
+  overlay records the id it was made from in `vms/<hash>/base.json`. Booting
+  an overlay against a different base is refused (status "base image
+  updated - reset needed"); "Reset" rebuilds it from the current image,
+  keeping the repo and opencode sessions. Overlays from before this record
+  existed are assumed to match the current base the first time they boot.
+- `<repo>/.gavmo/vm/` now holds only guest build output; VM files left there
+  by older versions are unused (the daemon logs a hint) and can be deleted.
 - virtiofs shares: repo -> `/workspace` (rw), gcloud ADC ->
   `/etc/gavmo/gcloud` (ro), MCP token dir -> `/etc/gavmo/mcp` (ro).
   Unprivileged `virtiofsd` maps the host owner to guest `agent` (uid 1000).

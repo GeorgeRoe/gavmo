@@ -144,6 +144,23 @@ fn the_modal_shows_failures_and_offers_the_build_log() {
 
     let html = render_modal(WorkspaceStatus::Stopping);
     assert!(html.contains("stopping…"), "{html}");
+    assert!(!html.contains("base-image-changed"), "{html}");
+}
+
+/// A disk from an older base image explains itself and points at Reset.
+#[test]
+fn the_modal_explains_a_changed_base_image() {
+    let html = render_modal(WorkspaceStatus::BaseImageChanged {
+        reason: "the base image has changed (was aaaa, now bbbb)".to_owned(),
+    });
+    assert!(html.contains("base image updated - reset needed"), "{html}");
+    assert!(html.contains("base-image-changed"), "{html}");
+    assert!(html.contains("Reset the workspace"), "{html}");
+    assert!(html.contains("(was aaaa, now bbbb)"), "{html}");
+    assert!(
+        html.contains(">Reset<") && html.contains(">Start<"),
+        "{html}"
+    );
 }
 
 /// A workspace that disappeared from the list renders as stopped (the
