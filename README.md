@@ -40,8 +40,8 @@ Workspaces and VMs:
   existed are assumed to match the current base the first time they boot.
 - `<repo>/.gavmo/vm/` now holds only guest build output; VM files left there
   by older versions are unused (the daemon logs a hint) and can be deleted.
-- virtiofs shares: repo -> `/workspace` (rw), gcloud ADC ->
-  `/etc/gavmo/gcloud` (ro), MCP token dir -> `/etc/gavmo/mcp` (ro).
+- virtiofs shares: repo -> `/workspace` (rw), MCP token dir ->
+  `/etc/gavmo/mcp` (ro). No credentials are shared into VMs.
   Unprivileged `virtiofsd` maps the host owner to guest `agent` (uid 1000).
 - QEMU user-mode NAT forwards a free `127.0.0.1` port to opencode on guest
   port 7080; the guest reaches host loopback via `10.0.2.2`.
@@ -56,8 +56,37 @@ Inside the guest (`nix/base/configuration.nix`):
   unprivileged `agent` user in a systemd sandbox; session data lives in
   `/workspace/.gavmo/opencode`.
 - Managed `/etc/opencode/opencode.json` (not repo-overridable) pins the
-  Vertex provider, allows all permissions (the VM is the trust boundary), and
+  host-served `gavmo` provider (see "Models"), allows all permissions (the VM is the trust boundary), and
   registers the `gavmo-tools` MCP server.
+
+Models:
+
+- Guests hold no model credentials. opencode's `gavmo` provider calls
+  `http://10.0.2.2:7071/llm/anthropic/v1` with the boot's workspace token
+  (the same one as the tool gateway). The daemon checks it, strips it and any
+  `x-bf-*` header, and streams the request to its model gateway: a supervised
+  [Bifrost](https://github.com/maximhq/bifrost) process holding the user's
+  Google Application Default Credentials and doing the Vertex translation.
+  Only `/llm/anthropic/v1/*` is forwarded, never Bifrost's admin API.
+- Bifrost runs with a generated file-only config
+  (`~/.local/share/gavmo/bifrost/config.json`, log `bifrost.log` beside
+  it): no database, no request logging. In that mode it has no inbound auth
+  and a readable admin API, so it binds `127.0.0.2`, which guests can't
+  reach (QEMU maps their `10.0.2.2` only to host `127.0.0.1`). It dies with
+  the daemon and is restarted (with backoff) if it exits.
+- Configuration, for now from the environment:
+  - `GAVMO_BIFROST`: absolute path to the `bifrost-http` binary.
+  - `GAVMO_GCP_PROJECT`: the Google Cloud project for Vertex AI.
+  - `GAVMO_GCP_REGION`: optional, default `global`.
+  - `GAVMO_BIFROST_DATA_DIR`: optional dir with Bifrost's `datasheet.json`
+    and `model-parameters.json`, so it starts without downloading them.
+  Credentials are `application_default_credentials.json` in `GAVMO_GCLOUD_DIR`
+  (default `~/.config/gcloud`), written by
+  `gcloud auth application-default login`. Without the first two the daemon
+  still runs, and model requests fail with the reason.
+- The guest's models are declared in `nix/base/configuration.nix`
+  (`provider.gavmo.models`), mapping opencode names to Bifrost ones
+  (`vertex/claude-sonnet-5-5@default`).
 
 Tool gateway and secrets:
 
@@ -246,7 +275,7 @@ A few things worth knowing:
   base config - list-valued options (like `environment.systemPackages`)
   concatenate; most other options just work as expected. Don't try to redefine
   options the base config already fixes - in particular, the `/workspace` and
-  `/etc/gavmo/gcloud` virtiofs mounts and the `gavmo-opencode` service are
+  `/etc/gavmo/mcp` virtiofs mounts and the `gavmo-opencode` service are
   owned by GAVMO and shouldn't be touched.
 - **It runs as root, at VM-boot time**, via an in-guest `nixos-rebuild test`
   (activates immediately, never touches the bootloader) - so treat `gavmo.nix`

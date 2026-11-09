@@ -107,6 +107,22 @@ GAVMO_BASE_IMAGE="$(readlink -f result/nixos.qcow2)" \
 The first boot takes a few minutes; the timeout is 15. Everything lives in
 temp dirs, and the VM is killed if the test process dies.
 
+## Live model gateway test
+
+Starts a real Bifrost through the daemon's supervisor and sends a streamed
+request through the `/llm` route to Vertex AI. Needs a `bifrost-http` binary,
+network access and Google credentials, so it is opt-in:
+
+```sh
+GAVMO_TEST_BIFROST=/path/to/bifrost-http \
+GAVMO_TEST_GCP_PROJECT=my-project \
+GAVMO_TEST_ADC=~/.config/gcloud/application_default_credentials.json \
+  cargo test -p gavmo --features ssr live_bifrost -- --ignored --nocapture
+```
+
+Set `GAVMO_TEST_BIFROST_DATA_DIR` to a dir with Bifrost's datasheets to skip
+their download.
+
 ## Coverage
 
 CI fails if the native tests cover less of the code than the floor in
