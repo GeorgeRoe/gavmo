@@ -114,19 +114,23 @@ includes `credentials.db`, `access_tokens.db` and `legacy_credentials/`
   - pasting the ADC JSON into `auth_credentials` instead of using the file.
 
 ## 8. Packaging decision
-- Release builds: a `bundled-bifrost` Cargo feature.
-  - `build.rs` downloads the pinned bifrost-http and its datasheets, checks
-    their sha256, and embeds them zstd-compressed.
-  - The daemon unpacks them on first run to
-    `~/.local/share/gavmo/bin/bifrost-<sha256>`.
-- Dev and tests: no feature. The daemon uses `GAVMO_BIFROST=/path`; without
-  it, `/llm` reports "not configured". `GAVMO_BIFROST` also overrides the
-  bundled copy.
-- Ship Bifrost's Apache-2.0 LICENSE and NOTICE.
+Revised 2026-11-11: GAVMO is distributed as a Nix flake, so Bifrost is a
+Nix package rather than something embedded in the daemon. The original plan
+(a `bundled-bifrost` Cargo feature whose `build.rs` downloaded and embedded
+the binary) is dropped: no build-script downloads, and no 152 MB in the
+daemon binary.
+- `flake.nix`'s `bifrost` package fetches the pinned upstream binary
+  (v2.5.0, sha256-pinned) and installs Bifrost's Apache-2.0 `LICENSE` and
+  `THIRD_PARTY_NOTICES.md` beside it (upstream has no NOTICE file).
+- The wrapped `gavmo` command sets `GAVMO_BIFROST` to it as a default; the
+  user's own `GAVMO_BIFROST` still wins. Dev and tests set it by hand (the
+  flake's dev shell does too); without it, `/llm` reports "not configured".
+- Datasheets are still fetched by Bifrost at startup (about 6-10 s, see 1)
+  unless `GAVMO_BIFROST_DATA_DIR` is set.
 
 ## 9. Implementation outline
 1. Daemon supervises bifrost-http:
-   - binary resolved like qemu: bundled or `GAVMO_BIFROST`;
+   - binary from `GAVMO_BIFROST` (the Nix package sets it, see 8);
    - `-host 127.0.0.2 -port <free>`, app-dir under
      `~/.local/share/gavmo/bifrost`;
    - generated file-only `config.json` (logs store off, datasheets file://);
@@ -143,5 +147,4 @@ includes `credentials.db`, `access_tokens.db` and `legacy_credentials/`
    - provider block as above (static in the image, or per-boot via
      `OPENCODE_CONFIG_CONTENT` written to token.env-style file);
    - this is a base-image change, so workspaces get "reset needed".
-5. Packaging: ship bifrost-http (152 MB) and datasheets in the tarball, or
-   download on first run with sha256 pinned.
+5. Packaging: a pinned Nix package (see 8).

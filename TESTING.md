@@ -180,14 +180,34 @@ are exempt from the panic-family lints through `clippy.toml`.
 
 ## GitHub Actions
 
-All three workflows can also be started by hand ("Run workflow").
+Every workflow can also be started by hand ("Run workflow").
 
 - **CI** (`ci.yml`, on push to `main`): the checks above, except
   `cargo deny`, on the Rust pinned in `rust-toolchain.toml`, plus the
   coverage floor (see "Coverage"). The coverage job installs qemu from apt,
   opens up `/dev/kvm`, and takes virtiofsd from the nixpkgs revision that
   `nix/base/flake.lock` pins (Ubuntu's is older than the 1.13 GAVMO needs),
-  so the real-qemu tests run there too.
+  so the real-qemu tests run there too. The `release-tarball` job builds the
+  release tarball (`scripts/build-release-tarball.sh`: a static musl daemon
+  plus the site assets) and keeps it as an artifact for a week.
+- **Nix** (`nix.yml`, on push to `main`): `nix flake check`, then builds
+  `.#gavmo-from-source` (daemon, Bifrost, base image and the wrapper that
+  puts qemu and virtiofsd on its `PATH`) in Nix's sandbox and runs
+  `scripts/smoke-test-package.sh` on it: version, startup with only the
+  wrapper's defaults, login, serving the wasm bundle, clean shutdown. No VM
+  is booted. Slow (it builds opencode and the image), so expect most of an
+  hour.
+- **Release** (`release.yml`, by hand only, from `main`): bump the
+  workspace `version` in `Cargo.toml` (it must stay `0.y.z` for now), push,
+  then run it with that version. It builds the tarball and the
+  zstd-compressed base image, writes `release.json` (their URLs and hashes,
+  which switch the flake's default package to the prebuilt release),
+  installs and smoke-tests `.#gavmo-bin` from those files, pushes a
+  `release: vX.Y.Z` commit to `main` and publishes the GitHub release, tagged
+  at that commit. It needs to push to `main`: if branch protection forbids
+  `github-actions[bot]` that, allow it or the push step fails (the draft
+  release is then deleted, and nothing is published). If `main` moved during
+  the run, just run it again.
 - **Deny** (`deny.yml`, on push to `main` and daily): `cargo deny`. It is
   the only check whose result changes without a code change, since the
   RustSec database grows daily. A scheduled failure means a new advisory

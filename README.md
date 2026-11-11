@@ -2,6 +2,54 @@
 
 > George's Agent Virtual Machine Orchestrator
 
+## Installing
+
+GAVMO runs on Linux x86-64 hosts with KVM and is installed with Nix, which
+also brings the right qemu and virtiofsd. Nix works on any distribution
+(Ubuntu, Fedora, Arch, ...), alongside the system package manager.
+
+1. **Install Nix** 2.26 or newer with flakes enabled, if you don't have it.
+   The [Determinate Systems installer](https://determinate.systems/nix-installer/)
+   does both:
+   ```sh
+   curl -fsSL https://install.determinate.systems/nix | sh -s -- install
+   ```
+   Open a new shell afterwards.
+2. **Make sure you can use KVM.** `ls -l /dev/kvm` should exist and be
+   accessible to you; on most distributions that means being in the `kvm`
+   group (`sudo usermod -aG kvm "$USER"`, then log out and back in).
+3. **Install GAVMO:**
+   ```sh
+   nix profile install github:GeorgeRoe/gavmo
+   ```
+   This downloads the latest release: the daemon, the [Bifrost](https://github.com/maximhq/bifrost)
+   model gateway, and the VM base image (about 570 MB compressed, 2.6 GB on
+   disk).
+4. **Run it:** `gavmo`. It prints a login URL for the control panel
+   (`http://localhost:3000/login?token=...`; see "Logging in to the control
+   panel"). Stop it with Ctrl-C.
+
+Upgrade with `nix profile upgrade gavmo`. If a release changes the base
+image, existing workspaces show "base image updated - reset needed" until
+you Reset them; the repo and opencode sessions are kept.
+
+What else the host needs:
+
+- **An OS keyring** (Secret Service, e.g. GNOME Keyring or KWallet, as on
+  any desktop) to store tool credentials. Without one GAVMO still runs, but
+  can't save credentials for `gavmo.yaml` tools.
+- **Models** come from Vertex AI through your Google Cloud credentials (see
+  "Models" under Architecture): run `gcloud auth application-default login`,
+  then start GAVMO with your project, e.g.
+  `GAVMO_GCP_PROJECT=my-project gavmo`. Without that, VMs still boot and
+  opencode opens, but model requests fail with "model gateway is not
+  configured". On the first start with a project set, Bifrost downloads its
+  model datasheets (about 27 MB) from the internet.
+
+To build everything from source instead (compiles the daemon, opencode and
+the VM image; slow), use `nix profile install github:GeorgeRoe/gavmo#gavmo-from-source`.
+Releases are made by `.github/workflows/release.yml`; see TESTING.md.
+
 ## Architecture
 
 A host daemon boots one QEMU/KVM NixOS VM per repository and runs
@@ -107,12 +155,15 @@ Tool gateway and secrets:
 
 The daemon drives QEMU directly, and each VM's filesystem shares run over
 **virtiofs**, which needs a `virtiofsd` binary on `PATH` in addition to
-`qemu-system-x86_64` - both must be present when you launch it, e.g.:
+`qemu-system-x86_64` - both must be present when you launch it. (The
+installed `gavmo` command brings both.) On a Nix host, the flake's dev shell
+has them, the Rust/Leptos toolchain and `GAVMO_BIFROST`:
 
 ```sh
-nix-shell -p qemu virtiofsd --command 'env \
+nix build .#base-image
+nix develop --command env \
   GAVMO_BASE_IMAGE="$(readlink -f result/nixos.qcow2)" \
-  cargo leptos watch --project gavmo'
+  cargo leptos watch --project gavmo
 ```
 
 Forgetting `virtiofsd` fails a VM boot immediately with `failed to spawn
@@ -123,8 +174,8 @@ almost certainly why.
 `virtiofsd` must be **1.13.0 or newer**, the first release with
 `--translate-uid` and `--readonly`. Older ones, such as Ubuntu 24.04's
 package, are refused before qemu starts with `virtiofsd X is too old`;
-use nixpkgs' (`nix-shell -p virtiofsd`, as above) or `cargo install
-virtiofsd` instead.
+use nixpkgs' (the dev shell's, or `nix-shell -p virtiofsd`) or `cargo
+install virtiofsd` instead.
 
 This repo's own `gavmo.nix` sets up a GAVMO VM for developing GAVMO itself
 (Rust toolchain, `cargo-leptos`, `wasm-bindgen-cli`, `binaryen`, headless

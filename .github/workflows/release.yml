@@ -1,0 +1,218 @@
+# Publishes a release: builds the static daemon tarball and the compressed
+# base image, commits a release.json naming them (which makes the flake's
+# default package install them), tags that commit vX.Y.Z and publishes the
+# GitHub release with both files attached.
+#
+# Run it from main (Actions > Release > Run workflow) after bumping the
+# workspace version in Cargo.toml. Nothing is published until both
+# artifacts are built and the flake has installed and smoke-tested them. If
+# anything fails before release.json reaches main (including the push
+# itself: main moved, or branch protection), the draft release is deleted
+# and the run can simply be repeated.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v. Must match Cargo.toml and stay below 1.0.0."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One release at a time; never cancel one half-way through.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the version and ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$VERSION" =~ ^0\.[0-9]+\.[0-9]+$ ]] ||
+            fail "version '$VERSION' must be 0.Y.Z (GAVMO stays below 1.0.0 for now)"
+          cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          [ "$VERSION" = "$cargo_version" ] ||
+            fail "version $VERSION does not match Cargo.toml's $cargo_version; bump Cargo.toml first"
+          [ "$GITHUB_REF" = refs/heads/main ] || fail "run this workflow from main, not $GITHUB_REF"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" > /dev/null 2>&1; then
+            fail "tag v$VERSION already exists"
+          fi
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            fail "a release (perhaps a leftover draft) named v$VERSION already exists"
+          fi
+
+  tarball:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # No rust-cache: a release builds from scratch, not from a cache that
+      # any main-branch run could have written.
+      - name: Install musl-tools and binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools binaryen
+      - name: Read wasm-bindgen version from Cargo.lock
+        run: |
+          v=$(awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/"/, "", $3); print $3 }' Cargo.lock)
+          test -n "$v" || { echo "::error::wasm-bindgen not found in Cargo.lock"; exit 1; }
+          echo "WASM_BINDGEN_VERSION=$v" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }},cargo-leptos
+      - run: scripts/build-release-tarball.sh "$VERSION" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarball
+          path: dist/gavmo-${{ inputs.version }}-x86_64-linux.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      # Before installing Nix, so its daemon detects the `kvm` feature.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: Build the base image
+        run: nix build -L .#base-image
+      # --long=27 needs the same window to decompress; flake.nix passes it.
+      # A GitHub release asset must be under 2 GiB.
+      - name: Compress the image
+        run: |
+          mkdir -p dist
+          asset="dist/gavmo-base-image-$VERSION.qcow2.zst"
+          zstd -19 --long=27 -T0 result/nixos.qcow2 -o "$asset"
+          size=$(stat -c %s "$asset")
+          echo "compressed image: $size bytes"
+          [ "$size" -lt 2147483648 ] ||
+            { echo "::error::the compressed image is over GitHub's 2 GiB asset limit"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: dist/gavmo-base-image-${{ inputs.version }}.qcow2.zst
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [tarball, image]
+    runs-on: ubuntu-latest
+    permissions:
+      # Pushing the release.json commit, creating the tag and the release.
+      contents: write
+    steps:
+      # Credentials kept: this job pushes to main.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+      - name: Write and commit release.json
+        run: |
+          tarball="gavmo-$VERSION-x86_64-linux.tar.gz"
+          image="gavmo-base-image-$VERSION.qcow2.zst"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tarball_url "$base/$tarball" \
+            --arg tarball_hash "$(nix hash file "dist/$tarball")" \
+            --arg image_url "$base/$image" \
+            --arg image_hash "$(nix hash file "dist/$image")" \
+            '{
+              version: $version,
+              tarball: { url: $tarball_url, hash: $tarball_hash },
+              image: { url: $image_url, hash: $image_hash }
+            }' > release.json
+          cat release.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add release.json
+          git commit -m "release: v$VERSION"
+      # Installs exactly what users will get. The assets aren't downloadable
+      # yet, so they're put in the store at the paths fetchurl expects.
+      - name: Install and smoke-test the prebuilt package
+        run: |
+          for file in dist/*; do nix store add --mode flat "$file"; done
+          nix build -L .#gavmo-bin
+          scripts/smoke-test-package.sh result/bin/gavmo "$VERSION"
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          Install with Nix (see the README for the KVM and keyring prerequisites):
+
+              nix profile install github:$GITHUB_REPOSITORY
+
+          or upgrade an existing install with \`nix profile upgrade gavmo\`.
+
+          After upgrading, workspaces created on an older base image show
+          "reset needed" if the image changed.
+          EOF
+          gh release create "v$VERSION" --draft --title "v$VERSION" --notes-file notes.md \
+            dist/gavmo-*.tar.gz dist/gavmo-base-image-*.qcow2.zst
+      # Fails if main moved since this run started: rerun from the new main.
+      - name: Push release.json to main
+        id: push
+        run: git push origin HEAD:refs/heads/main
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "v$VERSION" --target "$(git rev-parse HEAD)" --draft=false
+      - name: Check the published assets
+        run: |
+          for asset in tarball image; do
+            url=$(jq -er ".$asset.url" release.json)
+            hash=$(jq -er ".$asset.hash" release.json)
+            curl -fsSL --retry 5 "$url" -o "/tmp/$asset"
+            [ "$(nix hash file "/tmp/$asset")" = "$hash" ] ||
+              { echo "::error::$url does not match release.json"; exit 1; }
+          done
+      # Only while main doesn't name the draft's assets yet. If the push went
+      # through but publishing failed, the draft is kept: publish it by hand
+      # (Releases > Edit, target the "release: vX.Y.Z" commit).
+      - name: Delete the draft release on failure
+        if: failure() && steps.push.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "v$VERSION" --yes
+            echo "::warning::deleted the draft release v$VERSION; fix the failure and rerun"
+          fi
