@@ -10,8 +10,9 @@
 # Cargo.toml's workspace version.
 #
 # Needs: the toolchain from rust-toolchain.toml (including its musl
-# target), a C compiler for the musl target (Ubuntu: `musl-tools`, for
-# ring), cargo-leptos, a wasm-bindgen CLI matching Cargo.lock, binaryen's
+# target), a C compiler for the musl target (for ring: `musl-gcc` from
+# Ubuntu's `musl-tools`, or one named by CC_x86_64_unknown_linux_musl, as
+# scripts/ci-install-musl-cc.sh sets up), cargo-leptos, a wasm-bindgen CLI matching Cargo.lock, binaryen's
 # wasm-opt, and readelf.
 set -euo pipefail
 
