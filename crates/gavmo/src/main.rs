@@ -54,6 +54,12 @@ mod daemon {
     }
 
     pub(crate) async fn main() -> ExitCode {
+        if let Some(arg) = std::env::args().nth(1)
+            && matches!(arg.as_str(), "--version" | "-V")
+        {
+            print_version();
+            return ExitCode::SUCCESS;
+        }
         init_tracing();
         match run().await {
             Ok(()) => ExitCode::SUCCESS,
@@ -62,6 +68,11 @@ mod daemon {
                 ExitCode::FAILURE
             }
         }
+    }
+
+    #[expect(clippy::print_stdout, reason = "`--version` output is for the user")]
+    fn print_version() {
+        println!("gavmo {}", env!("CARGO_PKG_VERSION"));
     }
 
     /// Logs to stderr at `info` by default; override with `RUST_LOG`.

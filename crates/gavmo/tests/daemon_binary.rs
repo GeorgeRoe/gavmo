@@ -110,6 +110,23 @@ mod tests {
         );
     }
 
+    /// `--version` / `-V` print the version and exit, needing no
+    /// configuration at all (no base image here).
+    #[test]
+    fn version_flag_prints_the_version_and_exits() {
+        let env = Env::new();
+        for flag in ["--version", "-V"] {
+            let mut command = env.command();
+            command.env_remove("GAVMO_BASE_IMAGE").arg(flag);
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("gavmo {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+
     #[test]
     fn startup_refuses_a_missing_base_image() {
         let env = Env::new();
