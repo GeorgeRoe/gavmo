@@ -195,13 +195,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release edit "v$VERSION" --target "$(git rev-parse HEAD)" --draft=false
+      # Downloaded through the API rather than from the plain URLs, which
+      # need authentication while the repo is private.
       - name: Check the published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          mkdir -p /tmp/published
           for asset in tarball image; do
             url=$(jq -er ".$asset.url" release.json)
             hash=$(jq -er ".$asset.hash" release.json)
-            curl -fsSL --retry 5 "$url" -o "/tmp/$asset"
-            [ "$(nix hash file "/tmp/$asset")" = "$hash" ] ||
+            name=${url##*/}
+            gh release download "v$VERSION" --pattern "$name" --dir /tmp/published
+            [ "$(nix hash file "/tmp/published/$name")" = "$hash" ] ||
               { echo "::error::$url does not match release.json"; exit 1; }
           done
       # Only while main doesn't name the draft's assets yet. If the push went
