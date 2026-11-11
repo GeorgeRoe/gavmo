@@ -31,9 +31,28 @@ if [ "$version" != "$cargo_version" ]; then
   exit 1
 fi
 
-# The musl target links a fully static binary. The site assets don't
-# depend on the server's target.
-cargo leptos build --release --cargo-locked --bin-cargo-args="--target=$triple"
+# The site (wasm, JS, CSS) from cargo-leptos as usual.
+cargo leptos build --release --cargo-locked --frontend-only
+
+# The server for the musl target, which links a fully static binary.
+# cargo-leptos can't do this half: it only looks for the server binary in
+# target/release/ (unless `bin-target-triple` is set in Cargo.toml, which
+# would apply to dev builds too). So this is the `cargo build` it would run,
+# with the environment it would set; the values are crates/gavmo's
+# [package.metadata.leptos]. Keep them in step with it. (The "dropping
+# unsupported crate type `cdylib`" warning is expected: the lib is also
+# built for wasm, where it is a cdylib.)
+LEPTOS_OUTPUT_NAME=gavmo \
+  LEPTOS_SITE_ROOT=target/site \
+  LEPTOS_SITE_PKG_DIR=pkg \
+  LEPTOS_SITE_ADDR=127.0.0.1:3000 \
+  LEPTOS_RELOAD_PORT=3001 \
+  LEPTOS_LIB_DIR=crates/gavmo \
+  LEPTOS_BIN_DIR=crates/gavmo \
+  LEPTOS_HASH_FILES=false \
+  LEPTOS_JS_MINIFY=true \
+  cargo build --locked --release --target="$triple" \
+  --package=gavmo --bin=gavmo --no-default-features --features=ssr
 
 bin="${CARGO_TARGET_DIR:-target}/$triple/release/gavmo"
 # cargo-leptos puts the site under the workspace's target/, whatever
