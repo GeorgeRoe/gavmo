@@ -1,8 +1,7 @@
 .dafnai
 target
 result
+result-*
 .gavmo/vm
 .gavmo/opencode
 .gavmo/proc
-# Local sample workspace for trying the Bifrost model gateway.
-testing-bifrost
