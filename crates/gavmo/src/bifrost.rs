@@ -85,6 +85,9 @@ pub struct BifrostConfig {
     /// Optional dir holding Bifrost's datasheets (`datasheet.json`,
     /// `model-parameters.json`), so it starts without downloading them.
     pub data_dir: Option<PathBuf>,
+    /// Port on [`BIND_ADDR`] to listen on (`--bifrost-port`); `None` picks a
+    /// free one at startup.
+    pub port: Option<u16>,
 }
 
 /// Bifrost's `config.json` for `cfg`: file-only (no config store, so no
@@ -176,15 +179,16 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    /// Writes Bifrost's config and starts it in the background on a free
-    /// port on [`BIND_ADDR`]. Returns once it is spawned, not once it is
-    /// ready; requests before then fail as "starting".
+    /// Writes Bifrost's config and starts it in the background on
+    /// [`BifrostConfig::port`] (or a free port) on [`BIND_ADDR`]. Returns once
+    /// it is spawned, not once it is ready; requests before then fail as
+    /// "starting".
     pub fn start(cfg: BifrostConfig) -> io::Result<Arc<Self>> {
         check_executable(&cfg.binary)?;
+        let addr = available_addr(cfg.port)?;
         vm::create_private_dir_all(&cfg.app_dir).map_err(io::Error::other)?;
         let config = serde_json::to_vec_pretty(&render_config(&cfg)).map_err(io::Error::other)?;
         crate::atomic_file::write_atomically(&cfg.app_dir.join("config.json"), &config)?;
-        let addr = free_port()?;
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(supervise(cfg, addr, stopped));
         Ok(Arc::new(Self { addr, task, stop }))
@@ -232,10 +236,14 @@ fn check_executable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// A currently free port on [`BIND_ADDR`]. (Racy, but only another local
-/// process grabbing it in between can break it; the restart loop retries.)
-fn free_port() -> io::Result<SocketAddr> {
-    std::net::TcpListener::bind((BIND_ADDR, 0))?.local_addr()
+/// `port` on [`BIND_ADDR`] if it is currently free, or any free port for
+/// `None`. (Racy, but only another local process grabbing it in between can
+/// break it; the restart loop retries.)
+fn available_addr(port: Option<u16>) -> io::Result<SocketAddr> {
+    let wanted = SocketAddr::from((BIND_ADDR, port.unwrap_or(0)));
+    std::net::TcpListener::bind(wanted)
+        .and_then(|listener| listener.local_addr())
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot listen on {wanted}: {e}")))
 }
 
 /// Runs Bifrost until told to stop, restarting it with backoff whenever it
@@ -351,6 +359,7 @@ mod tests {
             gcp: GcpSettings::new("my-project-1", "global").unwrap(),
             credentials_file: dir.join("adc.json"),
             data_dir: None,
+            port: None,
         }
     }
 
@@ -500,5 +509,40 @@ mod tests {
                     .is_ok_and(|s| s.contains(") Z "))
         })
         .await;
+    }
+
+    /// `--bifrost-port` pins the port (still on 127.0.0.2); one already in
+    /// use is refused up front rather than left to fail in the background.
+    #[tokio::test]
+    async fn a_configured_port_is_used_or_refused_if_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = fake_binary(tmp.path(), "exec sleep 600");
+        let port = std::net::TcpListener::bind((BIND_ADDR, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let supervisor = Supervisor::start(BifrostConfig {
+            port: Some(port),
+            ..cfg(tmp.path(), binary.clone())
+        })
+        .unwrap();
+        assert_eq!(supervisor.base_url(), format!("http://127.0.0.2:{port}"));
+        supervisor.shutdown().await;
+
+        let taken = std::net::TcpListener::bind((BIND_ADDR, 0)).unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let Err(e) = Supervisor::start(BifrostConfig {
+            port: Some(taken_port),
+            ..cfg(tmp.path(), binary)
+        }) else {
+            panic!("started on a port in use");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            e.to_string().contains(&format!("127.0.0.2:{taken_port}")),
+            "{e}"
+        );
     }
 }

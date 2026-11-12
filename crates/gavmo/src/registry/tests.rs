@@ -346,6 +346,7 @@ fn scripted_app_state() -> (
     let state = AppState::with_data_dir(
         base_image,
         Path::new("/nonexistent/gavmo-test-gcloud"),
+        mcp::DEFAULT_MCP_PORT,
         data.path(),
         Some(Path::new("/nonexistent/gavmo-test-home")),
         &data.path().join("run"),
@@ -1554,18 +1555,21 @@ async fn write_owner_only_creates_and_resets_mode_0600() {
     assert_eq!(std::fs::read(&path).unwrap(), b"b");
 }
 
-/// Minting writes `token.env`; the token is not valid until a slot
-/// holds it.
+/// Minting writes `token.env` (with the gateway port the guest builds its
+/// URLs from); the token is not valid until a slot holds it.
 #[tokio::test]
 async fn a_minted_token_is_written_but_only_valid_once_installed() {
     let (_data, state) = test_app_state();
     let (_tmp, dir) = unique_temp_dir("mcp-token-mint");
 
-    let token = mint_mcp_token(&dir).await.unwrap();
+    let token = mint_mcp_token(&dir, 8123).await.unwrap();
     let contents = tokio::fs::read_to_string(dir.join("token.env"))
         .await
         .unwrap();
-    assert_eq!(contents, format!("GAVMO_MCP_TOKEN={token}\n"));
+    assert_eq!(
+        contents,
+        format!("GAVMO_MCP_TOKEN={token}\nGAVMO_HOST_PORT=8123\n")
+    );
     assert_eq!(TokenAuthority::resolve(&state, &token), None);
 }
 
@@ -1631,6 +1635,7 @@ async fn an_unreadable_secret_store_is_an_error_not_unconfigured() {
     let state = AppState::with_data_dir(
         PathBuf::from("/nonexistent/base.qcow2"),
         Path::new("/nonexistent/gcloud"),
+        mcp::DEFAULT_MCP_PORT,
         data.path(),
         Some(Path::new("/nonexistent/home")),
         &data.path().join("run"),

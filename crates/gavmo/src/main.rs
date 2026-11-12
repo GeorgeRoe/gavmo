@@ -4,32 +4,81 @@
 
 #[cfg(feature = "ssr")]
 mod daemon {
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::process::ExitCode;
 
     use anyhow::{Context as _, Result, anyhow, bail};
+    use clap::Parser as _;
     use gavmo::auth;
     use gavmo::bifrost::{BifrostConfig, GcpSettings, Supervisor, Upstream};
     use gavmo::registry::AppState;
     use leptos::prelude::get_configuration;
 
+    /// Default control-panel port.
+    const DEFAULT_UI_PORT: u16 = 3000;
+
+    /// The GAVMO daemon: serves the control panel, the guest-facing MCP and
+    /// model gateway, and supervises the model gateway's Bifrost process.
+    ///
+    /// Every option can also be set through the environment variable shown;
+    /// a flag beats its variable. Further settings (`GAVMO_GCLOUD_DIR`,
+    /// `GAVMO_BIFROST`, `GAVMO_GCP_PROJECT`, ...) are environment-only.
+    #[derive(clap::Parser, Debug)]
+    #[command(name = "gavmo", version)]
+    struct Cli {
+        /// The NixOS base image (qcow2) that workspace VMs boot from.
+        #[arg(env = "GAVMO_BASE_IMAGE", value_name = "BASE_IMAGE")]
+        base_image: Option<PathBuf>,
+
+        /// Port for the control panel (the web UI), on 127.0.0.1.
+        #[arg(long, env = "GAVMO_UI_PORT", value_name = "PORT",
+              default_value_t = DEFAULT_UI_PORT, value_parser = port_parser())]
+        ui_port: u16,
+
+        /// Port for the gateway guests reach for tools (/mcp) and models
+        /// (/llm), on 127.0.0.1. Guests are told it at boot.
+        #[arg(long, env = "GAVMO_MCP_PORT", value_name = "PORT",
+              default_value_t = mcp::DEFAULT_MCP_PORT, value_parser = port_parser())]
+        mcp_port: u16,
+
+        /// Port for Bifrost, the model gateway's backend, on 127.0.0.2 (out of
+        /// guests' reach) [default: any free port]
+        #[arg(long, env = "GAVMO_BIFROST_PORT", value_name = "PORT", value_parser = port_parser())]
+        bifrost_port: Option<u16>,
+    }
+
+    /// Ports 1-65535: port 0 would mean "any", which no URL can name.
+    fn port_parser() -> clap::builder::RangedI64ValueParser<u16> {
+        clap::value_parser!(u16).range(1..)
+    }
+
     /// Startup configuration from the CLI and environment.
+    #[derive(Debug)]
     struct Config {
         base_image: PathBuf,
         gcloud_dir: PathBuf,
+        ui_port: u16,
+        mcp_port: u16,
+        bifrost_port: Option<u16>,
     }
 
     impl Config {
-        fn from_env() -> Result<Self> {
-            let base_image = std::env::args()
-                .nth(1)
-                .or_else(|| std::env::var("GAVMO_BASE_IMAGE").ok())
-                .map(PathBuf::from)
-                .context(
-                    "no base image. Pass it as the first argument or set \
-                     GAVMO_BASE_IMAGE=/path/to/nixos.qcow2",
-                )?;
+        fn new(cli: Cli) -> Result<Self> {
+            let base_image = cli.base_image.context(
+                "no base image. Pass it as the first argument or set \
+                 GAVMO_BASE_IMAGE=/path/to/nixos.qcow2",
+            )?;
+
+            // Both on 127.0.0.1; Bifrost is on 127.0.0.2, so any port is fine
+            // for it.
+            if cli.ui_port == cli.mcp_port {
+                bail!(
+                    "the control panel and the MCP gateway need different ports, \
+                     both are {} (see --ui-port and --mcp-port)",
+                    cli.ui_port
+                );
+            }
 
             // No relative fallback: it would resolve against the daemon's
             // working directory and hand whatever lives there to the model gateway.
@@ -49,30 +98,24 @@ mod daemon {
             Ok(Self {
                 base_image,
                 gcloud_dir,
+                ui_port: cli.ui_port,
+                mcp_port: cli.mcp_port,
+                bifrost_port: cli.bifrost_port,
             })
         }
     }
 
     pub(crate) async fn main() -> ExitCode {
-        if let Some(arg) = std::env::args().nth(1)
-            && matches!(arg.as_str(), "--version" | "-V")
-        {
-            print_version();
-            return ExitCode::SUCCESS;
-        }
+        // Exits on `--help`, `--version` and usage errors (status 2).
+        let cli = Cli::parse();
         init_tracing();
-        match run().await {
+        match run(cli).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 tracing::error!("{e:#}");
                 ExitCode::FAILURE
             }
         }
-    }
-
-    #[expect(clippy::print_stdout, reason = "`--version` output is for the user")]
-    fn print_version() {
-        println!("gavmo {}", env!("CARGO_PKG_VERSION"));
     }
 
     /// Logs to stderr at `info` by default; override with `RUST_LOG`.
@@ -85,9 +128,9 @@ mod daemon {
             .init();
     }
 
-    async fn run() -> Result<()> {
-        let config = Config::from_env()?;
-        let app_state = AppState::new(config.base_image, &config.gcloud_dir)
+    async fn run(cli: Cli) -> Result<()> {
+        let config = Config::new(cli)?;
+        let app_state = AppState::new(config.base_image, &config.gcloud_dir, config.mcp_port)
             .context("failed to initialize GAVMO state")?;
 
         warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);
@@ -99,16 +142,19 @@ mod daemon {
             .await
             .context("failed to load the control-panel token or sessions")?;
 
-        let conf = get_configuration(None).context("failed to load Leptos configuration")?;
-        let ui_addr = conf.leptos_options.site_addr;
+        let mut conf = get_configuration(None).context("failed to load Leptos configuration")?;
+        // `--ui-port` decides the address, not Leptos's `site-addr`
+        // (`LEPTOS_SITE_ADDR`), which is only a build-time setting here.
+        let ui_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.ui_port));
+        conf.leptos_options.site_addr = ui_addr;
         let ui_router = gavmo::daemon::ui_router(conf.leptos_options, &app_state, &auth);
 
-        let llm = start_model_gateway(&config.gcloud_dir);
+        let llm = start_model_gateway(&config.gcloud_dir, config.bifrost_port);
 
         // Separate port from the UI: guests must reach the bearer-authenticated
         // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
         let mcp_router = gavmo::daemon::mcp_router(&app_state, llm.clone());
-        let mcp_addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, mcp::GAVMO_MCP_PORT));
+        let mcp_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.mcp_port));
 
         // Bind both before announcing anything, so a port clash fails fast.
         let mcp_listener = bind(mcp_addr, "MCP gateway").await?;
@@ -143,10 +189,10 @@ mod daemon {
     /// `GAVMO_BIFROST` (the `bifrost-http` binary) and `GAVMO_GCP_PROJECT`
     /// are required, `GAVMO_GCP_REGION` defaults to `global`, and
     /// `GAVMO_BIFROST_DATA_DIR` optionally holds its datasheets. Otherwise
-    /// the daemon runs without one and guests' model requests fail with the
-    /// reason (logged here too).
-    fn start_model_gateway(gcloud_dir: &std::path::Path) -> Upstream {
-        match model_gateway_config(gcloud_dir).and_then(|cfg| {
+    /// (or if it can't start, e.g. `port` is taken) the daemon runs without
+    /// one and guests' model requests fail with the reason (logged here too).
+    fn start_model_gateway(gcloud_dir: &std::path::Path, port: Option<u16>) -> Upstream {
+        match model_gateway_config(gcloud_dir, port).and_then(|cfg| {
             Supervisor::start(cfg).map_err(|e| format!("cannot start Bifrost: {e}"))
         }) {
             Ok(supervisor) => Upstream::Bifrost(supervisor),
@@ -159,6 +205,7 @@ mod daemon {
 
     fn model_gateway_config(
         gcloud_dir: &std::path::Path,
+        port: Option<u16>,
     ) -> std::result::Result<BifrostConfig, String> {
         let absolute = |var: &str| -> std::result::Result<Option<PathBuf>, String> {
             match std::env::var_os(var).map(PathBuf::from) {
@@ -194,6 +241,7 @@ mod daemon {
             gcp,
             credentials_file,
             data_dir: absolute("GAVMO_BIFROST_DATA_DIR")?,
+            port,
         })
     }
 

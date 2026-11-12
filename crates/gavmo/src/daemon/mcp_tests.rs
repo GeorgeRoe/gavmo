@@ -83,8 +83,8 @@ impl Daemon {
         let env =
             std::fs::read_to_string(self.data.path().join("mcp").join(hash).join("token.env"))
                 .unwrap();
-        env.trim()
-            .strip_prefix("GAVMO_MCP_TOKEN=")
+        env.lines()
+            .find_map(|line| line.strip_prefix("GAVMO_MCP_TOKEN="))
             .unwrap()
             .to_owned()
     }

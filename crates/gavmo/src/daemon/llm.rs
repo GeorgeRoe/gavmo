@@ -482,6 +482,7 @@ mod tests {
             data_dir: std::env::var("GAVMO_TEST_BIFROST_DATA_DIR")
                 .ok()
                 .map(Into::into),
+            port: None,
         })
         .unwrap();
         let app = app(Upstream::Bifrost(Arc::clone(&supervisor)));

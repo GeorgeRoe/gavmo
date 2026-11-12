@@ -1,6 +1,13 @@
 { lib, pkgs, config, ... }:
 
 let
+  # The host daemon's guest-facing gateway (MCP tools at /mcp, models at
+  # /llm). 10.0.2.2 is the host under QEMU user-mode networking. The port is
+  # the daemon's `--mcp-port`, which it writes into each boot's token.env
+  # (`GAVMO_HOST_PORT`, next to `GAVMO_MCP_TOKEN`), so the image doesn't have to
+  # match it. opencode substitutes `{env:...}` anywhere in a config string.
+  hostGateway = "http://10.0.2.2:{env:GAVMO_HOST_PORT}";
+
   # opencode web UI source patches, verified against opencode v1.18.35.
   #
   # Default-on UI toggles: these Settings > General toggles exist only in the
@@ -445,9 +452,8 @@ in
     default_agent = "plan";
 
     # Models are served by the host: the `gavmo` provider talks to the
-    # daemon's /llm route (10.0.2.2 is the host under QEMU user-mode
-    # networking; 7071 must match `mcp::GAVMO_MCP_PORT`), authenticated with
-    # this boot's workspace token. The daemon forwards to its model gateway
+    # daemon's /llm route (see `hostGateway`), authenticated with this boot's
+    # workspace token. The daemon forwards to its model gateway
     # (Bifrost), which holds the user's provider credentials - the guest has
     # none. `id` is the model name Bifrost routes (provider/model).
     model = "gavmo/claude-sonnet-5-5";
@@ -475,7 +481,7 @@ in
         # Bundled with opencode: nothing is fetched at runtime.
         npm = "@ai-sdk/anthropic";
         options = {
-          baseURL = "http://10.0.2.2:7071/llm/anthropic/v1";
+          baseURL = "${hostGateway}/llm/anthropic/v1";
           apiKey = "{env:GAVMO_MCP_TOKEN}";
         };
         models = {
@@ -485,14 +491,13 @@ in
         };
       };
 
-    # Host-side tool gateway. 10.0.2.2 is the host under QEMU user-mode
-    # networking; 7071 must match `mcp::GAVMO_MCP_PORT` (kept in sync by hand).
-    # Always enabled: the gateway filters tools per bearer token, returning an
-    # empty list rather than an error. GAVMO_MCP_TOKEN comes from gavmo-opencode's
+    # Host-side tool gateway (see `hostGateway`). Always enabled: the gateway
+    # filters tools per bearer token, returning an empty list rather than an
+    # error. GAVMO_MCP_TOKEN and GAVMO_HOST_PORT come from gavmo-opencode's
     # EnvironmentFile.
     mcp.gavmo-tools = {
       type = "remote";
-      url = "http://10.0.2.2:7071/mcp";
+      url = "${hostGateway}/mcp";
       enabled = true;
       headers.Authorization = "Bearer {env:GAVMO_MCP_TOKEN}";
     };
@@ -708,9 +713,11 @@ in
       # Not mkDefault: only blocks creating setuid files, not running sudo.
       RestrictSUIDSGID = true;
 
-      # GAVMO_MCP_TOKEN (for both the tool gateway and the model provider), read as root before dropping privileges. `-` makes a
-      # missing file non-fatal: there's no ordering on the mcp mount, so the
-      # service may start tokenless and pick it up on a later restart.
+      # GAVMO_MCP_TOKEN (for both the tool gateway and the model provider)
+      # and GAVMO_HOST_PORT (the gateway's host port), read as root before
+      # dropping privileges. `-` makes a missing file non-fatal: there's no
+      # ordering on the mcp mount, so the service may start tokenless and pick
+      # it up on a later restart.
       EnvironmentFile = "-/etc/gavmo/mcp/token.env";
       Restart = "always";
       RestartSec = "1";

@@ -49,6 +49,9 @@ http-body = { version = "1", optional = true }
 # Host-side HTTP forwarder. rustls (not native-tls) avoids an OpenSSL
 # build/system dependency.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# The daemon binary's command line (`--ui-port`, ...). No `color` or
+# `suggestions`: plain output, fewer deps.
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"], optional = true }
 
 # hydrate-only (wasm32 browser build) dependencies.
 console_error_panic_hook = { version = "0.1", optional = true }
@@ -113,6 +116,7 @@ ssr = [
     "dep:reqwest",
     "dep:http-body-util",
     "dep:http-body",
+    "dep:clap",
     "dep:web-sys",
     "leptos/ssr",
     "leptos_meta/ssr",

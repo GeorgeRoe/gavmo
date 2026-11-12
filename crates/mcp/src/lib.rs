@@ -28,10 +28,10 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 
-/// Host port the gateway listens on; the same for every workspace (only the
-/// token differs). Hardcoded as `http://10.0.2.2:7071/mcp` in
-/// `nix/base/configuration.nix` - keep the two in sync by hand.
-pub const GAVMO_MCP_PORT: u16 = 7071;
+/// Default host port of the gateway (the daemon's `--mcp-port`); the same for
+/// every workspace (only the token differs). Guests learn the actual port from
+/// their token share (`GAVMO_HOST_PORT`), so the image doesn't hardcode it.
+pub const DEFAULT_MCP_PORT: u16 = 7071;
 
 /// Largest JSON-RPC request body accepted. Tool arguments are small; this
 /// keeps one request from making the daemon buffer megabytes.

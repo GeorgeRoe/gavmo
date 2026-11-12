@@ -27,7 +27,8 @@ also brings the right qemu and virtiofsd. Nix works on any distribution
    disk).
 4. **Run it:** `gavmo`. It prints a login URL for the control panel
    (`http://localhost:3000/login?token=...`; see "Logging in to the control
-   panel"). Stop it with Ctrl-C.
+   panel"). Stop it with Ctrl-C. `gavmo --help` lists its options; see
+   "Ports" to run it on other ports.
 
 Upgrade with `nix profile upgrade gavmo`. If a release changes the base
 image, existing workspaces show "base image updated - reset needed" until
@@ -49,6 +50,27 @@ What else the host needs:
 To build everything from source instead (compiles the daemon, opencode and
 the VM image; slow), use `nix profile install github:GeorgeRoe/gavmo#gavmo-from-source`.
 Releases are made by `.github/workflows/release.yml`; see TESTING.md.
+
+### Ports
+
+The daemon listens on three ports, each settable with a flag or an
+environment variable (the flag wins):
+
+| Flag | Variable | Default | What |
+|---|---|---|---|
+| `--ui-port` | `GAVMO_UI_PORT` | `3000` | Control panel, on `127.0.0.1` |
+| `--mcp-port` | `GAVMO_MCP_PORT` | `7071` | Gateway guests call for tools (`/mcp`) and models (`/llm`), on `127.0.0.1` |
+| `--bifrost-port` | `GAVMO_BIFROST_PORT` | any free port | Bifrost (the model backend), on `127.0.0.2` |
+
+```sh
+gavmo --ui-port 4000 --mcp-port 4001
+nix run github:GeorgeRoe/gavmo -- --ui-port 4000 --mcp-port 4001
+```
+
+The UI and MCP ports must differ. Guests are told the MCP port each time
+they boot (VMs never outlive the daemon), so the VM image doesn't depend on
+it. If the Bifrost port is taken, the daemon still starts, without models
+(the reason is logged), as when Bifrost isn't configured.
 
 ## Architecture
 
@@ -89,7 +111,8 @@ Workspaces and VMs:
 - `<repo>/.gavmo/vm/` now holds only guest build output; VM files left there
   by older versions are unused (the daemon logs a hint) and can be deleted.
 - virtiofs shares: repo -> `/workspace` (rw), MCP token dir ->
-  `/etc/gavmo/mcp` (ro). No credentials are shared into VMs.
+  `/etc/gavmo/mcp` (ro; its `token.env` holds the boot's token and the
+  gateway port, `GAVMO_HOST_PORT`). No credentials are shared into VMs.
   Unprivileged `virtiofsd` maps the host owner to guest `agent` (uid 1000).
 - QEMU user-mode NAT forwards a free `127.0.0.1` port to opencode on guest
   port 7080; the guest reaches host loopback via `10.0.2.2`.
@@ -110,7 +133,7 @@ Inside the guest (`nix/base/configuration.nix`):
 Models:
 
 - Guests hold no model credentials. opencode's `gavmo` provider calls
-  `http://10.0.2.2:7071/llm/anthropic/v1` with the boot's workspace token
+  `http://10.0.2.2:<mcp port>/llm/anthropic/v1` with the boot's workspace token
   (the same one as the tool gateway). The daemon checks it, strips it and any
   `x-bf-*` header, and streams the request to its model gateway: a supervised
   [Bifrost](https://github.com/maximhq/bifrost) process holding the user's
@@ -119,9 +142,10 @@ Models:
 - Bifrost runs with a generated file-only config
   (`~/.local/share/gavmo/bifrost/config.json`, log `bifrost.log` beside
   it): no database, no request logging. In that mode it has no inbound auth
-  and a readable admin API, so it binds `127.0.0.2`, which guests can't
-  reach (QEMU maps their `10.0.2.2` only to host `127.0.0.1`). It dies with
-  the daemon and is restarted (with backoff) if it exits.
+  and a readable admin API, so it binds `127.0.0.2` (on `--bifrost-port`,
+  else a free port), which guests can't reach (QEMU maps their `10.0.2.2`
+  only to host `127.0.0.1`). It dies with the daemon and is restarted (with
+  backoff) if it exits.
 - Configuration, for now from the environment:
   - `GAVMO_BIFROST`: absolute path to the `bifrost-http` binary.
   - `GAVMO_GCP_PROJECT`: the Google Cloud project for Vertex AI.
@@ -138,14 +162,15 @@ Models:
 
 Tool gateway and secrets:
 
-- The MCP gateway is `127.0.0.1:7071/mcp`. Each boot mints a bearer token
-  into the token share (outside the repo); Stop/Reset revoke it.
+- The MCP gateway is `127.0.0.1:<mcp port>/mcp` (default 7071). Each boot
+  mints a bearer token into the token share (outside the repo); Stop/Reset
+  revoke it.
 - `gavmo.yaml` is an untrusted request naming tools and secret references;
   the user enters credentials in the UI. Credentials are host-locked to and
   bound to the approved `base_url`; a changed URL fails closed.
 - The vault is one XChaCha20-Poly1305 file whose key is a single OS keystore
   entry; it opens lazily and fails closed without a keystore.
-- Guests can reach the UI port (`:3000`) too, so every route requires a
+- Guests can reach the UI port (`:3000` by default) too, so every route requires a
   session cookie from a host-only token; the daemon prints the login URL.
   Request bodies there are capped at 64 KiB and must arrive within 10 s in
   total; handlers themselves are never timed out, since stop/reset tear
@@ -191,7 +216,8 @@ pinned in `rust-toolchain.toml`, which CI uses. TESTING.md describes the test le
 ## Logging in to the control panel
 
 On start the daemon prints a login URL,
-`http://localhost:3000/login?token=<token>`. The token is persisted in
+`http://localhost:3000/login?token=<token>` (with your `--ui-port`, if
+set). The token is persisted in
 `~/.local/share/gavmo/ui_token` and never leaves the host.
 
 - Open the panel at **`localhost`**, not `127.0.0.1`. Every VM's opencode UI

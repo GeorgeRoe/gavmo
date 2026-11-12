@@ -59,6 +59,9 @@ struct Inner {
     /// Root dir for every workspace's MCP token share
     /// (`~/.local/share/gavmo/mcp`), deliberately outside any repo.
     mcp_base_dir: PathBuf,
+    /// Host port of the guest-facing gateway (`--mcp-port`), told to each
+    /// guest through its token share.
+    mcp_port: u16,
 
     /// Root of every workspace's host-only VM state (`~/.local/share/gavmo/vms`):
     /// disk and console log, outside the repo the guest can write (see
@@ -110,7 +113,8 @@ impl AppState {
     /// `base_image` is the read-only NixOS qcow2 (from `GAVMO_BASE_IMAGE`);
     /// `gcloud_dir` holds the user's Google credentials (used by the model
     /// gateway on the host, never shared into VMs); no workspace may overlap it.
-    pub fn new(base_image: PathBuf, gcloud_dir: &Path) -> io::Result<Self> {
+    /// `mcp_port` is the host port the guest-facing gateway listens on.
+    pub fn new(base_image: PathBuf, gcloud_dir: &Path, mcp_port: u16) -> io::Result<Self> {
         let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
             .join("gavmo");
@@ -123,6 +127,7 @@ impl AppState {
         Self::with_data_dir(
             base_image,
             gcloud_dir,
+            mcp_port,
             &gavmo_data_dir,
             dirs::home_dir().as_deref(),
             &default_runtime_base()?,
@@ -133,9 +138,14 @@ impl AppState {
 
     /// [`Self::new`] with an explicit data dir and secret store, so tests
     /// never touch the user's real `~/.local/share/gavmo` or keyring.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site plus tests; a params struct would only rename them"
+    )]
     pub(crate) fn with_data_dir(
         base_image: PathBuf,
         gcloud_dir: &Path,
+        mcp_port: u16,
         gavmo_data_dir: &Path,
         home_dir: Option<&Path>,
         runtime_base_dir: &Path,
@@ -165,6 +175,7 @@ impl AppState {
                 running: Mutex::new(HashMap::new()),
                 base_image: BaseImage::new(base_image, gavmo_data_dir.join("base-image.json")),
                 mcp_base_dir,
+                mcp_port,
                 vms_base_dir,
                 runtime_base_dir: runtime_base_dir.to_path_buf(),
                 protected_dirs,

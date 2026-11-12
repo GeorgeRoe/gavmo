@@ -230,7 +230,7 @@ const LOGIN_FALLBACK_HTML: &str = r#"<!DOCTYPE html>
 <h1>GAVMO control panel</h1>
 <p>This link is missing or has an invalid token.</p>
 <p>Run <code>gavmo</code> in your terminal and open the URL it prints — it looks like:</p>
-<pre>http://localhost:3000/login?token=&lt;token&gt;</pre>
+<pre>http://localhost:&lt;port&gt;/login?token=&lt;token&gt;</pre>
 </body>
 </html>"#;
 

@@ -227,7 +227,7 @@ impl AppState {
         // Mint the per-boot MCP token only on a real new boot: rotating a
         // running VM's token would break its already-loaded `gavmo-opencode`.
         let mcp_dir = self.mcp_dir_for(id);
-        let token = match mint_mcp_token(&mcp_dir).await {
+        let token = match mint_mcp_token(&mcp_dir, self.inner.mcp_port).await {
             Ok(token) => token,
             Err(e) => {
                 let e = RegistryError::io("writing the MCP token", e);
@@ -613,13 +613,16 @@ pub(super) fn reap_stale_vm_processes(runtime_base: &Path) {
 }
 
 /// Mints a fresh MCP token and writes it to the share dir as `token.env` (the
-/// guest's `GAVMO_MCP_TOKEN`). It becomes valid only once the caller puts it
-/// in a slot (see [`AppState::replace_slot`]).
-pub(super) async fn mint_mcp_token(dir: &Path) -> io::Result<String> {
+/// guest's `GAVMO_MCP_TOKEN`), along with the gateway's host port
+/// (`GAVMO_HOST_PORT`, which the guest's opencode config builds its gateway
+/// URLs from). The token becomes valid only once the caller puts it in a slot
+/// (see [`AppState::replace_slot`]).
+pub(super) async fn mint_mcp_token(dir: &Path, mcp_port: u16) -> io::Result<String> {
     tokio::fs::create_dir_all(dir).await?;
     let token = uuid::Uuid::new_v4().to_string();
     let path = dir.join("token.env");
-    write_owner_only(&path, format!("GAVMO_MCP_TOKEN={token}\n").as_bytes()).await?;
+    let env = format!("GAVMO_MCP_TOKEN={token}\nGAVMO_HOST_PORT={mcp_port}\n");
+    write_owner_only(&path, env.as_bytes()).await?;
     Ok(token)
 }
 

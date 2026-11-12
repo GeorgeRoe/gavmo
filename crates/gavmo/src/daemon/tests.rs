@@ -39,6 +39,7 @@ impl Daemon {
         let state = AppState::with_data_dir(
             base_image,
             Path::new("/nonexistent/gcloud"),
+            mcp::DEFAULT_MCP_PORT,
             data.path(),
             Some(Path::new("/nonexistent/home")),
             &data.path().join("run"),

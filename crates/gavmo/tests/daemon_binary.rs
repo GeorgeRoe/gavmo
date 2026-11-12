@@ -3,9 +3,9 @@
 //! writes goes to temp dirs (`HOME` and the XDG dirs point there), `PATH`
 //! holds only a stand-in browser opener, and no VM is ever booted.
 //!
-//! The MCP gateway port is fixed (guests are configured for it), so the
-//! tests that bind it share one `#[test]` and run in sequence; they fail if
-//! something else, such as a running GAVMO daemon, already holds it.
+//! Each environment gets its own free control-panel and MCP gateway ports
+//! (`--ui-port`, `--mcp-port`), so the tests run in parallel and alongside a
+//! real GAVMO daemon.
 #![cfg(feature = "ssr")]
 
 #[cfg(test)]
@@ -18,12 +18,11 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    const MCP_PORT: u16 = mcp::GAVMO_MCP_PORT;
-
     /// A daemon environment under one temp dir.
     struct Env {
         dir: tempfile::TempDir,
         ui_port: u16,
+        mcp_port: u16,
     }
 
     impl Env {
@@ -53,6 +52,7 @@ mod tests {
             Self {
                 dir,
                 ui_port: free_port(),
+                mcp_port: free_port(),
             }
         }
 
@@ -60,11 +60,16 @@ mod tests {
             self.dir.path().join(sub)
         }
 
-        /// The daemon command, configured for this environment. The coverage
-        /// variables (`LLVM_PROFILE_FILE`) are inherited on purpose.
+        /// The daemon command, configured for this environment (ports through
+        /// the environment, so tests can still override them with flags).
+        /// The coverage variables (`LLVM_PROFILE_FILE`) are inherited on
+        /// purpose; inherited GAVMO port settings are not.
         fn command(&self) -> Command {
             let mut command = Command::new(env!("CARGO_BIN_EXE_gavmo"));
             command
+                .env_remove("GAVMO_BIFROST_PORT")
+                .env("GAVMO_UI_PORT", self.ui_port.to_string())
+                .env("GAVMO_MCP_PORT", self.mcp_port.to_string())
                 .env("PATH", self.path("bin"))
                 .env("HOME", self.path("home"))
                 .env("XDG_DATA_HOME", self.path("data"))
@@ -74,7 +79,6 @@ mod tests {
                 .env("GAVMO_GCLOUD_DIR", self.path("gcloud"))
                 .env("LEPTOS_OUTPUT_NAME", "gavmo")
                 .env("LEPTOS_SITE_ROOT", self.path("site"))
-                .env("LEPTOS_SITE_ADDR", format!("127.0.0.1:{}", self.ui_port))
                 .env("RUST_LOG", "debug")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -125,6 +129,59 @@ mod tests {
                 format!("gavmo {}\n", env!("CARGO_PKG_VERSION"))
             );
         }
+    }
+
+    /// `--help` documents the port flags and their environment variables.
+    #[test]
+    fn help_lists_the_port_options() {
+        let output = Env::new().command().arg("--help").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let help = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "--ui-port <PORT>",
+            "GAVMO_UI_PORT",
+            "--mcp-port <PORT>",
+            "GAVMO_MCP_PORT",
+            "--bifrost-port <PORT>",
+            "GAVMO_BIFROST_PORT",
+            "[BASE_IMAGE]",
+        ] {
+            assert!(
+                help.contains(expected),
+                "{expected:?} missing from:\n{help}"
+            );
+        }
+    }
+
+    /// Bad port values are usage errors (status 2) naming the option, whether
+    /// from a flag or the environment.
+    #[test]
+    fn invalid_ports_are_refused() {
+        let env = Env::new();
+        for (flag, value) in [
+            ("--ui-port", "0"),
+            ("--mcp-port", "65536"),
+            ("--bifrost-port", "http"),
+        ] {
+            let mut command = env.command();
+            command.arg(format!("{flag}={value}"));
+            let (status, stderr) = run_to_exit(command);
+            assert_eq!(status.code(), Some(2), "{stderr}");
+            assert!(stderr.contains(flag), "{flag} {value}: {stderr}");
+        }
+        let mut command = env.command();
+        command.env("GAVMO_MCP_PORT", "not-a-port");
+        let (status, stderr) = run_to_exit(command);
+        assert_eq!(status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("--mcp-port"), "{stderr}");
+    }
+
+    #[test]
+    fn startup_refuses_the_same_port_for_ui_and_mcp() {
+        let env = Env::new();
+        let mut command = env.command();
+        command.arg(format!("--mcp-port={}", env.ui_port));
+        assert_fails_with(command, "need different ports");
     }
 
     #[test]
@@ -238,9 +295,7 @@ mod tests {
     fn the_daemon_binds_both_servers_serves_and_shuts_down_on_signals() {
         let env = Env::new();
 
-        let mcp_holder = TcpListener::bind(("127.0.0.1", MCP_PORT)).unwrap_or_else(|e| {
-            panic!("port {MCP_PORT} must be free for this test (is a GAVMO daemon running?): {e}")
-        });
+        let mcp_holder = TcpListener::bind(("127.0.0.1", env.mcp_port)).unwrap();
         assert_fails_with(env.command(), "failed to bind the MCP gateway");
         drop(mcp_holder);
 
@@ -266,13 +321,7 @@ mod tests {
             }
             let mut child = env.command().spawn().unwrap();
             let lines = stdout_lines(&mut child);
-            // Drained concurrently: debug logging would otherwise fill the pipe.
-            let stderr = child.stderr.take().unwrap();
-            let stderr = std::thread::spawn(move || {
-                let mut text = String::new();
-                BufReader::new(stderr).read_to_string(&mut text).unwrap();
-                text
-            });
+            let stderr = drain_stderr(&mut child);
             let url = login_url(&lines);
             let token = url.split("token=").nth(1).unwrap();
             assert_eq!(
@@ -292,10 +341,7 @@ mod tests {
                 "{response}"
             );
 
-            let (status, response) = http(
-                MCP_PORT,
-                "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+            let (status, response) = http(env.mcp_port, UNAUTHENTICATED_MCP_REQUEST);
             assert_eq!(status, 401, "{response}");
 
             signal(&child, signal_name);
@@ -315,6 +361,58 @@ mod tests {
             let opened = std::fs::read_to_string(env.path("opened")).ok();
             assert_eq!(opened.as_deref(), opener.map(|_| url.as_str()));
         }
+    }
+
+    /// `--ui-port` / `--mcp-port` beat `GAVMO_UI_PORT` / `GAVMO_MCP_PORT`
+    /// (which [`Env::command`] sets).
+    #[test]
+    fn port_flags_beat_the_environment() {
+        let env = Env::new();
+        let (ui_port, mcp_port) = (free_port(), free_port());
+        let mut command = env.command();
+        command.args([
+            "--ui-port",
+            &ui_port.to_string(),
+            "--mcp-port",
+            &mcp_port.to_string(),
+        ]);
+        let mut child = command.spawn().unwrap();
+        let lines = stdout_lines(&mut child);
+        let stderr = drain_stderr(&mut child);
+
+        let url = login_url(&lines);
+        assert!(
+            url.starts_with(&format!("http://localhost:{ui_port}/login?token=")),
+            "{url}"
+        );
+        let (status, response) = http(mcp_port, UNAUTHENTICATED_MCP_REQUEST);
+        assert_eq!(status, 401, "{response}");
+        for unused in [env.ui_port, env.mcp_port] {
+            assert!(TcpStream::connect(("127.0.0.1", unused)).is_err());
+        }
+
+        signal(&child, "TERM");
+        let exit = wait_with_timeout(&mut child, Duration::from_secs(30));
+        let stderr = stderr.join().unwrap();
+        assert!(exit.success(), "{stderr}");
+        assert!(
+            stderr.contains(&format!("listening on http://127.0.0.1:{mcp_port}/mcp")),
+            "{stderr}"
+        );
+    }
+
+    const UNAUTHENTICATED_MCP_REQUEST: &str =
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    /// Collects the daemon's stderr on a thread. Drained concurrently: debug
+    /// logging would otherwise fill the pipe.
+    fn drain_stderr(child: &mut Child) -> std::thread::JoinHandle<String> {
+        let stderr = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            BufReader::new(stderr).read_to_string(&mut text).unwrap();
+            text
+        })
     }
 
     /// Waits for `path` to be written (the opener runs in the background).

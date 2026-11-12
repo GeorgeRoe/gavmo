@@ -6,8 +6,8 @@
 #
 #   scripts/smoke-test-package.sh <path/to/bin/gavmo> <expected version>
 #
-# Needs curl. Uses the fixed MCP gateway port (7071), so no other GAVMO
-# daemon may be running.
+# Needs curl. Runs on its own ports (`--ui-port`, `--mcp-port`), so it works
+# alongside a running GAVMO daemon.
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
@@ -17,6 +17,7 @@ fi
 gavmo=$1
 version=$2
 port=3917
+mcp_port=3918
 
 fail() {
   echo "smoke test FAILED: $*" >&2
@@ -44,14 +45,14 @@ chmod 700 "$tmp/run"
 # defaults are tested (and no model gateway is started).
 env -u GAVMO_BASE_IMAGE -u GAVMO_BIFROST -u GAVMO_BIFROST_DATA_DIR \
   -u GAVMO_GCP_PROJECT -u GAVMO_GCP_REGION \
+  -u GAVMO_UI_PORT -u GAVMO_MCP_PORT -u GAVMO_BIFROST_PORT \
   -u LEPTOS_OUTPUT_NAME -u LEPTOS_SITE_ROOT -u LEPTOS_SITE_PKG_DIR -u LEPTOS_ENV \
   HOME="$tmp/home" \
   XDG_DATA_HOME="$tmp/data" \
   XDG_CONFIG_HOME="$tmp/config" \
   XDG_RUNTIME_DIR="$tmp/run" \
   GAVMO_GCLOUD_DIR="$tmp/gcloud" \
-  LEPTOS_SITE_ADDR="127.0.0.1:$port" \
-  "$gavmo" > "$tmp/out" 2> "$tmp/err" &
+  "$gavmo" --ui-port "$port" --mcp-port "$mcp_port" > "$tmp/out" 2> "$tmp/err" &
 pid=$!
 
 url=
@@ -77,6 +78,10 @@ curl_panel -f -o "$tmp/wasm" "http://localhost:$port/pkg/gavmo.wasm" ||
   fail "/pkg/gavmo.wasm is not a wasm module"
 curl_panel -f -o "$tmp/index" "http://localhost:$port/" || fail "could not fetch /"
 grep -q 'gavmo' "$tmp/index" || fail "/ does not look like the control panel"
+# The gateway is on --mcp-port and refuses an unauthenticated request.
+mcp_status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$mcp_port/mcp") ||
+  fail "the MCP gateway is not on port $mcp_port"
+[ "$mcp_status" = 401 ] || fail "the MCP gateway answered $mcp_status, expected 401"
 
 kill -TERM "$pid"
 status=0

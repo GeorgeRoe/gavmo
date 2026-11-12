@@ -32,6 +32,7 @@ async fn a_real_vm_boots_reports_stops_and_resets() {
     let state = AppState::with_data_dir(
         base_image,
         &gcloud_dir,
+        mcp::DEFAULT_MCP_PORT,
         &data_dir,
         None,
         &tmp.path().join("run"),
