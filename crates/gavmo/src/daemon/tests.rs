@@ -19,6 +19,8 @@ use crate::vm_handle::fake::{FakeLauncher, Script};
 
 const TOKEN: &str = "test-ui-token";
 const HOST: &str = "localhost:3000";
+/// The stand-in `/pkg/gavmo.js`.
+const BUNDLE: &str = "// the wasm bundle's glue";
 
 /// A daemon over temp dirs, plus a logged-in session.
 pub(super) struct Daemon {
@@ -51,8 +53,13 @@ impl Daemon {
         let auth = crate::auth::Auth::new(TOKEN.to_owned(), data.path().join("sessions.json"))
             .await
             .unwrap();
+        // A site dir with a stand-in bundle, served from `/pkg` like the real one.
+        let site = data.path().join("site");
+        std::fs::create_dir_all(site.join("pkg")).unwrap();
+        std::fs::write(site.join("pkg").join("gavmo.js"), BUNDLE).unwrap();
         let options = leptos::prelude::LeptosOptions::builder()
             .output_name("gavmo")
+            .site_root(site.to_str().unwrap().to_owned())
             .build();
         let router = super::ui_router(options, &state, &auth);
         let mut daemon = Self {
@@ -224,6 +231,43 @@ async fn the_page_renders_for_a_session_and_redirects_without_one() {
     let res = d.send(page("")).await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(res.headers()[header::LOCATION], "/login");
+}
+
+/// The bundle is served to anyone (the login page needs it) and never
+/// cached, so a rebuilt daemon's pages aren't hydrated by an old bundle;
+/// pages themselves keep their own headers.
+#[tokio::test]
+async fn site_assets_are_served_but_never_cached() {
+    let d = Daemon::start().await;
+    let get = |uri: &str, cookie: &str| {
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, HOST)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = d.send(get("/pkg/gavmo.js", "")).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+    let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(body, BUNDLE.as_bytes());
+
+    // A missing asset isn't cached either.
+    let res = d.send(get("/pkg/gone.wasm", "")).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.headers()[header::CACHE_CONTROL], "no-store");
+
+    let res = d.send(get("/", &d.cookie)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_ne!(
+        res.headers()
+            .get(header::CACHE_CONTROL)
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"no-store"[..]),
+    );
 }
 
 #[tokio::test]

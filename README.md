@@ -82,7 +82,11 @@ Crates (`crates/`):
 
 - `gavmo` - daemon + Leptos control panel (full hydration, `#[server]` API).
   cargo-leptos builds it as `ssr` (native) and `hydrate` (wasm32), so
-  host-only deps must stay optional and `ssr`-only. Owns all policy.
+  host-only deps must stay optional and `ssr`-only. Owns all policy. The
+  site's assets (`/pkg/*`) are served `no-store`: their names don't change
+  between builds and Nix gives every file the same timestamp, so a cached
+  bundle from an older daemon would otherwise fail to hydrate the new
+  pages (they stay at "Loading…").
 - `vm` - pure QEMU mechanism from a `VmConfig`: qcow2 overlay, one
   `virtiofsd` per share, QMP, health polling, stats.
 - `mcp` - host-side MCP tool gateway (`rmcp`, stateless Streamable HTTP);

@@ -6,6 +6,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
+use axum::http::{HeaderValue, header};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::post;
 use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list, handle_server_fns_with_context};
@@ -63,6 +66,7 @@ pub fn ui_router(
         // `/login` sits behind the auth layer too; it stays reachable only
         // because `auth::is_public_path` allowlists it, not via layer order.
         .merge(auth::login_router(Arc::clone(auth)))
+        .layer(axum::middleware::from_fn(no_store_assets))
         // Inside the auth layer: a request without a session is refused before
         // its body is read at all.
         .layer(axum::middleware::from_fn_with_state(
@@ -73,6 +77,26 @@ pub fn ui_router(
             Arc::clone(auth),
             auth::require_session,
         ))
+}
+
+/// Marks the site's assets (`/pkg/*`: the wasm bundle, its JS glue, the
+/// CSS) `no-store`, so a browser always runs the bundle this daemon serves.
+///
+/// Their names are the same in every build, and the only validator is
+/// `Last-Modified`, which is the same for every Nix-built daemon (the
+/// store's timestamps are all 1970). Left to heuristic caching, a browser
+/// keeps the previous build's bundle, which then fails to hydrate the new
+/// build's pages and leaves them at "Loading…". Re-fetching a few MB per
+/// page load from loopback costs little.
+async fn no_store_assets(req: Request, next: Next) -> Response {
+    let is_asset = req.uri().path().starts_with("/pkg/");
+    let mut response = next.run(req).await;
+    if is_asset {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// The guest-facing gateway, on its own port: guests reach it (at 10.0.2.2)
