@@ -408,10 +408,11 @@ mod settings {
     use super::{render, render_resolved};
     use crate::app::settings::{
         ActionResult, CheckLine, DefaultModels, FieldInput, GatewayPanel, ProviderCard,
-        SettingsPage, form_values, gateway_problem,
+        SettingsPage, catalog_summary, form_values, gateway_problem,
     };
     use crate::types::{
-        GatewayStatus, ModelChoice, ModelSettingsView, ProviderCheck, ProviderField, ProviderView,
+        GatewayStatus, ModelCatalogStatus, ModelChoice, ModelSettingsView, ProviderCheck,
+        ProviderField, ProviderView,
     };
 
     fn field(key: &str, secret: bool) -> ProviderField {
@@ -468,6 +469,11 @@ mod settings {
             saved_small_model: None,
             default_model: "big".to_owned(),
             small_model: "small".to_owned(),
+            catalog: ModelCatalogStatus {
+                fetched_secs_ago: Some(7_200),
+                error: Some("models.dev is down".to_owned()),
+                built_in: Vec::new(),
+            },
         }
     }
 
@@ -696,6 +702,43 @@ mod settings {
         assert!(
             html.contains(r#"<option value="" selected"#),
             "small is automatic: {html}"
+        );
+        for expected in [
+            "Models from models.dev",
+            "updated 2 h ago",
+            "The last update failed: <!>models.dev is down",
+            ">Update model list<",
+        ] {
+            assert!(html.contains(expected), "{expected:?} in {html}");
+        }
+    }
+
+    /// Where the models come from, by how fresh the catalog is.
+    #[test]
+    fn the_catalog_summary_says_where_the_models_come_from() {
+        let summary = |fetched_secs_ago: Option<u64>, built_in: &[&str]| {
+            catalog_summary(&ModelCatalogStatus {
+                fetched_secs_ago,
+                error: None,
+                built_in: built_in.iter().map(|s| (*s).to_owned()).collect(),
+            })
+        };
+        assert!(summary(None, &["Google Vertex AI"]).starts_with("The built-in model list"));
+        for (age, ago) in [
+            (5, "just now"),
+            (600, "10 min ago"),
+            (3_600 * 5, "5 h ago"),
+            (86_400, "1 day ago"),
+            (86_400 * 3, "3 days ago"),
+        ] {
+            let text = summary(Some(age), &[]);
+            assert!(text.contains(&format!("updated {ago};")), "{text}");
+            assert!(!text.contains("built-in"), "{text}");
+        }
+        let partial = summary(Some(5), &["Keyed"]);
+        assert!(
+            partial.contains("Keyed offers its built-in models"),
+            "{partial}"
         );
     }
 }

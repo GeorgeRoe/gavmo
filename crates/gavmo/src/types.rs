@@ -242,6 +242,21 @@ pub struct ModelSettingsView {
     /// The ids guests actually start with.
     pub default_model: String,
     pub small_model: String,
+    /// Where the models come from.
+    pub catalog: ModelCatalogStatus,
+}
+
+/// The models.dev catalog the offered models come from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogStatus {
+    /// How long ago it was fetched, in seconds; `None` if it never was
+    /// (every provider offers its built-in models).
+    pub fetched_secs_ago: Option<u64>,
+    /// Why the last fetch failed, if it did (the previous list stays).
+    pub error: Option<String>,
+    /// The providers offering their built-in models instead (not fetched
+    /// yet, or not in the catalog).
+    pub built_in: Vec<String>,
 }
 
 /// State of the host-side model gateway (Bifrost).

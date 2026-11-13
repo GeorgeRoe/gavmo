@@ -179,6 +179,11 @@ mod daemon {
         tracing::info!("GAVMO daemon listening on http://{ui_addr}");
         announce_login_url(ui_addr.port(), auth.token());
 
+        // The models guests are offered, from models.dev: fetched now if the
+        // cached copy is stale, then daily (the task lives as long as the
+        // daemon).
+        let _catalog_refresh = app_state.spawn_model_catalog_refresh();
+
         // Either server stopping is fatal: a UI without its gateway (or vice
         // versa) would look healthy while silently failing. Every exit path
         // stops the VMs first, so none outlives the daemon.

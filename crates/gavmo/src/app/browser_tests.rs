@@ -11,7 +11,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use leptos::mount::mount_to;
@@ -25,12 +25,13 @@ use web_sys::HtmlElement;
 
 use super::hooks::use_polling;
 use super::resources::ResourcesPanel;
+use super::settings::ModelCatalogPanel;
 use super::tools::WorkspaceTools;
 use super::workspace_modal::{ConsolePanel, StatsPanel, WorkspaceModal};
 use crate::api;
 use crate::types::{
-    ConsoleChunk, ResourceValues, Resources, ResourcesView, ToolConfig, ToolList, VmStats,
-    WorkspaceInfo, WorkspaceStatus,
+    AppError, ConsoleChunk, ModelCatalogStatus, ResourceValues, Resources, ResourcesView,
+    ToolConfig, ToolList, VmStats, WorkspaceInfo, WorkspaceStatus,
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -44,6 +45,12 @@ type Calls = Rc<RefCell<Vec<(String, String)>>>;
 /// path (e.g. `api::ListWorkspaces::PATH`) and its form-encoded arguments to
 /// a JSON body, answered with HTTP 200. Returns the call log.
 fn fake_fetch(reply: impl Fn(&str, &str) -> String + 'static) -> Calls {
+    fake_fetch_status(move |path, body| (200, reply(path, body)))
+}
+
+/// [`fake_fetch`] with the HTTP status chosen too (500 with a JSON
+/// [`AppError`] body is how a server function fails).
+fn fake_fetch_status(reply: impl Fn(&str, &str) -> (u16, String) + 'static) -> Calls {
     let calls = Calls::default();
     let log = Rc::clone(&calls);
     let reply = Rc::new(reply);
@@ -60,12 +67,12 @@ fn fake_fetch(reply: impl Fn(&str, &str) -> String + 'static) -> Calls {
             let reply = Rc::clone(&reply);
             wasm_bindgen_futures::future_to_promise(async move {
                 let body = JsFuture::from(body).await?.as_string().unwrap_or_default();
-                let json = reply(&path, &body);
+                let (status, json) = reply(&path, &body);
                 log.borrow_mut().push((path, body));
                 let headers = web_sys::Headers::new()?;
                 headers.set("content-type", "application/json")?;
                 let init = web_sys::ResponseInit::new();
-                init.set_status(200);
+                init.set_status(status);
                 init.set_headers(&headers);
                 Ok(web_sys::Response::new_with_opt_str_and_init(Some(&json), &init)?.into())
             })
@@ -490,4 +497,82 @@ async fn resources_lock_the_disk_while_running_and_save_the_rest() {
 
     status.set(WorkspaceStatus::Stopped);
     until("disk unlocked", || !inputs()[0].disabled()).await;
+}
+
+// --- Model catalog ---
+
+/// A saved fetch error shows until an update; an update that fails says why
+/// once (below the button, not again as the saved error); one that works
+/// clears it.
+#[wasm_bindgen_test]
+async fn a_failed_model_list_update_shows_its_error_once() {
+    let online = Arc::new(AtomicBool::new(false));
+    let calls = {
+        let online = Arc::clone(&online);
+        fake_fetch_status(move |path, _| {
+            assert_eq!(path, api::RefreshModelCatalog::PATH);
+            if online.load(Ordering::SeqCst) {
+                (200, json(&"14 models offered"))
+            } else {
+                let error = AppError::Failed("Couldn't update the model list: offline".into());
+                (500, json(&error))
+            }
+        })
+    };
+    let failed = |error: &str| ModelCatalogStatus {
+        fetched_secs_ago: Some(7_200),
+        error: Some(error.to_owned()),
+        built_in: Vec::new(),
+    };
+    let status = RwSignal::new(Some(failed("timed out")));
+    let reloaded = {
+        let online = Arc::clone(&online);
+        // What the settings page reloads after an update.
+        move || {
+            status.set(Some(if online.load(Ordering::SeqCst) {
+                ModelCatalogStatus {
+                    fetched_secs_ago: Some(0),
+                    ..ModelCatalogStatus::default()
+                }
+            } else {
+                failed("offline")
+            }));
+        }
+    };
+    let root = container();
+    let _handle = mount_to(root.clone(), move || {
+        let on_changed = Callback::new(move |()| reloaded());
+        view! { <ModelCatalogPanel status=Signal::from(status) on_changed /> }
+    });
+
+    assert_eq!(
+        text_of(&root, ".error").as_deref(),
+        Some("The last update failed: timed out")
+    );
+    element(&root, ".tool-actions button").click();
+    until("the failed update", || {
+        text_of(&root, ".tool-result--err").as_deref()
+            == Some("Couldn't update the model list: offline")
+    })
+    .await;
+    until("the reload", || {
+        status.with_untracked(|s| s.as_ref().unwrap().error.as_deref() == Some("offline"))
+    })
+    .await;
+    assert_eq!(text_of(&root, ".error"), None, "the error is shown twice");
+
+    online.store(true, Ordering::SeqCst);
+    element(&root, ".tool-actions button").click();
+    until("the update", || {
+        text_of(&root, ".tool-result--ok").as_deref() == Some("14 models offered")
+    })
+    .await;
+    assert_eq!(text_of(&root, ".tool-result--err"), None);
+    assert_eq!(text_of(&root, ".error"), None);
+    assert!(
+        text_of(&root, ".hint").is_some_and(|t| t.contains("updated just now")),
+        "{:?}",
+        text_of(&root, ".hint")
+    );
+    assert_eq!(calls_to(&calls, api::RefreshModelCatalog::PATH).len(), 2);
 }

@@ -37,7 +37,11 @@ What they cover, roughly by crate:
   providers and their settings (`registry::models`: save, remove,
   environment overrides, vaulted secrets, the per-boot `opencode.json`,
   against a stand-in Bifrost script whose generated config shows what it
-  was given), the gateway test (against local axum servers), and UI
+  was given), the gateway test (against local axum servers), the model
+  catalog (`providers::models_dev`, `registry::model_catalog`: opencode's
+  filtering, the cache, the built-in fallback, failed fetches; read from a
+  `file://` copy of models.dev's real Vertex section,
+  `providers/testdata/models-dev-vertex.json`, never the network), and UI
   helpers that are plain Rust (e.g. `trim_front`).
 
 ## Daemon end-to-end tests

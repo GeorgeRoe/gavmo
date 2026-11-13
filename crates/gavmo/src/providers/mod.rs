@@ -1,22 +1,31 @@
 //! The model providers the host-side model gateway can serve, described as
 //! data: each provider declares its settings as form fields (rendered by the
-//! control panel without provider-specific UI), its models, and how to turn
-//! its settings into Bifrost configuration.
+//! control panel without provider-specific UI), where its models are listed,
+//! and how to turn its settings into Bifrost configuration.
 //!
 //! Adding a provider means implementing [`Provider`] and listing it in
 //! [`ALL`]. Its settings are saved in `settings.json` as plain strings keyed
 //! by field; [`FieldSpec::secret`] fields (API keys) go to the host's
 //! secret vault instead, under [`secret_key`].
 //!
+//! A provider's models come from its section of the models.dev catalog
+//! ([`models_dev`]), the list opencode itself ships with, so guests are
+//! offered what opencode would show for that provider; its built-in
+//! [`Provider::fallback_models`] stand in until the catalog has been
+//! fetched once.
+//!
 //! Guests reach every model through the gateway's Anthropic-format route
 //! (`/llm/anthropic/v1`), so a provider's models must be servable there by
 //! Bifrost; one with another wire format would also need a route in
 //! `daemon::llm` and a guest provider in the base image's opencode config.
 
+pub(crate) mod models_dev;
 pub(crate) mod vertex;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+
+use serde_json::{Map, Value};
 
 use crate::bifrost::ProviderBlock;
 use crate::types::ProviderCheck;
@@ -50,16 +59,67 @@ pub(crate) struct FieldSpec {
 }
 
 /// A model a provider serves.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelSpec {
-    /// The name guests see (`gavmo/<id>`); provider-neutral, so it can stay
-    /// the same if another provider serves the model.
-    pub id: &'static str,
+    /// The name guests see (`gavmo/<id>`): the catalog's id without a
+    /// provider's `@version` suffix, so it can stay the same if another
+    /// provider serves the model.
+    pub id: String,
     /// The model as Bifrost routes it (`<bifrost provider>/<model>`).
-    pub upstream: &'static str,
-    pub name: &'static str,
-    pub context: u32,
-    pub output: u32,
+    pub upstream: String,
+    pub name: String,
+    /// models.dev's family (`claude-sonnet`), which the suggested defaults
+    /// are picked by.
+    pub family: Option<String>,
+    /// `YYYY-MM-DD`; models are offered newest first.
+    pub release_date: Option<String>,
+    /// The rest of opencode's entry for the model, passed through to guests:
+    /// capabilities, limits (which drive auto-compaction), cost... See
+    /// [`models_dev::PASSED_THROUGH`].
+    pub details: Map<String, Value>,
+}
+
+impl ModelSpec {
+    /// opencode's config entry for the model; its `id` is what the gateway
+    /// routes.
+    fn opencode_entry(&self) -> Value {
+        let mut entry = self.details.clone();
+        entry.insert("id".to_owned(), self.upstream.clone().into());
+        entry.insert("name".to_owned(), self.name.clone().into());
+        if let Some(family) = &self.family {
+            entry.insert("family".to_owned(), family.clone().into());
+        }
+        if let Some(date) = &self.release_date {
+            entry.insert("release_date".to_owned(), date.clone().into());
+        }
+        Value::Object(entry)
+    }
+}
+
+/// Sorts `models` newest first (undated last), then by id.
+pub(crate) fn sort_newest_first(models: &mut [ModelSpec]) {
+    models.sort_by(|a, b| {
+        let undated = |m: &ModelSpec| m.release_date.is_none();
+        undated(a)
+            .cmp(&undated(b))
+            .then_with(|| b.release_date.cmp(&a.release_date))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// A provider with the models it currently offers.
+pub(crate) type ProviderModels = (&'static dyn Provider, Vec<ModelSpec>);
+
+/// `providers` with their built-in models.
+pub(crate) fn built_in(providers: &[&'static dyn Provider]) -> Vec<ProviderModels> {
+    providers
+        .iter()
+        .map(|&p| {
+            let mut models = p.fallback_models();
+            sort_newest_first(&mut models);
+            (p, models)
+        })
+        .collect()
 }
 
 /// Host facts providers' checks and configuration depend on.
@@ -76,10 +136,17 @@ pub(crate) trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn fields(&self) -> &'static [FieldSpec];
-    fn models(&self) -> &'static [ModelSpec];
-    /// The ids (from [`Self::models`]) it suggests as the default and the
-    /// small model.
-    fn suggested_models(&self) -> (&'static str, &'static str);
+    /// Its provider id in the models.dev catalog, whose models it offers.
+    fn models_dev_id(&self) -> &'static str;
+    /// How Bifrost routes the catalog's model `id` (`<bifrost
+    /// provider>/<model>`).
+    fn upstream(&self, id: &str) -> String;
+    /// The models it offers until the catalog has been fetched (or if its
+    /// section there is empty).
+    fn fallback_models(&self) -> Vec<ModelSpec>;
+    /// The model families it suggests the default and the small model from
+    /// (the newest of each).
+    fn suggested_families(&self) -> (&'static str, &'static str);
     /// Checks resolved values (see [`resolve`]: trimmed, defaults and
     /// environment overrides applied, required fields present). The error is
     /// for the user.
@@ -187,22 +254,21 @@ pub(crate) fn check_values(provider: &dyn Provider, values: &Values) -> Result<(
     provider.validate(values)
 }
 
-/// The models guests are offered: those of the `configured` providers (in
-/// [`ALL`] order, the first provider of a model id winning), or every
-/// provider's if none is configured.
-pub(crate) fn catalog(
-    providers: &[&'static dyn Provider],
-    configured: &[&str],
-) -> Vec<&'static ModelSpec> {
-    let mut models: Vec<&'static ModelSpec> = Vec::new();
-    let any_configured = providers.iter().any(|p| configured.contains(&p.kind()));
-    for provider in providers {
+/// The models guests are offered, from `providers`' current models: those of
+/// the `configured` providers (in [`ALL`] order, the first provider of a
+/// model id winning), or every provider's if none is configured.
+pub(crate) fn catalog(providers: &[ProviderModels], configured: &[&str]) -> Vec<ModelSpec> {
+    let mut models: Vec<ModelSpec> = Vec::new();
+    let any_configured = providers
+        .iter()
+        .any(|(p, _)| configured.contains(&p.kind()));
+    for (provider, offered) in providers {
         if any_configured && !configured.contains(&provider.kind()) {
             continue;
         }
-        for model in provider.models() {
+        for model in offered {
             if !models.iter().any(|m| m.id == model.id) {
-                models.push(model);
+                models.push(model.clone());
             }
         }
     }
@@ -210,31 +276,41 @@ pub(crate) fn catalog(
 }
 
 /// The default and small model ids guests start with: the saved choices if
-/// still offered, else the first configured provider's suggestions, else the
-/// first model offered (empty if none).
+/// still offered, else the newest offered models of the first configured
+/// provider's suggested families, else the first model offered (empty if
+/// none).
 pub(crate) fn pick_models(
-    providers: &[&'static dyn Provider],
+    providers: &[ProviderModels],
     configured: &[&str],
     saved: (Option<&str>, Option<&str>),
 ) -> (String, String) {
     let models = catalog(providers, configured);
     let offered = |id: &str| models.iter().any(|m| m.id == id);
-    let suggested = providers
+    let suggesting = providers
         .iter()
-        .find(|p| configured.contains(&p.kind()))
-        .or_else(|| providers.first())
-        .map(|p| p.suggested_models());
-    let first = models.first().map_or("", |m| m.id);
-    let pick = |saved: Option<&str>, suggestion: Option<&'static str>| {
+        .find(|(p, _)| configured.contains(&p.kind()))
+        .or_else(|| providers.first());
+    let newest_of = |family: &str| -> Option<&str> {
+        let (_, own) = suggesting?;
+        own.iter()
+            .filter(|m| m.family.as_deref() == Some(family) && offered(&m.id))
+            // The first of the newest, as they're listed newest first.
+            .rev()
+            .max_by(|a, b| a.release_date.cmp(&b.release_date))
+            .map(|m| m.id.as_str())
+    };
+    let families = suggesting.map(|(p, _)| p.suggested_families());
+    let first = models.first().map_or("", |m| m.id.as_str());
+    let pick = |saved: Option<&str>, family: Option<&str>| {
         saved
             .filter(|id| offered(id))
-            .or(suggestion.filter(|id| offered(id)))
+            .or_else(|| family.and_then(newest_of))
             .unwrap_or(first)
             .to_owned()
     };
     (
-        pick(saved.0, suggested.map(|s| s.0)),
-        pick(saved.1, suggested.map(|s| s.1)),
+        pick(saved.0, families.map(|f| f.0)),
+        pick(saved.1, families.map(|f| f.1)),
     )
 }
 
@@ -244,27 +320,13 @@ pub(crate) fn pick_models(
 /// default ones. opencode merges the two; a repo's own `opencode.json` can
 /// still choose another default.
 pub(crate) fn opencode_config(
-    models: &[&ModelSpec],
+    models: &[ModelSpec],
     default_model: &str,
     small_model: &str,
-) -> serde_json::Value {
-    let models: serde_json::Map<String, serde_json::Value> = models
+) -> Value {
+    let models: Map<String, Value> = models
         .iter()
-        .map(|m| {
-            (
-                m.id.to_owned(),
-                serde_json::json!({
-                    "id": m.upstream,
-                    "name": m.name,
-                    "reasoning": true,
-                    "tool_call": true,
-                    "attachment": true,
-                    "temperature": true,
-                    // Drives opencode's auto-compaction threshold.
-                    "limit": { "context": m.context, "output": m.output },
-                }),
-            )
-        })
+        .map(|m| (m.id.clone(), m.opencode_entry()))
         .collect();
     let mut config = serde_json::json!({
         // Present, so opencode doesn't try to add it to this read-only file.
@@ -289,22 +351,25 @@ pub(crate) mod tests {
     /// GAVMO doesn't have yet, to exercise secret fields.
     pub(crate) struct KeyProvider;
 
-    pub(crate) static KEY_MODELS: &[ModelSpec] = &[
-        ModelSpec {
-            id: "claude-sonnet-5-5",
-            upstream: "anthropic/claude-sonnet-5-5",
-            name: "Claude Sonnet 5.5 (direct)",
-            context: 200_000,
-            output: 64_000,
-        },
-        ModelSpec {
-            id: "key-model",
-            upstream: "anthropic/key-model",
-            name: "Key model",
-            context: 100_000,
-            output: 8_000,
-        },
-    ];
+    /// [`KeyProvider`]'s models: one shared with Vertex, one of its own.
+    pub(crate) fn key_models(provider: &dyn Provider) -> Vec<ModelSpec> {
+        models_dev::models(
+            provider,
+            &serde_json::json!({ "models": {
+                "key-model": {
+                    "name": "Key model",
+                    "family": "key",
+                    "release_date": "2026-01-01",
+                    "limit": { "context": 100_000, "output": 8_000 },
+                },
+                "claude-sonnet-5-5": {
+                    "name": "Claude Sonnet 5.5 (direct)",
+                    "family": "claude-sonnet",
+                    "release_date": "2026-09-28",
+                },
+            }}),
+        )
+    }
 
     impl Provider for KeyProvider {
         fn kind(&self) -> &'static str {
@@ -340,11 +405,17 @@ pub(crate) mod tests {
                 },
             ]
         }
-        fn models(&self) -> &'static [ModelSpec] {
-            KEY_MODELS
+        fn models_dev_id(&self) -> &'static str {
+            "anthropic"
         }
-        fn suggested_models(&self) -> (&'static str, &'static str) {
-            ("key-model", "key-model")
+        fn upstream(&self, id: &str) -> String {
+            format!("anthropic/{id}")
+        }
+        fn fallback_models(&self) -> Vec<ModelSpec> {
+            key_models(self)
+        }
+        fn suggested_families(&self) -> (&'static str, &'static str) {
+            ("key", "key")
         }
         fn validate(&self, values: &Values) -> Result<(), String> {
             match values.get("base_url") {
@@ -464,36 +535,80 @@ pub(crate) mod tests {
         assert!(check_values(&KeyProvider, &values(&[("base_url", "http://x")])).is_err());
     }
 
+    fn ids(models: &[ModelSpec]) -> Vec<&str> {
+        models.iter().map(|m| m.id.as_str()).collect()
+    }
+
     #[test]
     fn the_catalog_offers_configured_providers_models_once() {
-        let ids = |models: Vec<&ModelSpec>| models.iter().map(|m| m.id).collect::<Vec<_>>();
-        let vertex_ids = ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"];
-        assert_eq!(ids(catalog(WITH_KEYED, &["vertex"])), vertex_ids);
+        let providers = built_in(WITH_KEYED);
+        let vertex_ids = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"];
+        assert_eq!(ids(&catalog(&providers, &["vertex"])), vertex_ids);
         assert_eq!(
-            ids(catalog(WITH_KEYED, &["keyed"])),
+            ids(&catalog(&providers, &["keyed"])),
             ["claude-sonnet-5-5", "key-model"]
         );
         // Both: Vertex comes first and keeps the shared id.
-        let both = catalog(WITH_KEYED, &["keyed", "vertex"]);
+        let both = catalog(&providers, &["keyed", "vertex"]);
         assert_eq!(
-            ids(both.clone()),
+            ids(&both),
             [
-                "claude-sonnet-5-5",
                 "claude-haiku-5-5",
+                "claude-sonnet-5-5",
                 "claude-opus-5-5",
                 "key-model"
             ]
         );
-        assert_eq!(both[0].upstream, "vertex/claude-sonnet-5-5@default");
+        assert_eq!(both[1].upstream, "vertex/claude-sonnet-5-5@default");
         // None configured (or only unknown kinds): everything.
-        assert_eq!(ids(catalog(WITH_KEYED, &[])).len(), 4);
-        assert_eq!(ids(catalog(WITH_KEYED, &["gone"])).len(), 4);
+        assert_eq!(catalog(&providers, &[]).len(), 4);
+        assert_eq!(catalog(&providers, &["gone"]).len(), 4);
         assert!(catalog(&[], &[]).is_empty());
     }
 
     #[test]
+    fn models_sort_newest_first_then_by_id() {
+        let model = |id: &str, date: Option<&str>| ModelSpec {
+            id: id.to_owned(),
+            upstream: String::new(),
+            name: String::new(),
+            family: None,
+            release_date: date.map(str::to_owned),
+            details: Map::new(),
+        };
+        let mut models = vec![
+            model("undated", None),
+            model("old", Some("2024-01-01")),
+            model("b", Some("2026-01-01")),
+            model("a", Some("2026-01-01")),
+        ];
+        sort_newest_first(&mut models);
+        assert_eq!(ids(&models), ["a", "b", "old", "undated"]);
+    }
+
+    #[test]
+    fn suggestions_are_the_newest_of_their_family() {
+        let api: Value = serde_json::from_str(models_dev::tests::VERTEX_FIXTURE).unwrap();
+        let section = &api["google-vertex-anthropic"];
+        let providers = vec![(ALL[0], models_dev::models(ALL[0], section))];
+        assert_eq!(
+            pick_models(&providers, &["vertex"], (None, None)),
+            (
+                "claude-sonnet-5-5".to_owned(),
+                "claude-haiku-5-5".to_owned()
+            )
+        );
+        // Older ones stay pickable.
+        assert_eq!(
+            pick_models(&providers, &["vertex"], (Some("claude-opus-4-6"), None)).0,
+            "claude-opus-4-6"
+        );
+    }
+
+    #[test]
     fn default_models_prefer_saved_then_suggested_then_first() {
-        let pick = |configured: &[&str], saved| pick_models(WITH_KEYED, configured, saved);
+        let providers = built_in(WITH_KEYED);
+        let pick = |configured: &[&str], saved| pick_models(&providers, configured, saved);
         assert_eq!(
             pick(&["vertex"], (None, None)),
             (
@@ -542,10 +657,16 @@ pub(crate) mod tests {
             fn fields(&self) -> &'static [FieldSpec] {
                 &[]
             }
-            fn models(&self) -> &'static [ModelSpec] {
-                KEY_MODELS
+            fn models_dev_id(&self) -> &'static str {
+                "odd"
             }
-            fn suggested_models(&self) -> (&'static str, &'static str) {
+            fn upstream(&self, id: &str) -> String {
+                format!("odd/{id}")
+            }
+            fn fallback_models(&self) -> Vec<ModelSpec> {
+                key_models(self)
+            }
+            fn suggested_families(&self) -> (&'static str, &'static str) {
                 ("missing", "missing")
             }
             fn validate(&self, _: &Values) -> Result<(), String> {
@@ -593,8 +714,9 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+        assert_eq!(odd.models_dev_id(), "odd");
         assert_eq!(
-            pick_models(ODD, &["odd"], (None, None)),
+            pick_models(&built_in(ODD), &["odd"], (None, None)),
             (
                 "claude-sonnet-5-5".to_owned(),
                 "claude-sonnet-5-5".to_owned()
@@ -604,7 +726,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_guest_config_lists_models_and_defaults() {
-        let models = catalog(ALL, &["vertex"]);
+        let models = catalog(&built_in(ALL), &["vertex"]);
         let config = opencode_config(&models, "claude-sonnet-5-5", "claude-haiku-5-5");
         assert_eq!(config["$schema"], "https://opencode.ai/config.json");
         assert_eq!(config["model"], "gavmo/claude-sonnet-5-5");
@@ -612,9 +734,13 @@ pub(crate) mod tests {
         let sonnet = &config["provider"]["gavmo"]["models"]["claude-sonnet-5-5"];
         assert_eq!(sonnet["id"], "vertex/claude-sonnet-5-5@default");
         assert_eq!(sonnet["name"], "Claude Sonnet 5.5");
+        assert_eq!(sonnet["family"], "claude-sonnet");
+        assert_eq!(sonnet["release_date"], "2026-09-28");
         assert_eq!(sonnet["tool_call"], true);
-        assert_eq!(sonnet["limit"]["context"], 200_000);
-        assert_eq!(sonnet["limit"]["output"], 64_000);
+        assert_eq!(sonnet["temperature"], false);
+        assert_eq!(sonnet["limit"]["context"], 1_000_000);
+        assert_eq!(sonnet["limit"]["output"], 128_000);
+        assert_eq!(sonnet["cost"]["input"], 2.0);
         // Only what the guest may change: no endpoint or credential.
         assert!(config["provider"]["gavmo"].get("options").is_none());
         assert!(config.get("enabled_providers").is_none());
@@ -631,6 +757,7 @@ pub(crate) mod tests {
         };
         let p = &KeyProvider;
         assert!(!p.description().is_empty());
+        assert_eq!(p.models_dev_id(), "anthropic");
         assert!(p.checks(host).is_empty() && p.suggestions(host).is_empty());
         assert!(p.bifrost(&Values::new(), &Values::new(), host).is_err());
         let block = p

@@ -46,7 +46,7 @@ What else the host needs:
   Until a provider is set up, VMs still boot and opencode opens, but model
   requests fail with the reason, and the home page says so. The first time
   Bifrost starts it downloads its model datasheets (about 27 MB) from the
-  internet.
+  internet, and the daemon fetches the model list from models.dev daily.
 
 To build everything from source instead (compiles the daemon, opencode and
 the VM image; slow), use `nix profile install github:GeorgeRoe/gavmo#gavmo-from-source`.
@@ -163,7 +163,8 @@ Models:
   shows the command if it is missing; signing in later is picked up the
   next time the page loads. Providers are defined in
   `crates/gavmo/src/providers/` (one `Provider` impl each: form fields,
-  models, Bifrost config); the UI renders their fields generically.
+  where its models are listed, Bifrost config); the UI renders their fields
+  generically.
 - Environment variables override the saved settings field by field, and
   such fields are read-only in the UI: `GAVMO_GCP_PROJECT` and
   `GAVMO_GCP_REGION` (setting them alone configures Vertex). Also from the
@@ -172,12 +173,26 @@ Models:
     there are no models, and the UI says why).
   - `GAVMO_BIFROST_DATA_DIR`: optional dir with Bifrost's `datasheet.json`
     and `model-parameters.json`, so it starts without downloading them.
+  - `GAVMO_MODELS_DEV_URL`: where the model list is fetched from (default
+    `https://models.dev/api.json`; a `file://` path works too).
+- The models offered are what opencode itself would show for each
+  configured provider: its section of the [models.dev](https://models.dev)
+  catalog (Vertex: `google-vertex-anthropic`), without deprecated models,
+  newest first, with their capabilities, limits and cost. The daemon
+  fetches the catalog (about 6 MB) at start if its copy is older than a day,
+  then daily (hourly retries after a failure), and on **Update model list**
+  under Settings; the providers' sections are cached in
+  `~/.local/share/gavmo/model-catalog.json`. Until the first fetch succeeds,
+  each provider offers a small built-in list. models.dev describes models,
+  not your account: a listed model your project hasn't enabled (e.g. in
+  Vertex's Model Garden) fails when used, with the provider's error.
 - Each boot's models come from the daemon, not the image: it writes the
   configured providers' models and the default and small model (chosen
-  under Settings, else the providers' suggestion) to the token share's
-  `opencode.json`, which `gavmo-opencode` loads as `OPENCODE_CONFIG` on top
-  of the managed config. Model changes therefore apply when a workspace
-  next starts. opencode names map to Bifrost ones
+  under Settings, else the newest of the providers' suggested families:
+  Claude Sonnet and Haiku) to the token share's `opencode.json`, which
+  `gavmo-opencode` loads as `OPENCODE_CONFIG` on top of the managed config.
+  Model changes therefore apply when a workspace next starts. opencode names
+  are the catalog's without the version suffix
   (`claude-sonnet-5-5` -> `vertex/claude-sonnet-5-5@default`).
 
 Tool gateway and secrets:

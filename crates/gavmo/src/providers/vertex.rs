@@ -37,34 +37,36 @@ static FIELDS: &[FieldSpec] = &[
     },
 ];
 
-const fn claude(id: &'static str, upstream: &'static str, name: &'static str) -> ModelSpec {
-    // Conservative limits: they drive opencode's auto-compaction.
-    ModelSpec {
-        id,
-        upstream,
-        name,
-        context: 200_000,
-        output: 64_000,
-    }
+/// The built-in models, as a models.dev section (from its entries for them).
+fn fallback_section() -> serde_json::Value {
+    let claude = |name: &str, family: &str, released: &str, cost: [f64; 4]| {
+        serde_json::json!({
+            "name": name,
+            "family": family,
+            "attachment": true,
+            "reasoning": true,
+            "tool_call": true,
+            "temperature": false,
+            "release_date": released,
+            "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+            "limit": { "context": 1_000_000, "output": 128_000 },
+            "cost": {
+                "input": cost[0],
+                "output": cost[1],
+                "cache_read": cost[2],
+                "cache_write": cost[3],
+            },
+        })
+    };
+    serde_json::json!({ "models": {
+        "claude-haiku-5-5@default":
+            claude("Claude Haiku 5.5", "claude-haiku", "2026-10-07", [0.1, 0.5, 0.01, 0.125]),
+        "claude-sonnet-5-5@default":
+            claude("Claude Sonnet 5.5", "claude-sonnet", "2026-09-28", [2.0, 10.0, 0.1, 2.5]),
+        "claude-opus-5-5@default":
+            claude("Claude Opus 5.5", "claude-opus", "2026-09-22", [4.0, 20.0, 0.2, 5.0]),
+    }})
 }
-
-static MODELS: &[ModelSpec] = &[
-    claude(
-        "claude-sonnet-5-5",
-        "vertex/claude-sonnet-5-5@default",
-        "Claude Sonnet 5.5",
-    ),
-    claude(
-        "claude-haiku-5-5",
-        "vertex/claude-haiku-5-5@default",
-        "Claude Haiku 5.5",
-    ),
-    claude(
-        "claude-opus-5-5",
-        "vertex/claude-opus-5-5@default",
-        "Claude Opus 5.5",
-    ),
-];
 
 impl Provider for Vertex {
     fn kind(&self) -> &'static str {
@@ -84,12 +86,22 @@ impl Provider for Vertex {
         FIELDS
     }
 
-    fn models(&self) -> &'static [ModelSpec] {
-        MODELS
+    fn models_dev_id(&self) -> &'static str {
+        "google-vertex-anthropic"
     }
 
-    fn suggested_models(&self) -> (&'static str, &'static str) {
-        ("claude-sonnet-5-5", "claude-haiku-5-5")
+    fn upstream(&self, id: &str) -> String {
+        // Bifrost's Vertex provider takes Vertex's own model ids, which
+        // models.dev uses (`claude-sonnet-5-5@default`).
+        format!("vertex/{id}")
+    }
+
+    fn fallback_models(&self) -> Vec<ModelSpec> {
+        super::models_dev::models(self, &fallback_section())
+    }
+
+    fn suggested_families(&self) -> (&'static str, &'static str) {
+        ("claude-sonnet", "claude-haiku")
     }
 
     fn validate(&self, values: &Values) -> Result<(), String> {
@@ -443,6 +455,31 @@ mod tests {
                 .contains("Application Default Credentials")
         );
         assert_eq!(Vertex.fields().len(), 2);
-        assert_eq!(Vertex.models().len(), 3);
+        assert_eq!(Vertex.models_dev_id(), "google-vertex-anthropic");
+        assert_eq!(
+            Vertex.upstream("claude-opus-4-8@default"),
+            "vertex/claude-opus-4-8@default"
+        );
+    }
+
+    #[test]
+    fn its_built_in_models_are_the_newest_claudes() {
+        let models = Vertex.fallback_models();
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+        );
+        let sonnet = &models[1];
+        assert_eq!(sonnet.upstream, "vertex/claude-sonnet-5-5@default");
+        assert_eq!(sonnet.name, "Claude Sonnet 5.5");
+        assert_eq!(sonnet.family.as_deref(), Some("claude-sonnet"));
+        assert_eq!(sonnet.details["limit"]["context"], 1_000_000);
+        assert_eq!(sonnet.details["tool_call"], true);
+        // Each suggested family has a built-in model.
+        let (default, small) = Vertex.suggested_families();
+        for family in [default, small] {
+            assert!(models.iter().any(|m| m.family.as_deref() == Some(family)));
+        }
     }
 }

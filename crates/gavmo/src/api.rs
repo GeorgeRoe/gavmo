@@ -241,6 +241,15 @@ pub async fn test_model_gateway() -> Result<String, AppError> {
     state.test_model_gateway().await.map_err(AppError::from)
 }
 
+/// Fetches the model list from models.dev now (it is also refreshed
+/// daily) and says how many models are offered; used by workspaces started
+/// afterwards.
+#[server]
+pub async fn refresh_model_catalog() -> Result<String, AppError> {
+    let state = app_state()?;
+    state.refresh_model_catalog().await.map_err(AppError::from)
+}
+
 /// Fetches the injected [`registry::AppState`] from Leptos context.
 #[cfg(feature = "ssr")]
 fn app_state() -> Result<crate::registry::AppState, AppError> {
@@ -375,6 +384,7 @@ mod tests {
             remove_provider(id()).await,
             set_default_models(None, None).await,
             test_model_gateway().await.map(drop),
+            refresh_model_catalog().await.map(drop),
         ];
         for result in results {
             assert_eq!(

@@ -63,25 +63,36 @@ pub struct ModelOptions {
     /// The provider fields' environment overrides, read once at startup.
     pub(crate) env: Values,
     pub(crate) gateway: Arc<ModelGateway>,
+    /// Where the models.dev catalog is fetched from (`file://` for a local
+    /// copy).
+    pub(crate) catalog_url: String,
 }
 
 impl ModelOptions {
     /// Every supported provider, with overrides from this process's
-    /// environment, served by `gateway`.
+    /// environment, served by `gateway`. `GAVMO_MODELS_DEV_URL` replaces
+    /// the models.dev catalog's URL (e.g. with a `file://` copy).
     pub fn from_env(gateway: ModelGateway) -> Self {
         Self {
             providers: providers::ALL,
             env: providers::env_overrides(providers::ALL, |name| std::env::var(name).ok()),
             gateway: Arc::new(gateway),
+            catalog_url: std::env::var("GAVMO_MODELS_DEV_URL")
+                .ok()
+                .map(|url| url.trim().to_owned())
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| providers::models_dev::DEFAULT_URL.to_owned()),
         }
     }
 
-    /// No environment overrides and no Bifrost binary.
+    /// No environment overrides, no Bifrost binary, and no catalog (never
+    /// the network).
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self {
             providers: providers::ALL,
             env: Values::new(),
+            catalog_url: "file:///nonexistent/models-dev.json".to_owned(),
             gateway: Arc::new(ModelGateway::new(
                 crate::bifrost::GatewayOptions::disabled("GAVMO_BIFROST is not set"),
                 std::path::PathBuf::from("/nonexistent/bifrost"),
@@ -192,15 +203,13 @@ impl AppState {
 
     /// The models guests are offered and the default/small ids, for
     /// `settings`.
-    fn model_choices(
-        &self,
-        settings: &Settings,
-    ) -> (Vec<&'static providers::ModelSpec>, String, String) {
+    fn model_choices(&self, settings: &Settings) -> (Vec<providers::ModelSpec>, String, String) {
         let configured = self.configured(settings);
         let kinds: Vec<&str> = configured.iter().map(|(p, _)| p.kind()).collect();
-        let models = providers::catalog(self.inner.providers, &kinds);
+        let offered = self.inner.model_catalog.models(self.inner.providers);
+        let models = providers::catalog(&offered, &kinds);
         let (default_model, small_model) = providers::pick_models(
-            self.inner.providers,
+            &offered,
             &kinds,
             (
                 settings.models.default_model.as_deref(),
@@ -224,6 +233,46 @@ impl AppState {
         self.inner.gateway.status()
     }
 
+    /// Fetches the model catalog from models.dev now, returning how many
+    /// models guests are offered after it. Workspaces started afterwards
+    /// get the new list.
+    pub async fn refresh_model_catalog(&self) -> Result<String> {
+        let ids: Vec<&str> = self
+            .inner
+            .providers
+            .iter()
+            .map(|p| p.models_dev_id())
+            .collect();
+        self.inner
+            .model_catalog
+            .refresh(&ids)
+            .await
+            .map_err(|why| {
+                RegistryError::Failed(format!("Couldn't update the model list: {why}"))
+            })?;
+        let settings = self.inner.settings.lock().await.clone();
+        let (models, _, _) = self.model_choices(&settings);
+        Ok(format!("{} models offered", models.len()))
+    }
+
+    /// Keeps the model catalog fresh for the daemon's lifetime: fetches it
+    /// now if the cached copy is stale (or missing), then daily, retrying
+    /// hourly after a failure.
+    pub fn spawn_model_catalog_refresh(&self) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(state.inner.model_catalog.due_in()).await;
+                match state.refresh_model_catalog().await {
+                    Ok(offered) => {
+                        tracing::info!("model catalog updated from models.dev: {offered}");
+                    }
+                    Err(e) => tracing::warn!("{e}"),
+                }
+            }
+        })
+    }
+
     /// The settings page's view. Re-applies the settings first, so fixing a
     /// host-side prerequisite (signing in with gcloud) takes effect on the
     /// next look.
@@ -239,12 +288,13 @@ impl AppState {
             gateway: self.inner.gateway.status(),
             providers: views,
             models: models
-                .iter()
+                .into_iter()
                 .map(|m| ModelChoice {
-                    id: m.id.to_owned(),
-                    name: m.name.to_owned(),
+                    id: m.id,
+                    name: m.name,
                 })
                 .collect(),
+            catalog: self.inner.model_catalog.status(self.inner.providers),
             saved_default_model: settings.models.default_model.clone(),
             saved_small_model: settings.models.small_model.clone(),
             default_model,
@@ -580,7 +630,24 @@ mod tests {
 
     impl Harness {
         fn new(providers: &'static [&'static dyn Provider], env: &[(&str, &str)]) -> Self {
+            Self::with_catalog(providers, env, None)
+        }
+
+        /// [`Self::new`], with a models.dev catalog file holding `catalog`.
+        fn with_catalog(
+            providers: &'static [&'static dyn Provider],
+            env: &[(&str, &str)],
+            catalog: Option<&str>,
+        ) -> Self {
             let tmp = tempfile::tempdir().unwrap();
+            let catalog_url = match catalog {
+                Some(contents) => {
+                    let file = tmp.path().join("models-dev.json");
+                    std::fs::write(&file, contents).unwrap();
+                    format!("file://{}", file.display())
+                }
+                None => ModelOptions::for_tests().catalog_url,
+            };
             let gcloud = tmp.path().join("gcloud");
             std::fs::create_dir(&gcloud).unwrap();
             std::fs::write(gcloud.join("application_default_credentials.json"), "{}").unwrap();
@@ -599,6 +666,7 @@ mod tests {
                     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                     .collect(),
                 gateway: Arc::new(gateway),
+                catalog_url,
             };
             let state = Self::open(tmp.path(), options);
             Self { tmp, state }
@@ -894,6 +962,66 @@ mod tests {
             "claude-opus-5-5",
             "unchanged"
         );
+        h.shutdown().await;
+    }
+
+    /// Once fetched, models.dev's list is what guests are offered, newest
+    /// first, with its metadata; the suggested defaults follow the newest
+    /// models while a saved choice stays.
+    #[tokio::test]
+    async fn the_fetched_catalog_is_offered_to_guests() {
+        use crate::providers::models_dev::tests::VERTEX_FIXTURE;
+        let h = Harness::with_catalog(WITH_KEYED, &[], Some(VERTEX_FIXTURE));
+        h.state
+            .save_provider("vertex", values(&[("project", "my-project-1")]))
+            .await
+            .unwrap();
+        let before = h.view().await;
+        assert_eq!(before.models.len(), 3, "the built-in list");
+        assert_eq!(before.catalog.fetched_secs_ago, None);
+        h.state
+            .set_default_models(Some("claude-opus-5-5".to_owned()), None)
+            .await
+            .unwrap();
+
+        let message = h.state.refresh_model_catalog().await.unwrap();
+        assert_eq!(message, "14 models offered");
+        let view = h.view().await;
+        assert_eq!(view.models[0].id, "claude-fable-5-2");
+        assert!(view.models.iter().any(|m| m.id == "claude-opus-4-8"));
+        assert_eq!(view.catalog.built_in, ["Keyed"]);
+        assert_eq!(
+            (view.default_model.as_str(), view.small_model.as_str()),
+            ("claude-opus-5-5", "claude-haiku-5-5")
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&h.state.guest_opencode_config().await).unwrap();
+        let opus = &config["provider"]["gavmo"]["models"]["claude-opus-4-8"];
+        assert_eq!(opus["id"], "vertex/claude-opus-4-8@default");
+        assert_eq!(opus["limit"]["context"], 1_000_000);
+        assert_eq!(opus["temperature"], false);
+        assert!(opus.get("knowledge").is_none(), "opencode would drop it");
+        // Older models can be picked too.
+        h.state
+            .set_default_models(Some("claude-sonnet-4-6".to_owned()), None)
+            .await
+            .unwrap();
+
+        // A failed update keeps the list and says why.
+        std::fs::write(h.tmp.path().join("models-dev.json"), "oops").unwrap();
+        let failed = h
+            .state
+            .refresh_model_catalog()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            failed.contains("Couldn't update the model list"),
+            "{failed}"
+        );
+        let view = h.view().await;
+        assert_eq!(view.models.len(), 14);
+        assert!(view.catalog.error.is_some_and(|e| e.contains("isn't JSON")));
         h.shutdown().await;
     }
 

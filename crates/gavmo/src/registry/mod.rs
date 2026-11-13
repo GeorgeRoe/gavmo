@@ -9,6 +9,7 @@ mod base_image;
 mod error;
 mod lifecycle;
 mod logs;
+mod model_catalog;
 mod models;
 mod paths;
 mod ports;
@@ -116,6 +117,8 @@ struct Inner {
     apply_lock: Mutex<()>,
     /// The model providers GAVMO supports.
     providers: &'static [&'static dyn crate::providers::Provider],
+    /// Their models, from models.dev.
+    model_catalog: model_catalog::ModelCatalog,
     /// Environment overrides of provider settings (see [`ModelOptions`]).
     provider_env: crate::providers::Values,
     /// The user's gcloud config dir, where provider credentials are read.
@@ -220,6 +223,10 @@ impl AppState {
                 settings: Mutex::new(settings),
                 apply_lock: Mutex::new(()),
                 providers: models.providers,
+                model_catalog: model_catalog::ModelCatalog::open(
+                    models.catalog_url,
+                    gavmo_data_dir.join(model_catalog::CACHE_FILE),
+                ),
                 provider_env: models.env,
                 gcloud_dir: gcloud_dir.to_path_buf(),
                 gateway: models.gateway,

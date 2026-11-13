@@ -15,10 +15,12 @@ use leptos::prelude::*;
 use super::hooks::run_action;
 use super::workspace_modal::{ConfirmButton, Confirming};
 use crate::api::{
-    get_model_settings, remove_provider, save_provider, set_default_models, test_model_gateway,
+    get_model_settings, refresh_model_catalog, remove_provider, save_provider, set_default_models,
+    test_model_gateway,
 };
 use crate::types::{
-    AppError, GatewayStatus, ModelSettingsView, ProviderCheck, ProviderField, ProviderView,
+    AppError, GatewayStatus, ModelCatalogStatus, ModelSettingsView, ProviderCheck, ProviderField,
+    ProviderView,
 };
 
 /// The `/settings` route.
@@ -408,6 +410,75 @@ pub(super) fn form_values(
         .collect()
 }
 
+/// Where the offered models come from, for the default models section.
+pub(super) fn catalog_summary(status: &ModelCatalogStatus) -> String {
+    let Some(age) = status.fetched_secs_ago else {
+        return "The built-in model list: the list from models.dev (the one opencode uses) \
+                hasn't been fetched yet."
+            .to_owned();
+    };
+    let ago = match age {
+        0..60 => "just now".to_owned(),
+        60..3_600 => format!("{} min ago", age / 60),
+        3_600..86_400 => format!("{} h ago", age / 3_600),
+        _ => match age / 86_400 {
+            1 => "1 day ago".to_owned(),
+            days => format!("{days} days ago"),
+        },
+    };
+    let built_in = if status.built_in.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {} offers its built-in models (models.dev doesn't list it).",
+            status.built_in.join(", ")
+        )
+    };
+    format!(
+        "Models from models.dev (the list opencode uses), updated {ago}; it is updated \
+         daily.{built_in}"
+    )
+}
+
+/// Where the offered models come from, with a button that updates them.
+/// `status` is `None` until the settings load.
+#[component]
+pub(super) fn ModelCatalogPanel(
+    status: Signal<Option<ModelCatalogStatus>>,
+    on_changed: Callback<()>,
+) -> impl IntoView {
+    let busy = RwSignal::new(false);
+    let result = RwSignal::new(None::<Result<String, String>>);
+    let refresh = move |_| {
+        result.set(None);
+        run_action(busy, refresh_model_catalog(), move |outcome| {
+            on_changed.run(());
+            result.set(Some(outcome.map_err(|e| e.to_string())));
+        });
+    };
+    // An update that just failed says why itself (below the button).
+    let just_failed = move || result.with(|r| matches!(r, Some(Err(_))));
+    view! {
+        <div class="tool-row">
+            <div class="tool-form">
+                {move || status.get().map(|status| view! {
+                    <p class="hint">{catalog_summary(&status)}</p>
+                    {status.error.filter(|_| !just_failed()).map(|e| view! {
+                        <p class="error">"The last update failed: " {e}</p>
+                    })}
+                })}
+                <div class="tool-actions">
+                    <button on:click=refresh disabled=move || busy.get()>
+                        {move || if busy.get() { "Updating…" } else { "Update model list" }}
+                    </button>
+                </div>
+            </div>
+            <ActionResult result />
+        </div>
+    }
+    .into_any()
+}
+
 /// The default and small model pickers. "Automatic" follows the providers'
 /// suggestion.
 #[component]
@@ -502,6 +573,7 @@ pub(super) fn DefaultModels(
             </label>
         }
     };
+    let catalog = Signal::derive(move || settings.with(|s| s.as_ref().map(|s| s.catalog.clone())));
 
     view! {
         <div class="tool-row">
@@ -515,6 +587,7 @@ pub(super) fn DefaultModels(
             </div>
             <ActionResult result />
         </div>
+        <ModelCatalogPanel status=catalog on_changed />
     }
     .into_any()
 }
