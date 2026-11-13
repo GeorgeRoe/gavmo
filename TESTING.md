@@ -33,7 +33,11 @@ What they cover, roughly by crate:
   probing, process supervision, using stand-in processes.
 - `gavmo`: the registry and lifecycle state machine with a scriptable fake
   launcher (`vm_handle::fake`), sessions and auth, credential binding and
-  the HTTP forwarder (against local axum servers), log reading, and UI
+  the HTTP forwarder (against local axum servers), log reading, model
+  providers and their settings (`registry::models`: save, remove,
+  environment overrides, vaulted secrets, the per-boot `opencode.json`,
+  against a stand-in Bifrost script whose generated config shows what it
+  was given), the gateway test (against local axum servers), and UI
   helpers that are plain Rust (e.g. `trim_front`).
 
 ## Daemon end-to-end tests
@@ -137,16 +141,16 @@ untested branch counts even when its line ran.
 ```sh
 cargo llvm-cov clean --workspace
 cargo llvm-cov --no-report --workspace --exclude gavmo -- --include-ignored
-cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm
+cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm --skip live_bifrost
 cargo llvm-cov report --summary-only --fail-under-regions 90 --fail-under-lines 91
 cargo llvm-cov report --html   # -> $CARGO_TARGET_DIR/llvm-cov/html/index.html
 ```
 
 This includes the real-qemu tests (so it needs `qemu`, `virtiofsd` and
-`/dev/kvm`, as in a GAVMO VM) but not the full-boot test. This repo's
-`gavmo.nix` provides `cargo-llvm-cov` and points it at the LLVM tools of
-the LLVM that rustc was built with; with rustup, `rustup component add
-llvm-tools-preview` does the same.
+`/dev/kvm`, as in a GAVMO VM) but not the full-boot or live model
+gateway tests. This repo's `gavmo.nix` provides `cargo-llvm-cov` and
+points it at the LLVM tools of the LLVM that rustc was built with; with
+rustup, `rustup component add llvm-tools-preview` does the same.
 
 cargo-llvm-cov leaves test files out of the count by default (`tests.rs`,
 `*_tests.rs`, `tests/`), but inline `#[cfg(test)] mod tests` blocks are

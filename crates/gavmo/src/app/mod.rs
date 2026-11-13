@@ -13,6 +13,7 @@ mod hooks;
 mod modal;
 mod polling;
 mod resources;
+mod settings;
 #[cfg(test)]
 #[cfg(feature = "ssr")]
 mod ssr_tests;
@@ -21,6 +22,7 @@ mod transitions;
 mod workspace_modal;
 
 use self::home::HomePage;
+use self::settings::SettingsPage;
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
@@ -57,6 +59,7 @@ pub fn App() -> impl IntoView {
             <main class="page">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=StaticSegment("settings") view=SettingsPage/>
                 </Routes>
             </main>
         </Router>

@@ -8,10 +8,11 @@
 use super::card::WorkspaceCard;
 use super::folder_browser::FolderBrowser;
 use super::modal::Modal;
+use super::settings::gateway_problem;
 use super::transitions::{go_to_login, set_card_vt_name, start_view_transition, vt_name};
 use super::workspace_modal::WorkspaceModal;
-use crate::api::list_workspaces;
-use crate::types::{AppError, WorkspaceInfo};
+use crate::api::{list_workspaces, model_gateway_status};
+use crate::types::{AppError, GatewayStatus, WorkspaceInfo};
 use leptos::prelude::*;
 /// The workspace grid, the detail modal for the selected workspace, and the
 /// add-workspace dialog.
@@ -78,6 +79,7 @@ pub(crate) fn HomePage() -> impl IntoView {
 
     view! {
         <TopBar on_add=Callback::new(move |()| show_browser.set(true)) />
+        <GatewayBanner refresh />
 
         <Show
             // Memoized: the grid only remounts on empty<->non-empty, not per poll.
@@ -130,7 +132,8 @@ pub(crate) fn HomePage() -> impl IntoView {
     }
 }
 
-/// The page header: title, "Add workspace" and "Log out everywhere".
+/// The page header: title, "Add workspace", "Settings" and "Log out
+/// everywhere".
 #[component]
 fn TopBar(on_add: Callback<()>) -> impl IntoView {
     view! {
@@ -140,6 +143,7 @@ fn TopBar(on_add: Callback<()>) -> impl IntoView {
                 <button class="primary" on:click=move |_| on_add.run(())>
                     "Add workspace"
                 </button>
+                <a class="button-link" href="/settings">"Settings"</a>
                 // A plain same-origin form POST; the server ends every session.
                 <form method="post" action="/logout">
                     <button
@@ -185,4 +189,33 @@ fn close_with_morph(
             },
         );
     })
+}
+
+/// A warning while agents can't reach any model (no provider configured, or
+/// the gateway failing), linking to the settings. Checked every 10th
+/// `refresh` (30 s); filled client-side only, like the workspace list.
+#[component]
+pub(super) fn GatewayBanner(refresh: RwSignal<u32>) -> impl IntoView {
+    let status = RwSignal::new(None::<GatewayStatus>);
+    let fetched = Resource::new(
+        move || refresh.get() / 10,
+        |_| async move { model_gateway_status().await },
+    );
+    Effect::new(move |_| {
+        // A failed check keeps the last known state; the grid shows errors.
+        if let Some(Ok(latest)) = fetched.get() {
+            status.set(Some(latest));
+        }
+    });
+    move || {
+        status.get().as_ref().and_then(gateway_problem).map(|why| {
+            view! {
+                <div class="banner">
+                    <strong>"Agents can't reach any model."</strong>
+                    " " {why} " "
+                    <a href="/settings">"Open settings"</a>
+                </div>
+            }
+        })
+    }
 }

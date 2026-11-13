@@ -223,3 +223,96 @@ pub struct ResourcesView {
     /// be set to this or more.
     pub disk_current_gib: Option<u32>,
 }
+
+/// The Settings page's model section: the gateway's state, every provider
+/// GAVMO supports (configured or not), and the models guests are offered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSettingsView {
+    pub gateway: GatewayStatus,
+    pub providers: Vec<ProviderView>,
+    /// The models guests get, from the configured providers (or, with none
+    /// configured, every provider's, so a guest's request still reaches the
+    /// gateway and explains what is missing).
+    pub models: Vec<ModelChoice>,
+    /// The saved default and small (titles, summaries) model ids; `None`
+    /// means the providers' suggestion, shown in `default_model` and
+    /// `small_model`.
+    pub saved_default_model: Option<String>,
+    pub saved_small_model: Option<String>,
+    /// The ids guests actually start with.
+    pub default_model: String,
+    pub small_model: String,
+}
+
+/// State of the host-side model gateway (Bifrost).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayStatus {
+    /// Not running, and why (nothing configured, no Bifrost binary, ...).
+    NotConfigured {
+        reason: String,
+    },
+    /// Started; not answering yet.
+    Starting,
+    Ready,
+    /// It exited or never became ready; it is being restarted.
+    Failing {
+        reason: String,
+    },
+}
+
+/// One model provider, as a schema-driven form: the UI renders `fields`
+/// without knowing anything provider-specific.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderView {
+    /// Stable id (`"vertex"`), the key in `settings.json`.
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    /// Saved in the settings, or set through environment variables.
+    pub configured: bool,
+    /// Configured only through environment variables; it can't be removed
+    /// here.
+    pub env_only: bool,
+    pub fields: Vec<ProviderField>,
+    /// Host-side prerequisites (credentials files and the like).
+    pub checks: Vec<ProviderCheck>,
+    /// Why the configuration in effect can't be used, if it can't.
+    pub error: Option<String>,
+}
+
+/// One form field of a [`ProviderView`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderField {
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    pub placeholder: String,
+    /// A credential: never sent to the browser (`value` is empty), stored in
+    /// the host's secret vault; submitting it empty keeps the stored one.
+    pub secret: bool,
+    pub required: bool,
+    /// The value in effect, or a suggestion for an unconfigured provider.
+    pub value: String,
+    /// For secrets: a value is stored.
+    pub is_set: bool,
+    /// The environment variable that sets this field, overriding the
+    /// settings; the field is then read-only here.
+    pub overridden_by: Option<String>,
+}
+
+/// The outcome of one host-side prerequisite check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCheck {
+    pub ok: bool,
+    pub message: String,
+    /// A command that fixes it, shown copyable.
+    pub fix: Option<String>,
+}
+
+/// A model guests can pick.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// The id opencode shows after `gavmo/`, e.g. `claude-sonnet-5-5`.
+    pub id: String,
+    pub name: String,
+}

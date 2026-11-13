@@ -227,10 +227,11 @@ impl AppState {
         // Mint the per-boot MCP token only on a real new boot: rotating a
         // running VM's token would break its already-loaded `gavmo-opencode`.
         let mcp_dir = self.mcp_dir_for(id);
-        let token = match mint_mcp_token(&mcp_dir, self.inner.mcp_port).await {
+        let opencode_config = self.guest_opencode_config().await;
+        let token = match mint_mcp_token(&mcp_dir, self.inner.mcp_port, &opencode_config).await {
             Ok(token) => token,
             Err(e) => {
-                let e = RegistryError::io("writing the MCP token", e);
+                let e = RegistryError::io("writing the MCP token and model list", e);
                 let mut running = self.inner.running.lock().await;
                 self.replace_slot(&mut running, id, Some(VmSlot::Failed(e.to_string())));
                 return Err(e);
@@ -476,11 +477,17 @@ impl AppState {
     /// Stops every VM, for daemon shutdown: refuses new boots, then stops all
     /// workspaces concurrently, waiting at most `limit` overall. Anything
     /// still running after that is left to the kernel: VM processes get
-    /// `SIGTERM` when the daemon exits (`vm` crate, `PR_SET_PDEATHSIG`).
+    /// `SIGTERM` when the daemon exits (`vm` crate, `PR_SET_PDEATHSIG`). Then
+    /// stops the model gateway.
     pub async fn shutdown(&self, limit: Duration) {
         self.inner
             .shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_all_vms(limit).await;
+        self.inner.gateway.shutdown().await;
+    }
+
+    async fn stop_all_vms(&self, limit: Duration) {
         let ids: Vec<String> = self.inner.running.lock().await.keys().cloned().collect();
         if ids.is_empty() {
             return;
@@ -612,13 +619,26 @@ pub(super) fn reap_stale_vm_processes(runtime_base: &Path) {
     }
 }
 
+/// The per-boot opencode config in the token share; the guest's
+/// `gavmo-opencode` points `OPENCODE_CONFIG` at it (`/etc/gavmo/mcp/opencode.json`).
+pub(super) const GUEST_OPENCODE_CONFIG: &str = "opencode.json";
+
 /// Mints a fresh MCP token and writes it to the share dir as `token.env` (the
 /// guest's `GAVMO_MCP_TOKEN`), along with the gateway's host port
 /// (`GAVMO_HOST_PORT`, which the guest's opencode config builds its gateway
 /// URLs from). The token becomes valid only once the caller puts it in a slot
 /// (see [`AppState::replace_slot`]).
-pub(super) async fn mint_mcp_token(dir: &Path, mcp_port: u16) -> io::Result<String> {
+///
+/// Also writes this boot's `opencode_config` (the offered models, see
+/// [`crate::providers::opencode_config`]) as [`GUEST_OPENCODE_CONFIG`].
+pub(super) async fn mint_mcp_token(
+    dir: &Path,
+    mcp_port: u16,
+    opencode_config: &[u8],
+) -> io::Result<String> {
     tokio::fs::create_dir_all(dir).await?;
+    // The guest reads it as `agent`, which the share maps the host owner to.
+    write_owner_only(&dir.join(GUEST_OPENCODE_CONFIG), opencode_config).await?;
     let token = uuid::Uuid::new_v4().to_string();
     let path = dir.join("token.env");
     let env = format!("GAVMO_MCP_TOKEN={token}\nGAVMO_HOST_PORT={mcp_port}\n");

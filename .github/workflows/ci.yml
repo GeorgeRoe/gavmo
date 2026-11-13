@@ -60,9 +60,10 @@ jobs:
       - run: cargo test -p gavmo --features ssr
 
   # The native tests again, instrumented, plus the #[ignore]d real-qemu ones
-  # (only the full-boot test is skipped: it needs a built base image). Fails
-  # below the floor in the last step; see "Coverage" in TESTING.md. The
-  # browser tests aren't measured: llvm-cov can't instrument wasm on stable.
+  # (the full-boot and live model tests are skipped: they need a built base
+  # image, or network and Google credentials). Fails below the floor in the
+  # last step; see "Coverage" in TESTING.md. The browser tests aren't
+  # measured: llvm-cov can't instrument wasm on stable.
   coverage:
     runs-on: ubuntu-latest
     steps:
@@ -96,7 +97,7 @@ jobs:
           echo "$out/bin" >> "$GITHUB_PATH"
           "$out/bin/virtiofsd" --version
       - run: cargo llvm-cov --no-report --workspace --exclude gavmo -- --include-ignored
-      - run: cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm
+      - run: cargo llvm-cov --no-report -p gavmo --features ssr -- --include-ignored --skip a_real_vm --skip live_bifrost
       # A ratchet just under the current coverage: raise it as tests are
       # added, never lower it to make a change pass (see TESTING.md).
       - run: cargo llvm-cov report --summary-only --fail-under-regions 90 --fail-under-lines 91

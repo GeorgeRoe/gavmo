@@ -38,6 +38,7 @@ async fn a_real_vm_boots_reports_stops_and_resets() {
         &tmp.path().join("run"),
         Arc::new(secrets::MemoryStore::new()),
         Arc::new(QemuLauncher),
+        crate::registry::ModelOptions::for_tests(),
     )
     .unwrap();
 

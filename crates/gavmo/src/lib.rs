@@ -21,6 +21,9 @@ pub mod bifrost;
 pub mod daemon;
 
 #[cfg(feature = "ssr")]
+mod providers;
+
+#[cfg(feature = "ssr")]
 mod sessions;
 
 #[cfg(feature = "ssr")]

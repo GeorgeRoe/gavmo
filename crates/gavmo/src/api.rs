@@ -1,9 +1,11 @@
 //! The server-function API: the control panel's entire interface to the
 //! daemon. Bodies only compile on the server, where they use the registry.
 
+use std::collections::BTreeMap;
+
 use crate::types::{
-    AppError, ConsoleChunk, DirListing, ResourcesView, ToolList, VmStats, WorkspaceInfo,
-    WorkspaceStatus,
+    AppError, ConsoleChunk, DirListing, GatewayStatus, ModelSettingsView, ResourcesView, ToolList,
+    VmStats, WorkspaceInfo, WorkspaceStatus,
 };
 use leptos::prelude::*;
 
@@ -177,6 +179,68 @@ pub async fn set_resources(
         .map_err(AppError::from)
 }
 
+/// The model settings page: every supported provider (with its fields,
+/// host-side checks and status), the offered models, the default choices,
+/// and the gateway's state. Re-applies the settings first, so a fixed
+/// prerequisite (gcloud sign-in) is picked up.
+#[server]
+pub async fn get_model_settings() -> Result<ModelSettingsView, AppError> {
+    let state = app_state()?;
+    state.model_settings().await.map_err(AppError::from)
+}
+
+/// Just the gateway's state, for the home page's banner.
+#[server]
+pub async fn model_gateway_status() -> Result<GatewayStatus, AppError> {
+    let state = app_state()?;
+    Ok(state.model_gateway_status())
+}
+
+/// Saves a model provider's settings (field key -> value; empty means the
+/// default, an empty secret keeps the stored one) and restarts the gateway.
+/// Secrets stay on the host.
+#[server]
+pub async fn save_provider(
+    kind: String,
+    #[server(default)] values: BTreeMap<String, String>,
+) -> Result<(), AppError> {
+    let state = app_state()?;
+    state
+        .save_provider(&kind, values)
+        .await
+        .map_err(AppError::from)
+}
+
+/// Forgets a model provider's settings and secrets, and restarts the
+/// gateway without it.
+#[server]
+pub async fn remove_provider(kind: String) -> Result<(), AppError> {
+    let state = app_state()?;
+    state.remove_provider(&kind).await.map_err(AppError::from)
+}
+
+/// Saves the default and small model (`None` for the suggestion); used by
+/// workspaces started afterwards.
+#[server]
+pub async fn set_default_models(
+    default_model: Option<String>,
+    small_model: Option<String>,
+) -> Result<(), AppError> {
+    let state = app_state()?;
+    state
+        .set_default_models(default_model, small_model)
+        .await
+        .map_err(AppError::from)
+}
+
+/// Sends one small request through the model gateway and reports how it
+/// went; `Err` explains a failure.
+#[server]
+pub async fn test_model_gateway() -> Result<String, AppError> {
+    let state = app_state()?;
+    state.test_model_gateway().await.map_err(AppError::from)
+}
+
 /// Fetches the injected [`registry::AppState`] from Leptos context.
 #[cfg(feature = "ssr")]
 fn app_state() -> Result<crate::registry::AppState, AppError> {
@@ -305,6 +369,12 @@ mod tests {
             test_tool(id(), id()).await.map(drop),
             get_resources(id()).await.map(drop),
             set_resources(id(), None, None, None).await,
+            get_model_settings().await.map(drop),
+            model_gateway_status().await.map(drop),
+            save_provider(id(), BTreeMap::new()).await,
+            remove_provider(id()).await,
+            set_default_models(None, None).await,
+            test_model_gateway().await.map(drop),
         ];
         for result in results {
             assert_eq!(

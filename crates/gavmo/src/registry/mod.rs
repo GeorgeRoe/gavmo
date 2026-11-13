@@ -9,6 +9,7 @@ mod base_image;
 mod error;
 mod lifecycle;
 mod logs;
+mod models;
 mod paths;
 mod ports;
 mod resources;
@@ -22,6 +23,7 @@ mod util;
 
 pub use self::error::RegistryError;
 use self::error::{Result, io_ctx};
+pub use self::models::ModelOptions;
 
 use std::collections::HashMap;
 use std::io;
@@ -105,6 +107,21 @@ struct Inner {
     /// Shared HTTP client for the tool forwarder; clones share one
     /// connection pool across all workspaces.
     http_client: reqwest::Client,
+
+    /// `settings.json` and its contents (model providers).
+    settings_path: PathBuf,
+    settings: Mutex<models::Settings>,
+    /// Held from reading the settings to applying them to the gateway, so
+    /// a stale snapshot is never applied after a newer one.
+    apply_lock: Mutex<()>,
+    /// The model providers GAVMO supports.
+    providers: &'static [&'static dyn crate::providers::Provider],
+    /// Environment overrides of provider settings (see [`ModelOptions`]).
+    provider_env: crate::providers::Values,
+    /// The user's gcloud config dir, where provider credentials are read.
+    gcloud_dir: PathBuf,
+    /// The model gateway (Bifrost) `/llm` forwards to.
+    gateway: Arc<crate::bifrost::ModelGateway>,
 }
 
 impl AppState {
@@ -113,8 +130,15 @@ impl AppState {
     /// `base_image` is the read-only NixOS qcow2 (from `GAVMO_BASE_IMAGE`);
     /// `gcloud_dir` holds the user's Google credentials (used by the model
     /// gateway on the host, never shared into VMs); no workspace may overlap it.
-    /// `mcp_port` is the host port the guest-facing gateway listens on.
-    pub fn new(base_image: PathBuf, gcloud_dir: &Path, mcp_port: u16) -> io::Result<Self> {
+    /// `mcp_port` is the host port the guest-facing gateway listens on;
+    /// `models` configures the model gateway (started by
+    /// [`Self::apply_model_settings`]).
+    pub fn new(
+        base_image: PathBuf,
+        gcloud_dir: &Path,
+        mcp_port: u16,
+        models: ModelOptions,
+    ) -> io::Result<Self> {
         let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
             .join("gavmo");
@@ -133,6 +157,7 @@ impl AppState {
             &default_runtime_base()?,
             secret_store,
             Arc::new(QemuLauncher),
+            models,
         )
     }
 
@@ -151,6 +176,7 @@ impl AppState {
         runtime_base_dir: &Path,
         secret_store: Arc<dyn SecretStore>,
         launcher: Arc<dyn Launcher>,
+        models: ModelOptions,
     ) -> io::Result<Self> {
         std::fs::create_dir_all(gavmo_data_dir)?;
         vm::create_private_dir_all(runtime_base_dir).map_err(io::Error::other)?;
@@ -162,6 +188,8 @@ impl AppState {
         let home_dir = home_dir.map(canonical_or_self);
         let registry_path = gavmo_data_dir.join("workspaces.json");
         let registry = load_registry(&registry_path)?;
+        let settings_path = gavmo_data_dir.join("settings.json");
+        let settings = models::load_settings(&settings_path)?;
         let mcp_base_dir = gavmo_data_dir.join("mcp");
         let vms_base_dir = gavmo_data_dir.join("vms");
         for workspace in &registry.workspaces {
@@ -188,6 +216,13 @@ impl AppState {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 launcher,
                 http_client: crate::integrations::forwarding_client().map_err(io::Error::other)?,
+                settings_path,
+                settings: Mutex::new(settings),
+                apply_lock: Mutex::new(()),
+                providers: models.providers,
+                provider_env: models.env,
+                gcloud_dir: gcloud_dir.to_path_buf(),
+                gateway: models.gateway,
             }),
         })
     }

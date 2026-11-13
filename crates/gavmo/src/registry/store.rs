@@ -39,13 +39,27 @@ pub(super) struct WorkspaceRecord {
 /// can be re-added (their VM disks are found again by path). Other read
 /// errors (permissions, I/O) are returned: nothing is discarded on a guess.
 pub(super) fn load_registry(path: &Path) -> io::Result<Registry> {
+    load_json_or_set_aside(
+        path,
+        "workspace registry was unreadable; starting with an empty one \
+         (re-add your workspaces; their VM disks are kept)",
+    )
+}
+
+/// Loads a JSON state file as [`load_registry`] does: missing is the
+/// default, unparsable is moved aside (logged with `what_happened`) and
+/// replaced by the default, other read errors are returned.
+pub(super) fn load_json_or_set_aside<T: serde::de::DeserializeOwned + Default>(
+    path: &Path,
+    what_happened: &str,
+) -> io::Result<T> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(T::default()),
         Err(e) => return Err(e),
     };
     match serde_json::from_slice(&bytes) {
-        Ok(registry) => Ok(registry),
+        Ok(value) => Ok(value),
         Err(parse_error) => {
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -56,10 +70,9 @@ pub(super) fn load_registry(path: &Path) -> io::Result<Registry> {
             tracing::error!(
                 error = %parse_error,
                 moved_to = %Path::new(&aside).display(),
-                "workspace registry was unreadable; starting with an empty one \
-                 (re-add your workspaces; their VM disks are kept)"
+                "{what_happened}"
             );
-            Ok(Registry::default())
+            Ok(T::default())
         }
     }
 }
@@ -70,7 +83,12 @@ pub(super) fn load_registry(path: &Path) -> io::Result<Registry> {
 /// truncated one. Runs on the blocking pool; callers hold the registry lock
 /// across it, which keeps concurrent saves ordered.
 pub(super) async fn save_registry(path: &Path, registry: &Registry) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(registry)
+    save_json(path, registry).await
+}
+
+/// Durably replaces a JSON state file, as [`save_registry`] does.
+pub(super) async fn save_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || crate::atomic_file::write_atomically(&path, &bytes))

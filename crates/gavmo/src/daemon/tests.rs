@@ -45,6 +45,7 @@ impl Daemon {
             &data.path().join("run"),
             Arc::new(secrets::MemoryStore::new()),
             Arc::new(FakeLauncher(Arc::clone(&script))),
+            crate::registry::ModelOptions::for_tests(),
         )
         .unwrap();
         let auth = crate::auth::Auth::new(TOKEN.to_owned(), data.path().join("sessions.json"))

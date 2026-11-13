@@ -11,8 +11,8 @@ mod daemon {
     use anyhow::{Context as _, Result, anyhow, bail};
     use clap::Parser as _;
     use gavmo::auth;
-    use gavmo::bifrost::{BifrostConfig, GcpSettings, Supervisor, Upstream};
-    use gavmo::registry::AppState;
+    use gavmo::bifrost::{GatewayOptions, ModelGateway};
+    use gavmo::registry::{AppState, ModelOptions};
     use leptos::prelude::get_configuration;
 
     /// Default control-panel port.
@@ -23,7 +23,9 @@ mod daemon {
     ///
     /// Every option can also be set through the environment variable shown;
     /// a flag beats its variable. Further settings (`GAVMO_GCLOUD_DIR`,
-    /// `GAVMO_BIFROST`, `GAVMO_GCP_PROJECT`, ...) are environment-only.
+    /// `GAVMO_BIFROST`, ...) are environment-only. Model providers are set up
+    /// in the control panel (Settings); `GAVMO_GCP_PROJECT` and
+    /// `GAVMO_GCP_REGION` override what is saved there.
     #[derive(clap::Parser, Debug)]
     #[command(name = "gavmo", version)]
     struct Cli {
@@ -130,8 +132,20 @@ mod daemon {
 
     async fn run(cli: Cli) -> Result<()> {
         let config = Config::new(cli)?;
-        let app_state = AppState::new(config.base_image, &config.gcloud_dir, config.mcp_port)
-            .context("failed to initialize GAVMO state")?;
+        let gateway = ModelGateway::new(
+            gateway_options(config.bifrost_port),
+            dirs::data_dir()
+                .context("cannot locate the user data dir")?
+                .join("gavmo")
+                .join("bifrost"),
+        );
+        let app_state = AppState::new(
+            config.base_image,
+            &config.gcloud_dir,
+            config.mcp_port,
+            ModelOptions::from_env(gateway),
+        )
+        .context("failed to initialize GAVMO state")?;
 
         warn_if_missing_from_path(&["qemu-img", "qemu-system-x86_64"]);
 
@@ -149,11 +163,13 @@ mod daemon {
         conf.leptos_options.site_addr = ui_addr;
         let ui_router = gavmo::daemon::ui_router(conf.leptos_options, &app_state, &auth);
 
-        let llm = start_model_gateway(&config.gcloud_dir, config.bifrost_port);
+        // Starts Bifrost if a provider is configured; otherwise guests' model
+        // requests fail with the reason until one is added in the UI.
+        app_state.apply_model_settings().await;
 
         // Separate port from the UI: guests must reach the bearer-authenticated
         // gateway (at 10.0.2.2) while the UI port stays session-cookie-gated.
-        let mcp_router = gavmo::daemon::mcp_router(&app_state, llm.clone());
+        let mcp_router = gavmo::daemon::mcp_router(&app_state);
         let mcp_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.mcp_port));
 
         // Bind both before announcing anything, so a port clash fails fast.
@@ -181,32 +197,14 @@ mod daemon {
             }
         };
         app_state.shutdown(VM_SHUTDOWN_LIMIT).await;
-        llm.shutdown().await;
         outcome
     }
 
-    /// Starts Bifrost, the host-side model gateway, if configured:
-    /// `GAVMO_BIFROST` (the `bifrost-http` binary) and `GAVMO_GCP_PROJECT`
-    /// are required, `GAVMO_GCP_REGION` defaults to `global`, and
-    /// `GAVMO_BIFROST_DATA_DIR` optionally holds its datasheets. Otherwise
-    /// (or if it can't start, e.g. `port` is taken) the daemon runs without
-    /// one and guests' model requests fail with the reason (logged here too).
-    fn start_model_gateway(gcloud_dir: &std::path::Path, port: Option<u16>) -> Upstream {
-        match model_gateway_config(gcloud_dir, port).and_then(|cfg| {
-            Supervisor::start(cfg).map_err(|e| format!("cannot start Bifrost: {e}"))
-        }) {
-            Ok(supervisor) => Upstream::Bifrost(supervisor),
-            Err(why) => {
-                tracing::warn!("model gateway disabled: {why}");
-                Upstream::NotConfigured(why)
-            }
-        }
-    }
-
-    fn model_gateway_config(
-        gcloud_dir: &std::path::Path,
-        port: Option<u16>,
-    ) -> std::result::Result<BifrostConfig, String> {
+    /// The model gateway's settings from the environment: `GAVMO_BIFROST`
+    /// (the `bifrost-http` binary, required) and `GAVMO_BIFROST_DATA_DIR`
+    /// (optional, its datasheets), both absolute. Without them the gateway
+    /// never runs and guests' model requests fail with the reason.
+    fn gateway_options(port: Option<u16>) -> GatewayOptions {
         let absolute = |var: &str| -> std::result::Result<Option<PathBuf>, String> {
             match std::env::var_os(var).map(PathBuf::from) {
                 Some(p) if p.is_absolute() => Ok(Some(p)),
@@ -217,32 +215,22 @@ mod daemon {
                 None => Ok(None),
             }
         };
-        let binary = absolute("GAVMO_BIFROST")?
-            .ok_or("GAVMO_BIFROST is not set (path to the bifrost-http binary)")?;
-        let project = std::env::var("GAVMO_GCP_PROJECT").map_err(|e| {
-            format!("GAVMO_GCP_PROJECT (the Google Cloud project for Vertex AI): {e}")
-        })?;
-        let region = std::env::var("GAVMO_GCP_REGION").unwrap_or_else(|_| "global".to_owned());
-        let gcp = GcpSettings::new(&project, &region)?;
-        let credentials_file = gcloud_dir.join("application_default_credentials.json");
-        if !credentials_file.is_file() {
-            return Err(format!(
-                "{} not found; run `gcloud auth application-default login`",
-                credentials_file.display()
-            ));
+        let paths = absolute("GAVMO_BIFROST").and_then(|binary| {
+            let binary =
+                binary.ok_or("GAVMO_BIFROST is not set (path to the bifrost-http binary)")?;
+            Ok((binary, absolute("GAVMO_BIFROST_DATA_DIR")?))
+        });
+        match paths {
+            Ok((binary, data_dir)) => GatewayOptions {
+                binary: Ok(binary),
+                data_dir,
+                port,
+            },
+            Err(why) => GatewayOptions {
+                port,
+                ..GatewayOptions::disabled(&why)
+            },
         }
-        let app_dir = dirs::data_dir()
-            .ok_or("no data dir")?
-            .join("gavmo")
-            .join("bifrost");
-        Ok(BifrostConfig {
-            binary,
-            app_dir,
-            gcp,
-            credentials_file,
-            data_dir: absolute("GAVMO_BIFROST_DATA_DIR")?,
-            port,
-        })
     }
 
     /// Upper bound on stopping all VMs at exit: one VM's graceful (30s) plus

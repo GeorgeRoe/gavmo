@@ -385,10 +385,13 @@ in
     ];
   };
 
-  # Per-workspace MCP bearer token (see `VmConfig::mcp_dir` in
-  # crates/vm/src/config.rs for why it's a separate share). gavmo-opencode
-  # loads token.env via EnvironmentFile, which root reads before dropping to
-  # `agent`, so uid mapping doesn't matter here.
+  # Per-boot files from the daemon (see `VmConfig::mcp_dir` in
+  # crates/vm/src/config.rs for why it's a separate share):
+  #   - token.env: the workspace's MCP bearer token. gavmo-opencode loads it
+  #     via EnvironmentFile, which root reads before dropping to `agent`.
+  #   - opencode.json: the models this boot offers and the default ones
+  #     (gavmo-opencode's OPENCODE_CONFIG). Read by `agent`, which the share
+  #     maps to the file's host owner.
   fileSystems."/etc/gavmo/mcp" = {
     device = "mcp";
     fsType = "virtiofs";
@@ -455,41 +458,27 @@ in
     # daemon's /llm route (see `hostGateway`), authenticated with this boot's
     # workspace token. The daemon forwards to its model gateway
     # (Bifrost), which holds the user's provider credentials - the guest has
-    # none. `id` is the model name Bifrost routes (provider/model).
-    model = "gavmo/claude-sonnet-5-5";
-    small_model = "gavmo/claude-haiku-5-5";
+    # none.
+    #
+    # The model list and the default `model`/`small_model` are not here: they
+    # depend on the providers configured in the control panel, so the daemon
+    # writes them per boot to /etc/gavmo/mcp/opencode.json (OPENCODE_CONFIG,
+    # merged into this). Setting `model` here would override that file.
+
     # The provider pin is the security boundary: only the host-served
     # provider can be used, whatever a repo's own opencode.json says.
     enabled_providers = [ "gavmo" ];
-    provider.gavmo =
-      let
-        claude = id: name: {
-          inherit id name;
-          reasoning = true;
-          tool_call = true;
-          attachment = true;
-          temperature = true;
-          # Conservative; drives opencode's auto-compaction threshold.
-          limit = {
-            context = 200000;
-            output = 64000;
-          };
-        };
-      in
-      {
-        name = "GAVMO";
-        # Bundled with opencode: nothing is fetched at runtime.
-        npm = "@ai-sdk/anthropic";
-        options = {
-          baseURL = "${hostGateway}/llm/anthropic/v1";
-          apiKey = "{env:GAVMO_MCP_TOKEN}";
-        };
-        models = {
-          claude-sonnet-5-5 = claude "vertex/claude-sonnet-5-5@default" "Claude Sonnet 5.5";
-          claude-haiku-5-5 = claude "vertex/claude-haiku-5-5@default" "Claude Haiku 5.5";
-          claude-opus-5-5 = claude "vertex/claude-opus-5-5@default" "Claude Opus 5.5";
-        };
+    # The endpoint stays here too: a repo's own opencode.json outranks
+    # OPENCODE_CONFIG, but not this file.
+    provider.gavmo = {
+      name = "GAVMO";
+      # Bundled with opencode: nothing is fetched at runtime.
+      npm = "@ai-sdk/anthropic";
+      options = {
+        baseURL = "${hostGateway}/llm/anthropic/v1";
+        apiKey = "{env:GAVMO_MCP_TOKEN}";
       };
+    };
 
     # Host-side tool gateway (see `hostGateway`). Always enabled: the gateway
     # filters tools per bearer token, returning an empty list rather than an
@@ -677,6 +666,8 @@ in
       # the overlay) and is host-visible. Relies on virtiofs locking
       # semantics; 9p caused SQLITE_IOERR here.
       XDG_DATA_HOME = "/workspace/.gavmo/opencode";
+      # This boot's models, written by the daemon (see the managed config).
+      OPENCODE_CONFIG = "/etc/gavmo/mcp/opencode.json";
     };
     serviceConfig = {
       ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p /workspace/.gavmo/opencode /home/agent/.local/share /home/agent/.config /home/agent/.cache";

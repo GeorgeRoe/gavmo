@@ -12,7 +12,8 @@ use vm::{Error as VmError, VmStatus};
 use mcp::{TokenAuthority, WorkspaceScope};
 
 use super::lifecycle::{
-    OPENCODE_WORKSPACE_SESSION_PATH, VmSlot, mint_mcp_token, slot_for_boot_error, to_status,
+    GUEST_OPENCODE_CONFIG, OPENCODE_WORKSPACE_SESSION_PATH, VmSlot, mint_mcp_token,
+    slot_for_boot_error, to_status,
 };
 use super::logs::{MAX_CONSOLE_LOG_BYTES, is_safe_rebuild_log_filename, sanitize_console};
 use super::paths::{check_workspace_path, human_bytes, workspace_hash};
@@ -352,6 +353,7 @@ fn scripted_app_state() -> (
         &data.path().join("run"),
         Arc::new(secrets::MemoryStore::new()),
         Arc::new(crate::vm_handle::fake::FakeLauncher(Arc::clone(&script))),
+        ModelOptions::for_tests(),
     )
     .unwrap();
     (data, state, script)
@@ -1556,13 +1558,15 @@ async fn write_owner_only_creates_and_resets_mode_0600() {
 }
 
 /// Minting writes `token.env` (with the gateway port the guest builds its
-/// URLs from); the token is not valid until a slot holds it.
+/// URLs from) and the boot's opencode config, both owner-only; the token is
+/// not valid until a slot holds it.
 #[tokio::test]
 async fn a_minted_token_is_written_but_only_valid_once_installed() {
+    use std::os::unix::fs::PermissionsExt as _;
     let (_data, state) = test_app_state();
     let (_tmp, dir) = unique_temp_dir("mcp-token-mint");
 
-    let token = mint_mcp_token(&dir, 8123).await.unwrap();
+    let token = mint_mcp_token(&dir, 8123, b"{}").await.unwrap();
     let contents = tokio::fs::read_to_string(dir.join("token.env"))
         .await
         .unwrap();
@@ -1570,7 +1574,24 @@ async fn a_minted_token_is_written_but_only_valid_once_installed() {
         contents,
         format!("GAVMO_MCP_TOKEN={token}\nGAVMO_HOST_PORT=8123\n")
     );
+    let config = dir.join(GUEST_OPENCODE_CONFIG);
+    assert_eq!(std::fs::read(&config).unwrap(), b"{}");
+    let mode = std::fs::metadata(&config).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
     assert_eq!(TokenAuthority::resolve(&state, &token), None);
+}
+
+/// Each boot's share carries the model list from the settings at that time:
+/// with nothing configured, every supported model, defaulting to the first
+/// provider's suggestions.
+#[tokio::test]
+async fn the_guest_opencode_config_lists_the_offered_models() {
+    let (_data, state) = test_app_state();
+    let config: serde_json::Value =
+        serde_json::from_slice(&state.guest_opencode_config().await).unwrap();
+    assert_eq!(config["model"], "gavmo/claude-sonnet-5-5");
+    assert_eq!(config["small_model"], "gavmo/claude-haiku-5-5");
+    assert!(config["provider"]["gavmo"]["models"]["claude-opus-5-5"].is_object());
 }
 
 /// The token index follows the slot: valid while Booting/Running,
@@ -1643,6 +1664,7 @@ async fn an_unreadable_secret_store_is_an_error_not_unconfigured() {
         Arc::new(crate::vm_handle::fake::FakeLauncher(
             crate::vm_handle::fake::Script::new(),
         )),
+        ModelOptions::for_tests(),
     )
     .unwrap();
     let (_repo, id) = registered_repo(&state).await;

@@ -124,7 +124,8 @@ daemon binary.
   `THIRD_PARTY_NOTICES.md` beside it (upstream has no NOTICE file).
 - The wrapped `gavmo` command sets `GAVMO_BIFROST` to it as a default; the
   user's own `GAVMO_BIFROST` still wins. Dev and tests set it by hand (the
-  flake's dev shell does too); without it, `/llm` reports "not configured".
+  flake's dev shell does too); without it, `/llm` and the settings page
+  report why there are no models.
 - Datasheets are still fetched by Bifrost at startup (about 6-10 s, see 1)
   unless `GAVMO_BIFROST_DATA_DIR` is set.
 
@@ -141,10 +142,14 @@ daemon binary.
    - strip it; reverse-proxy streaming to Bifrost;
    - body size limit; no timeout on the stream.
 3. Settings panel writes provider settings, which regenerate Bifrost's
-   config. Only GCP for now.
+   config. Only GCP for now. Done (2026-11-12): `/settings` in the control
+   panel, `settings.json`, schema-driven provider forms
+   (`crates/gavmo/src/providers/`), `GAVMO_GCP_*` as read-only overrides.
 4. Guest image:
    - drop the gcloud share/mount and `GOOGLE_*` env;
-   - provider block as above (static in the image, or per-boot via
-     `OPENCODE_CONFIG_CONTENT` written to token.env-style file);
+   - provider endpoint static in the managed config; the model list and
+     default models per boot, as `opencode.json` in the token share loaded
+     via `OPENCODE_CONFIG` (done 2026-11-12; a repo's own `opencode.json`
+     outranks it, so the endpoint stays in the managed file);
    - this is a base-image change, so workspaces get "reset needed".
 5. Packaging: a pinned Nix package (see 8).

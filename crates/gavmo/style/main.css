@@ -633,3 +633,124 @@ button.danger:hover:not(:disabled) {
 .resource-grid .hint {
   margin: 0;
 }
+
+/* Links styled as buttons (topbar navigation) */
+a.button-link {
+  display: inline-block;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.9rem;
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+
+a.button-link:hover {
+  border-color: var(--accent);
+}
+
+h1 .home-link {
+  color: var(--text);
+  text-decoration: none;
+}
+
+/* Home page warning banner */
+.banner {
+  margin-bottom: 1.25rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--warn);
+  background: rgba(240, 180, 41, 0.08);
+  font-size: 0.85rem;
+}
+
+/* Settings page */
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.settings-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.settings-subtitle {
+  margin: 0.75rem 0 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.settings-section .hint {
+  margin: 0;
+}
+
+.settings-label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.gateway-panel {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.gateway-panel .tool-status {
+  margin-left: 0;
+}
+
+.tool-status--err {
+  color: var(--err);
+}
+
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.field-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.tool-input[readonly] {
+  color: var(--muted);
+}
+
+.check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin: 0.3rem 0;
+  font-size: 0.8rem;
+}
+
+.check--ok .check-mark {
+  color: var(--ok);
+}
+
+.check--err .check-mark {
+  color: var(--err);
+}
+
+.check-fix {
+  flex-basis: 100%;
+  padding: 0.3rem 0.5rem;
+  color: var(--text);
+  word-break: break-all;
+  /* One click selects the whole command for copying. */
+  user-select: all;
+}

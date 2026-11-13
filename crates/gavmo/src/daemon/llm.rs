@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use mcp::TokenAuthority;
 
-use crate::bifrost::Upstream;
+use crate::bifrost::ModelGateway;
 
 /// Largest request body accepted. Conversations with images can be large;
 /// this still keeps one request from buffering unbounded memory.
@@ -57,13 +57,14 @@ const DROPPED_RESPONSE_HEADERS: &[&str] = &[
 #[derive(Clone)]
 struct Llm {
     authority: Arc<dyn TokenAuthority>,
-    upstream: Upstream,
+    gateway: Arc<ModelGateway>,
     client: reqwest::Client,
 }
 
-/// The `/llm` router. `authority` resolves workspace tokens; `upstream`
-/// says where requests go.
-pub(super) fn router(authority: Arc<dyn TokenAuthority>, upstream: Upstream) -> Router {
+/// The `/llm` router. `authority` resolves workspace tokens; `gateway`
+/// says where requests go (looked up per request, so settings changes
+/// apply at once).
+pub(super) fn router(authority: Arc<dyn TokenAuthority>, gateway: Arc<ModelGateway>) -> Router {
     // No overall timeout: a streamed response legitimately runs for minutes.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -72,7 +73,7 @@ pub(super) fn router(authority: Arc<dyn TokenAuthority>, upstream: Upstream) -> 
         .unwrap_or_default();
     Router::new().fallback(forward).with_state(Llm {
         authority,
-        upstream,
+        gateway,
         client,
     })
 }
@@ -132,13 +133,13 @@ async fn forward(State(llm): State<Llm>, request: Request) -> Response {
             "no such model route",
         );
     }
-    let base = match llm.upstream.base_url() {
+    let base = match llm.gateway.upstream().base_url() {
         Ok(base) => base,
         Err(why) => {
             return error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",
-                &format!("the model gateway is not configured: {why}"),
+                &format!("the model gateway is unavailable: {why}"),
             );
         }
     };
@@ -269,8 +270,10 @@ mod tests {
         format!("http://{addr}")
     }
 
+    use crate::bifrost::Upstream;
+
     fn app(upstream: Upstream) -> Router {
-        router(Arc::new(OneToken), upstream)
+        router(Arc::new(OneToken), Arc::new(ModelGateway::fixed(upstream)))
     }
 
     async fn send(app: Router, request: HttpRequest<Body>) -> (StatusCode, HeaderMap, String) {
@@ -471,14 +474,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a bifrost-http binary, network and Google credentials"]
     async fn live_bifrost_serves_a_streamed_request_through_the_route() {
-        use crate::bifrost::{BifrostConfig, GcpSettings, Supervisor};
+        use crate::bifrost::{BifrostConfig, Supervisor};
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
         let tmp = tempfile::tempdir().unwrap();
         let supervisor = Supervisor::start(BifrostConfig {
             binary: var("GAVMO_TEST_BIFROST").into(),
             app_dir: tmp.path().join("bifrost"),
-            gcp: GcpSettings::new(&var("GAVMO_TEST_GCP_PROJECT"), "global").unwrap(),
-            credentials_file: var("GAVMO_TEST_ADC").into(),
+            providers: vec![crate::providers::vertex::block(
+                &var("GAVMO_TEST_GCP_PROJECT"),
+                "global",
+                std::path::Path::new(&var("GAVMO_TEST_ADC")),
+            )],
             data_dir: std::env::var("GAVMO_TEST_BIFROST_DATA_DIR")
                 .ok()
                 .map(Into::into),

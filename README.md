@@ -37,15 +37,16 @@ you Reset them; the repo and opencode sessions are kept.
 What else the host needs:
 
 - **An OS keyring** (Secret Service, e.g. GNOME Keyring or KWallet, as on
-  any desktop) to store tool credentials. Without one GAVMO still runs, but
-  can't save credentials for `gavmo.yaml` tools.
-- **Models** come from Vertex AI through your Google Cloud credentials (see
-  "Models" under Architecture): run `gcloud auth application-default login`,
-  then start GAVMO with your project, e.g.
-  `GAVMO_GCP_PROJECT=my-project gavmo`. Without that, VMs still boot and
-  opencode opens, but model requests fail with "model gateway is not
-  configured". On the first start with a project set, Bifrost downloads its
-  model datasheets (about 27 MB) from the internet.
+  any desktop) to store tool credentials and provider API keys. Without one
+  GAVMO still runs, but can't save credentials for `gavmo.yaml` tools.
+- **A model provider**, set up under **Settings** in the control panel (see
+  "Models" under Architecture). For now that is Vertex AI with your Google
+  Cloud credentials: run `gcloud auth application-default login`, then enter
+  your project under Settings (it is suggested from your gcloud config).
+  Until a provider is set up, VMs still boot and opencode opens, but model
+  requests fail with the reason, and the home page says so. The first time
+  Bifrost starts it downloads its model datasheets (about 27 MB) from the
+  internet.
 
 To build everything from source instead (compiles the daemon, opencode and
 the VM image; slow), use `nix profile install github:GeorgeRoe/gavmo#gavmo-from-source`.
@@ -70,7 +71,7 @@ nix run github:GeorgeRoe/gavmo -- --ui-port 4000 --mcp-port 4001
 The UI and MCP ports must differ. Guests are told the MCP port each time
 they boot (VMs never outlive the daemon), so the VM image doesn't depend on
 it. If the Bifrost port is taken, the daemon still starts, without models
-(the reason is logged), as when Bifrost isn't configured.
+(the reason is logged and shown under Settings).
 
 ## Architecture
 
@@ -112,7 +113,8 @@ Workspaces and VMs:
   by older versions are unused (the daemon logs a hint) and can be deleted.
 - virtiofs shares: repo -> `/workspace` (rw), MCP token dir ->
   `/etc/gavmo/mcp` (ro; its `token.env` holds the boot's token and the
-  gateway port, `GAVMO_HOST_PORT`). No credentials are shared into VMs.
+  gateway port, `GAVMO_HOST_PORT`, and its `opencode.json` the boot's models,
+  see "Models"). No credentials are shared into VMs.
   Unprivileged `virtiofsd` maps the host owner to guest `agent` (uid 1000).
 - QEMU user-mode NAT forwards a free `127.0.0.1` port to opencode on guest
   port 7080; the guest reaches host loopback via `10.0.2.2`.
@@ -137,8 +139,8 @@ Models:
   (the same one as the tool gateway). The daemon checks it, strips it and any
   `x-bf-*` header, and streams the request to its model gateway: a supervised
   [Bifrost](https://github.com/maximhq/bifrost) process holding the user's
-  Google Application Default Credentials and doing the Vertex translation.
-  Only `/llm/anthropic/v1/*` is forwarded, never Bifrost's admin API.
+  provider credentials and translating to each provider's API. Only
+  `/llm/anthropic/v1/*` is forwarded, never Bifrost's admin API.
 - Bifrost runs with a generated file-only config
   (`~/.local/share/gavmo/bifrost/config.json`, log `bifrost.log` beside
   it): no database, no request logging. In that mode it has no inbound auth
@@ -146,19 +148,33 @@ Models:
   else a free port), which guests can't reach (QEMU maps their `10.0.2.2`
   only to host `127.0.0.1`). It dies with the daemon and is restarted (with
   backoff) if it exits.
-- Configuration, for now from the environment:
-  - `GAVMO_BIFROST`: absolute path to the `bifrost-http` binary.
-  - `GAVMO_GCP_PROJECT`: the Google Cloud project for Vertex AI.
-  - `GAVMO_GCP_REGION`: optional, default `global`.
+- Providers are configured under **Settings** in the control panel and saved
+  in `~/.local/share/gavmo/settings.json`; secret fields (API keys) go to
+  the vault (see below), never that file or the browser. Saving or removing
+  a provider restarts Bifrost with the new set, cutting off requests in
+  flight. Supported now: **Google Vertex AI** (project and region, default
+  `global`), authenticated by `application_default_credentials.json` in
+  `GAVMO_GCLOUD_DIR` (default `~/.config/gcloud`), written by
+  `gcloud auth application-default login`. The page checks for it and
+  shows the command if it is missing; signing in later is picked up the
+  next time the page loads. Providers are defined in
+  `crates/gavmo/src/providers/` (one `Provider` impl each: form fields,
+  models, Bifrost config); the UI renders their fields generically.
+- Environment variables override the saved settings field by field, and
+  such fields are read-only in the UI: `GAVMO_GCP_PROJECT` and
+  `GAVMO_GCP_REGION` (setting them alone configures Vertex). Also from the
+  environment:
+  - `GAVMO_BIFROST`: absolute path to the `bifrost-http` binary (without it
+    there are no models, and the UI says why).
   - `GAVMO_BIFROST_DATA_DIR`: optional dir with Bifrost's `datasheet.json`
     and `model-parameters.json`, so it starts without downloading them.
-  Credentials are `application_default_credentials.json` in `GAVMO_GCLOUD_DIR`
-  (default `~/.config/gcloud`), written by
-  `gcloud auth application-default login`. Without the first two the daemon
-  still runs, and model requests fail with the reason.
-- The guest's models are declared in `nix/base/configuration.nix`
-  (`provider.gavmo.models`), mapping opencode names to Bifrost ones
-  (`vertex/claude-sonnet-5-5@default`).
+- Each boot's models come from the daemon, not the image: it writes the
+  configured providers' models and the default and small model (chosen
+  under Settings, else the providers' suggestion) to the token share's
+  `opencode.json`, which `gavmo-opencode` loads as `OPENCODE_CONFIG` on top
+  of the managed config. Model changes therefore apply when a workspace
+  next starts. opencode names map to Bifrost ones
+  (`claude-sonnet-5-5` -> `vertex/claude-sonnet-5-5@default`).
 
 Tool gateway and secrets:
 

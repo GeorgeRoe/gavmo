@@ -382,6 +382,11 @@ async fn the_home_page_starts_out_loading() {
         html.contains("Add workspace") && html.contains("Log out everywhere"),
         "{html}"
     );
+    assert!(html.contains(r#"href="/settings""#), "{html}");
+    assert!(
+        !html.contains("reach any model"),
+        "the banner waits for the browser"
+    );
     assert!(html.contains("Loading…"), "{html}");
 }
 
@@ -393,4 +398,304 @@ async fn the_folder_picker_lists_the_home_directory() {
     let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
     assert!(html.contains(home.to_str().unwrap()), "{html}");
     assert!(html.contains("Use this directory"), "{html}");
+}
+
+mod settings {
+    use std::collections::BTreeMap;
+
+    use leptos::prelude::*;
+
+    use super::{render, render_resolved};
+    use crate::app::settings::{
+        ActionResult, CheckLine, DefaultModels, FieldInput, GatewayPanel, ProviderCard,
+        SettingsPage, form_values, gateway_problem,
+    };
+    use crate::types::{
+        GatewayStatus, ModelChoice, ModelSettingsView, ProviderCheck, ProviderField, ProviderView,
+    };
+
+    fn field(key: &str, secret: bool) -> ProviderField {
+        ProviderField {
+            key: key.to_owned(),
+            label: format!("{key} label"),
+            help: format!("{key} help"),
+            placeholder: format!("{key} placeholder"),
+            secret,
+            required: true,
+            value: if secret {
+                String::new()
+            } else {
+                format!("{key} value")
+            },
+            is_set: false,
+            overridden_by: None,
+        }
+    }
+
+    fn provider(configured: bool) -> ProviderView {
+        let mut project = field("project", false);
+        project.overridden_by = Some("GAVMO_GCP_PROJECT".to_owned());
+        let mut key = field("api_key", true);
+        key.is_set = true;
+        ProviderView {
+            kind: "vertex".to_owned(),
+            name: "Google Vertex AI".to_owned(),
+            description: "Claude through Google Cloud.".to_owned(),
+            configured,
+            env_only: false,
+            fields: vec![project, field("region", false), key],
+            checks: vec![ProviderCheck {
+                ok: false,
+                message: "No credentials".to_owned(),
+                fix: Some("gcloud auth application-default login".to_owned()),
+            }],
+            error: configured.then(|| "Region is invalid".to_owned()),
+        }
+    }
+
+    fn settings_view() -> ModelSettingsView {
+        let model = |id: &str, name: &str| ModelChoice {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        };
+        ModelSettingsView {
+            gateway: GatewayStatus::Failing {
+                reason: "exited".to_owned(),
+            },
+            providers: vec![provider(true)],
+            models: vec![model("big", "Big model"), model("small", "Small model")],
+            saved_default_model: Some("big".to_owned()),
+            saved_small_model: None,
+            default_model: "big".to_owned(),
+            small_model: "small".to_owned(),
+        }
+    }
+
+    /// The page as first served: the header and "Loading…" until the
+    /// browser fetches the settings.
+    #[tokio::test]
+    async fn the_settings_page_starts_out_loading() {
+        let html = render_resolved(|| view! { <SettingsPage/> }).await;
+        assert!(
+            html.contains("Settings") && html.contains("Back to workspaces"),
+            "{html}"
+        );
+        assert!(html.contains("Loading…"), "{html}");
+    }
+
+    /// A configured provider: its badge, checks with the fixing command,
+    /// error, fields (the overridden one read-only, the secret masked) and
+    /// Save / Remove.
+    #[test]
+    fn a_provider_card_renders_its_schema() {
+        let html = render(|| {
+            let provider = Memo::new(|_| Some(provider(true)));
+            view! { <ProviderCard provider on_changed=Callback::new(|()| ())/> }
+        });
+        for expected in [
+            "Google Vertex AI",
+            "Claude through Google Cloud.",
+            "needs attention",
+            "No credentials",
+            "gcloud auth application-default login",
+            "Region is invalid",
+            "region label",
+            "region help",
+            "Set by <code>GAVMO_GCP_PROJECT</code>",
+            "readonly",
+            r#"type="password""#,
+            "Stored; enter a new one to replace it",
+            ">Save<",
+            ">Remove<",
+            "Saving restarts the gateway",
+        ] {
+            assert!(html.contains(expected), "{expected:?} in {html}");
+        }
+    }
+
+    /// An unconfigured provider is added, not saved, and can't be removed.
+    #[test]
+    fn an_unconfigured_provider_card_offers_to_add_it() {
+        let html = render(|| {
+            let provider = Memo::new(|_| Some(provider(false)));
+            view! { <ProviderCard provider on_changed=Callback::new(|()| ())/> }
+        });
+        assert!(
+            html.contains("not configured") && html.contains(">Add<"),
+            "{html}"
+        );
+        assert!(
+            !html.contains(">Remove<") && !html.contains("Saving restarts"),
+            "{html}"
+        );
+
+        let mut env_only = provider(true);
+        env_only.env_only = true;
+        let html = render(move || {
+            let provider = Memo::new(move |_| Some(env_only.clone()));
+            view! { <ProviderCard provider on_changed=Callback::new(|()| ())/> }
+        });
+        assert!(
+            html.contains("environment variables") && !html.contains(">Remove<"),
+            "{html}"
+        );
+    }
+
+    /// A passed check has no fix; an unset secret shows its placeholder.
+    #[test]
+    fn checks_and_fields_render_their_state() {
+        let html = render(|| {
+            let check = ProviderCheck {
+                ok: true,
+                message: "Found".to_owned(),
+                fix: None,
+            };
+            view! { <CheckLine check/> }
+        });
+        assert!(
+            html.contains("check--ok") && !html.contains("check-fix"),
+            "{html}"
+        );
+
+        let html = render(|| {
+            let edits = RwSignal::new(BTreeMap::new());
+            let busy = RwSignal::new(false);
+            view! { <FieldInput field=field("api_key", true) edits busy/> }
+        });
+        assert!(
+            html.contains("api_key placeholder") && html.contains("(required)"),
+            "{html}"
+        );
+    }
+
+    /// Save sends typed values over shown ones, secrets only when typed,
+    /// and nothing for fields set through the environment.
+    #[test]
+    fn the_form_sends_typed_or_shown_values() {
+        let typed = BTreeMap::from([("region".to_owned(), "us-east5".to_owned())]);
+        let sent = form_values(&provider(true), &typed);
+        assert_eq!(sent, typed, "project is overridden, the key not typed");
+
+        let typed = BTreeMap::from([("api_key".to_owned(), "sk".to_owned())]);
+        let sent = form_values(&provider(true), &typed);
+        assert_eq!(sent["region"], "region value");
+        assert_eq!(sent["api_key"], "sk");
+    }
+
+    #[test]
+    fn gateway_problems_are_explained_except_while_it_works() {
+        assert_eq!(gateway_problem(&GatewayStatus::Ready), None);
+        assert_eq!(gateway_problem(&GatewayStatus::Starting), None);
+        let not_configured = GatewayStatus::NotConfigured {
+            reason: "no model provider".to_owned(),
+        };
+        assert_eq!(
+            gateway_problem(&not_configured).as_deref(),
+            Some("No model provider")
+        );
+        let empty = GatewayStatus::NotConfigured {
+            reason: String::new(),
+        };
+        assert_eq!(gateway_problem(&empty).as_deref(), Some(""));
+        let failing = GatewayStatus::Failing {
+            reason: "exited".to_owned(),
+        };
+        assert!(gateway_problem(&failing).unwrap().contains("exited"));
+    }
+
+    /// Each gateway state has its own badge; a working one explains nothing.
+    #[test]
+    fn every_gateway_state_has_a_badge() {
+        for (status, class, label) in [
+            (GatewayStatus::Ready, "tool-status--ok", "ready"),
+            (GatewayStatus::Starting, "tool-status--warn", "starting"),
+            (
+                GatewayStatus::NotConfigured {
+                    reason: "no model provider".to_owned(),
+                },
+                "tool-status\"",
+                "not running",
+            ),
+        ] {
+            let working = gateway_problem(&status).is_none();
+            let html = render(move || {
+                let mut view = settings_view();
+                view.gateway = status;
+                let settings = RwSignal::new(Some(view));
+                view! { <GatewayPanel settings on_changed=Callback::new(|()| ())/> }
+            });
+            assert!(
+                html.contains(class) && html.contains(&format!(">{label}<")),
+                "{label}: {html}"
+            );
+            assert_eq!(!working, html.contains("No model provider"), "{html}");
+        }
+    }
+
+    /// A configured provider without a problem says so.
+    #[test]
+    fn a_working_provider_is_shown_as_configured() {
+        let mut working = provider(true);
+        working.error = None;
+        let html = render(move || {
+            let provider = Memo::new(move |_| Some(working.clone()));
+            view! { <ProviderCard provider on_changed=Callback::new(|()| ())/> }
+        });
+        assert!(
+            html.contains("tool-status--ok") && html.contains(">configured<"),
+            "{html}"
+        );
+    }
+
+    /// An action's outcome: nothing before it, then success or the error.
+    #[test]
+    fn action_results_show_success_and_errors_apart() {
+        for (outcome, class) in [
+            (None, None),
+            (Some(Ok("Saved.".to_owned())), Some("tool-result--ok")),
+            (Some(Err("refused".to_owned())), Some("tool-result--err")),
+        ] {
+            let text = outcome
+                .clone()
+                .map(|r: Result<String, String>| r.unwrap_or_else(|e| e));
+            let html = render(move || {
+                let result = RwSignal::new(outcome);
+                view! { <ActionResult result/> }
+            });
+            match (class, text) {
+                (Some(class), Some(text)) => {
+                    assert!(html.contains(class) && html.contains(&text), "{html}");
+                }
+                _ => assert!(!html.contains("tool-result"), "{html}"),
+            }
+        }
+    }
+
+    /// The gateway's state, and the model pickers with the saved choice
+    /// selected and what workspaces start with.
+    #[test]
+    fn the_gateway_and_default_models_show_the_settings() {
+        let html = render(|| {
+            let settings = RwSignal::new(Some(settings_view()));
+            view! { <GatewayPanel settings on_changed=Callback::new(|()| ())/> }
+        });
+        assert!(
+            html.contains("failing") && html.contains("It keeps failing: exited"),
+            "{html}"
+        );
+
+        let html = render(|| {
+            let settings = RwSignal::new(Some(settings_view()));
+            view! { <DefaultModels settings on_changed=Callback::new(|()| ())/> }
+        });
+        assert!(
+            html.contains("Workspaces start with Big model (and Small model"),
+            "{html}"
+        );
+        assert!(html.contains(r#"<option value="big" selected"#), "{html}");
+        assert!(
+            html.contains(r#"<option value="" selected"#),
+            "small is automatic: {html}"
+        );
+    }
 }
