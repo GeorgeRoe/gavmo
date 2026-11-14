@@ -8,26 +8,16 @@ edition = "2024"
 # Internal crates only; never publish to crates.io by accident.
 publish = false
 license = "MIT"
+# Matches rust-toolchain.toml; older compilers fail with a clear error.
+rust-version = "1.98"
 
-# Single source of truth for versions shared by more than one crate. Member
-# crates opt in with `foo = { workspace = true }` and may add features.
+# Only dependencies used by two or more crates, plus the internal crates.
+# Members opt in with `foo.workspace = true` and may add features.
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = "1"
-http = "1"
-url = "2"
-tempfile = "3"
-tower = "0.5"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Internal crates: added back here as each one is ported.
 
 [workspace.lints.rust]
-# No crate needs `unsafe` today. `deny` (not `forbid`) so a future, reviewed
-# use can opt out locally with `#[expect(unsafe_code, reason = "...")]`.
+# `deny`, not `forbid`, so a reviewed use can opt out locally with
+# `#[expect(unsafe_code, reason = "...")]`. The only one is `vm::process`.
 unsafe_code = "deny"
 # Discarding a `#[must_use]` value (Result, Future, ...) is almost always a bug.
 unused_must_use = "deny"
@@ -79,6 +69,10 @@ cast_sign_loss = "warn"
 float_cmp_const = "warn"
 lossy_float_literal = "warn"
 
+# --- Output: the daemon logs through `tracing`; printing must be deliberate. ---
+print_stdout = "warn"
+print_stderr = "warn"
+
 # --- Misc correctness / hygiene. ---
 dbg_macro = "warn"
 mem_forget = "warn"
@@ -104,15 +98,6 @@ cast_precision_loss = "allow"
 # work inside them is a separate, real problem tracked by review, not by lint.)
 unused_async = "allow"
 unused_async_trait_impl = "allow"
-
-# Size-optimized profile for the cargo-leptos WASM bundle in release mode.
-# Must live at the workspace root so cargo honors it for the member crate.
-[profile.wasm-release]
-inherits = "release"
-opt-level = 'z'
-lto = true
-codegen-units = 1
-panic = "abort"
 
 # Integer overflow is a logic bug; trap on it in release builds too rather than
 # silently wrapping (port arithmetic, byte counts, CPU-time deltas, ...).
