@@ -48,6 +48,34 @@ mod daemon {
         /// guests' reach) [default: any free port]
         #[arg(long, env = "GAVMO_BIFROST_PORT", value_name = "PORT", value_parser = port_parser())]
         bifrost_port: Option<u16>,
+
+        /// Where the key that encrypts stored credentials is kept. `auto`
+        /// keeps it wherever it already is; a fresh install uses Windows
+        /// (DPAPI, via interop) on WSL and the OS keyring elsewhere.
+        #[arg(long, env = "GAVMO_KEY_STORE", value_enum, default_value_t = KeyStore::Auto)]
+        key_store: KeyStore,
+    }
+
+    /// `--key-store` values.
+    #[derive(clap::ValueEnum, Clone, Copy, Debug)]
+    enum KeyStore {
+        /// Wherever the key already is; for a new install, Windows on WSL and
+        /// the OS keyring elsewhere.
+        Auto,
+        /// The OS keyring (Secret Service, e.g. GNOME Keyring).
+        SecretService,
+        /// Windows DPAPI, through WSL interop.
+        Windows,
+    }
+
+    impl From<KeyStore> for secrets::KeyStoreChoice {
+        fn from(value: KeyStore) -> Self {
+            match value {
+                KeyStore::Auto => Self::Auto,
+                KeyStore::SecretService => Self::SecretService,
+                KeyStore::Windows => Self::Windows,
+            }
+        }
     }
 
     /// Ports 1-65535: port 0 would mean "any", which no URL can name.
@@ -63,6 +91,7 @@ mod daemon {
         ui_port: u16,
         mcp_port: u16,
         bifrost_port: Option<u16>,
+        key_store: secrets::KeyStoreChoice,
     }
 
     impl Config {
@@ -103,6 +132,7 @@ mod daemon {
                 ui_port: cli.ui_port,
                 mcp_port: cli.mcp_port,
                 bifrost_port: cli.bifrost_port,
+                key_store: cli.key_store.into(),
             })
         }
     }
@@ -144,6 +174,7 @@ mod daemon {
             &config.gcloud_dir,
             config.mcp_port,
             ModelOptions::from_env(gateway),
+            config.key_store,
         )
         .context("failed to initialize GAVMO state")?;
 

@@ -9,15 +9,29 @@ pub enum SecretError {
     /// Secret Service, ...).
     #[error("the OS keystore is unavailable: {0}")]
     KeyUnavailable(#[source] keyring_core::Error),
-    /// A vault exists but its data key is gone from the keystore. A new key
+    /// The Secret Service is reachable but has no default keyring to store a
+    /// new key in.
+    #[error(
+        "the OS keyring has no default keyring to store the vault key in \
+         (common on WSL and headless Linux, where nothing creates the \"login\" \
+         keyring): create one, e.g. with seahorse or `gnome-keyring-daemon --unlock`; \
+         on WSL, --key-store windows avoids the Linux keyring altogether"
+    )]
+    NoDefaultKeyring,
+    /// The Windows key store (DPAPI, reached through WSL interop) couldn't be
+    /// used: no interop, no PowerShell, a policy blocking it, ...
+    #[error("the Windows key store is unavailable: {0}")]
+    WindowsKeyUnavailable(String),
+    /// A vault exists but its data key is gone from the key store. A new key
     /// is deliberately *not* minted: that would make the existing secrets
     /// unrecoverable without saying so.
     #[error(
-        "the vault {path} exists but its key is missing from the OS keystore; \
+        "the vault {path} exists but its key is missing from the key store \
+         (the OS keyring, or vault-key.dpapi next to the vault on WSL); \
          restore the key, or move the vault aside to start over"
     )]
     KeyMissing { path: PathBuf },
-    #[error("the vault data key in the OS keystore is invalid: {0}")]
+    #[error("the stored vault data key is invalid: {0}")]
     BadKey(String),
     #[error("{action} {path}: {source}")]
     Io {

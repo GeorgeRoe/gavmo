@@ -38,7 +38,8 @@ What else the host needs:
 
 - **An OS keyring** (Secret Service, e.g. GNOME Keyring or KWallet, as on
   any desktop) to store tool credentials and provider API keys. Without one
-  GAVMO still runs, but can't save credentials for `gavmo.yaml` tools.
+  GAVMO still runs, but can't save credentials for `gavmo.yaml` tools. On
+  WSL none is needed: see "WSL" below.
 - **A model provider**, set up under **Settings** in the control panel (see
   "Models" under Architecture). For now that is Vertex AI with your Google
   Cloud credentials: run `gcloud auth application-default login`, then enter
@@ -72,6 +73,39 @@ The UI and MCP ports must differ. Guests are told the MCP port each time
 they boot (VMs never outlive the daemon), so the VM image doesn't depend on
 it. If the Bifrost port is taken, the daemon still starts, without models
 (the reason is logged and shown under Settings).
+
+### WSL
+
+Stock WSL has no usable Linux keyring: there is no desktop login, so the
+"login" keyring a Secret Service would store into is never created. So on
+WSL, GAVMO keeps the vault's key with Windows instead. It seals the key with
+DPAPI (to your Windows account) by running Windows PowerShell through WSL
+interop, and stores the sealed key as `~/.local/share/gavmo/vault-key.dpapi`
+next to the vault. Signing in to Windows is what unlocks it, so there is
+nothing to set up or unlock. Opening the vault takes about half a second
+(a second the first time, when the key is created), once per daemon run.
+
+Which store is used is decided each time the vault opens (`--key-store`,
+`GAVMO_KEY_STORE`; the startup log says which it would pick):
+
+- `auto` (default): an existing key stays where it is, so a vault from before
+  this, or one set up with a Linux keyring on WSL, keeps using the keyring. A
+  new install uses Windows on WSL with interop, and the keyring elsewhere.
+- `secret-service`: always the OS keyring.
+- `windows`: always Windows DPAPI.
+
+Needs WSL interop (on unless `[interop] enabled=false` in `/etc/wsl.conf`)
+and Windows PowerShell 5.1 in full language mode. Machines locked down by
+policy (Constrained Language Mode, AppLocker) fail with the reason; use a
+Linux keyring there. PowerShell is looked up on `PATH`, then at
+`/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`; set
+`GAVMO_POWERSHELL` if it is elsewhere.
+
+Like an unlocked keyring, the sealed key can be opened by any process
+running as your Windows user, which includes anything in WSL. If an
+administrator *resets* your Windows password (rather than you changing it),
+DPAPI keys are lost and the vault can't be opened; move it aside and enter
+the credentials again.
 
 ## Architecture
 
@@ -204,7 +238,8 @@ Tool gateway and secrets:
   the user enters credentials in the UI. Credentials are host-locked to and
   bound to the approved `base_url`; a changed URL fails closed.
 - The vault is one XChaCha20-Poly1305 file whose key is a single OS keystore
-  entry; it opens lazily and fails closed without a keystore.
+  entry, or on WSL a DPAPI-sealed file next to it (see "WSL"); it opens
+  lazily and fails closed without its key store.
 - Guests can reach the UI port (`:3000` by default) too, so every route requires a
   session cookie from a host-only token; the daemon prints the login URL.
   Request bodies there are capped at 64 KiB and must arrive within 10 s in

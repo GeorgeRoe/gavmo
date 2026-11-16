@@ -1,4 +1,10 @@
-//! The vault's data key and where it comes from.
+//! The vault's data key and where it comes from: the OS keyring
+//! ([`KeyringKeyProvider`]) or, on WSL, Windows DPAPI ([`DpapiKeyProvider`]),
+//! picked per vault open by [`KeyResolver`].
+
+mod dpapi;
+mod keyring;
+mod select;
 
 use base64::Engine as _;
 use chacha20poly1305::Key;
@@ -7,14 +13,12 @@ use zeroize::Zeroizing;
 
 use crate::SecretError;
 
+pub use dpapi::{DPAPI_KEY_FILE, DpapiKeyProvider};
+pub use keyring::{KEYRING_SERVICE, KeyringKeyProvider, VAULT_KEY_ENTRY};
+pub use select::{KeyBackend, KeyFacts, KeyResolver, KeyStoreChoice, choose};
+
 /// XChaCha20-Poly1305 uses a 256-bit key.
 pub const KEY_LEN: usize = 32;
-
-/// The `service` name all GAVMO entries live under in the OS keystore.
-pub const KEYRING_SERVICE: &str = "gavmo";
-
-/// Keyring entry holding the vault's base64-encoded data key.
-pub const VAULT_KEY_ENTRY: &str = "vault-data-key";
 
 /// The vault's 256-bit data key; zeroized on drop, redacted in `Debug`.
 #[derive(Clone)]
@@ -34,11 +38,12 @@ impl DataKey {
         &self.0
     }
 
-    fn encode(&self) -> Zeroizing<String> {
+    /// Base64, the form both key stores hold (their values are strings).
+    pub(crate) fn encode(&self) -> Zeroizing<String> {
         Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(self.as_bytes()))
     }
 
-    fn decode(encoded: &str) -> Result<Self, SecretError> {
+    pub(crate) fn decode(encoded: &str) -> Result<Self, SecretError> {
         let bytes = Zeroizing::new(
             base64::engine::general_purpose::STANDARD
                 .decode(encoded.trim())
@@ -71,41 +76,6 @@ pub trait KeyProvider: Send + Sync {
 
     /// Creates and persists a new key. Only called when no vault exists yet.
     fn create_key(&self) -> Result<DataKey, SecretError>;
-}
-
-/// Production [`KeyProvider`]: the key lives in the [`VAULT_KEY_ENTRY`] keyring
-/// entry.
-#[derive(Debug, Default, Clone)]
-pub struct KeyringKeyProvider;
-
-impl KeyringKeyProvider {
-    /// Built from its own store (connecting to the Secret Service), not
-    /// keyring-core's process-wide default store: no global state, and the
-    /// key is read only when a vault opens.
-    fn entry() -> Result<keyring_core::Entry, SecretError> {
-        use keyring_core::api::CredentialStoreApi as _;
-        zbus_secret_service_keyring_store::Store::new()
-            .and_then(|store| store.build(KEYRING_SERVICE, VAULT_KEY_ENTRY, None))
-            .map_err(SecretError::KeyUnavailable)
-    }
-}
-
-impl KeyProvider for KeyringKeyProvider {
-    fn load_key(&self) -> Result<Option<DataKey>, SecretError> {
-        match Self::entry()?.get_password() {
-            Ok(encoded) => DataKey::decode(&Zeroizing::new(encoded)).map(Some),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(e) => Err(SecretError::KeyUnavailable(e)),
-        }
-    }
-
-    fn create_key(&self) -> Result<DataKey, SecretError> {
-        let key = DataKey::generate();
-        Self::entry()?
-            .set_password(&key.encode())
-            .map_err(SecretError::KeyUnavailable)?;
-        Ok(key)
-    }
 }
 
 #[cfg(test)]

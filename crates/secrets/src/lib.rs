@@ -1,9 +1,10 @@
 //! Host-side secret storage for GAVMO's tool gateway: opaque strings by key.
 //!
 //! The main backend, [`VaultStore`], is one XChaCha20-Poly1305-encrypted file
-//! whose data key is the single GAVMO entry in the OS keystore. It fails closed:
-//! if the keystore is unreachable, every operation errors; there is no
-//! plaintext fallback.
+//! whose data key is kept by a key store: the single GAVMO entry in the OS
+//! keyring, or, on WSL, a key sealed with Windows DPAPI next to the vault
+//! ([`KeyResolver`] picks which). It fails closed: if the key store is
+//! unreachable, every operation errors; there is no plaintext fallback.
 //!
 //! Secret material (the data key, decrypted vault contents, values) is
 //! zeroized when dropped. This is best effort - values returned to callers
@@ -11,14 +12,17 @@
 //! the vault's own copies from lingering.
 
 mod error;
+mod fs;
 mod key;
 #[cfg(any(test, feature = "test-util"))]
 mod memory;
 mod vault;
+pub mod wsl;
 
 pub use error::SecretError;
 pub use key::{
-    DataKey, KEY_LEN, KEYRING_SERVICE, KeyProvider, KeyringKeyProvider, VAULT_KEY_ENTRY,
+    DPAPI_KEY_FILE, DataKey, DpapiKeyProvider, KEY_LEN, KEYRING_SERVICE, KeyBackend, KeyFacts,
+    KeyProvider, KeyResolver, KeyStoreChoice, KeyringKeyProvider, VAULT_KEY_ENTRY, choose,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use memory::MemoryStore;

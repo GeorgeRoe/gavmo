@@ -1,12 +1,12 @@
 //! [`VaultStore`]: all secrets in one encrypted file, held open (and locked)
 //! by one process; and [`LazyVaultStore`], which opens it on first use.
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::format::{self, SecretMap};
+use crate::fs::{create_private_dir_all, parent_dir, with_suffix, write_new, write_private_atomic};
 use crate::{DataKey, KeyProvider, KeyringKeyProvider, SecretError, SecretStore};
 
 /// All secrets in one encrypted file, decrypted into memory on open and
@@ -89,28 +89,12 @@ impl VaultStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Durably replaces the vault file with the encrypted `map`, so a crash
-    /// leaves either the old or the new vault, never a truncated one: a
-    /// uniquely named `0600` temp file in the same dir is written and
-    /// fsynced, renamed over the vault, and the dir is fsynced. On any error
-    /// the temp file is removed (by `NamedTempFile`'s drop).
+    /// Durably replaces the vault file with the encrypted `map`: a crash
+    /// leaves either the old or the new vault, never a truncated one (see
+    /// [`write_private_atomic`]).
     fn flush(&self, map: &SecretMap) -> Result<(), SecretError> {
-        use std::io::Write as _;
-
         let payload = format::encrypt(&self.key, map)?;
-        let dir = parent_dir(&self.path)?;
-        create_private_dir_all(dir)?;
-        let mut tmp = private_tempfile_builder()
-            .tempfile_in(dir)
-            .map_err(SecretError::io("creating temp file for", &self.path))?;
-        tmp.write_all(&payload)
-            .map_err(SecretError::io("writing temp file for", &self.path))?;
-        tmp.as_file()
-            .sync_all()
-            .map_err(SecretError::io("syncing temp file for", &self.path))?;
-        tmp.persist(&self.path)
-            .map_err(|e| SecretError::io("replacing", &self.path)(e.error))?;
-        sync_dir(dir)
+        write_private_atomic(&self.path, &payload, true)
     }
 
     /// Applies `mutate` to a copy of the map, persists the copy, and only then
@@ -209,17 +193,6 @@ impl SecretStore for LazyVaultStore {
     }
 }
 
-fn parent_dir(path: &Path) -> Result<&Path, SecretError> {
-    path.parent()
-        .ok_or_else(|| SecretError::Backend(format!("vault path {} has no parent", path.display())))
-}
-
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = OsString::from(path.as_os_str());
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
 /// Takes the vault's exclusive lock (non-blocking).
 fn lock_vault(path: &Path) -> Result<File, SecretError> {
     let lock_path = with_suffix(path, ".lock");
@@ -237,65 +210,6 @@ fn lock_vault(path: &Path) -> Result<File, SecretError> {
         }),
         Err(std::fs::TryLockError::Error(e)) => Err(SecretError::io("locking", &lock_path)(e)),
     }
-}
-
-/// Writes `bytes` to a new `0600` file at `path`; an existing file is kept
-/// (it is an earlier backup).
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), SecretError> {
-    use std::io::Write as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    match options.open(path) {
-        Ok(mut file) => file
-            .write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(SecretError::io("writing backup", path)),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(SecretError::io("creating backup", path)(e)),
-    }
-}
-
-/// A temp-file builder for vault writes: `0600` on Unix, applied at creation
-/// (also `tempfile`'s default, but this must never silently regress).
-/// Elsewhere the platform default applies (`tempfile` rejects explicit
-/// permissions there); Windows inherits ACLs from the per-user profile dir.
-fn private_tempfile_builder() -> tempfile::Builder<'static, 'static> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".secrets.vault.").suffix(".tmp");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o600));
-    }
-    builder
-}
-
-/// Creates `dir` (and parents) with mode `0700` on Unix where they don't yet
-/// exist. Existing directories are left as they are.
-fn create_private_dir_all(dir: &Path) -> Result<(), SecretError> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-        .create(dir)
-        .map_err(SecretError::io("creating", dir))
-}
-
-/// Fsyncs a directory so a rename inside it is durable. Unix only: Windows
-/// can't open directories this way and `MoveFileEx` semantics differ.
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> Result<(), SecretError> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(SecretError::io("syncing", dir))
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> Result<(), SecretError> {
-    Ok(())
 }
 
 #[cfg(test)]

@@ -26,7 +26,11 @@ What they cover, roughly by crate:
 - `toolspec`: `gavmo.yaml` parsing and validation, the host-lock
   (`lock_url`) and `canonical_base_url`.
 - `secrets`: the vault format (v1 to v2 migration, the `.v1.bak` backup),
-  locking, key handling, the in-memory store.
+  locking, key handling, the in-memory store; the WSL key store (DPAPI
+  through a stand-in `powershell.exe` script: sealing, timeouts, policy
+  failures, CLIXML errors), WSL detection on fake `/proc` trees, and which
+  key store is picked. Real DPAPI needs a Windows machine and is checked by
+  hand there.
 - `mcp`: bearer parsing, and the gateway driven through its tower service
   with a fake authority (401s, scoping, unknown tools, `Origin` refusal).
 - `vm`: qemu argument building, disk/overlay handling, QMP, health

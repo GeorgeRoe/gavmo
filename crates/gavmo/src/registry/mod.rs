@@ -135,21 +135,29 @@ impl AppState {
     /// gateway on the host, never shared into VMs); no workspace may overlap it.
     /// `mcp_port` is the host port the guest-facing gateway listens on;
     /// `models` configures the model gateway (started by
-    /// [`Self::apply_model_settings`]).
+    /// [`Self::apply_model_settings`]); `key_store` is where the vault's key
+    /// is kept (`--key-store`).
     pub fn new(
         base_image: PathBuf,
         gcloud_dir: &Path,
         mcp_port: u16,
         models: ModelOptions,
+        key_store: secrets::KeyStoreChoice,
     ) -> io::Result<Self> {
         let gavmo_data_dir = dirs::data_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no data dir"))?
             .join("gavmo");
-        // Opened lazily so a host with a broken/absent OS keystore can still
+        // Opened lazily so a host with a broken/absent key store can still
         // run the daemon and manage VMs; only secret operations fail (closed).
-        // There is no plaintext fallback.
-        let secret_store: Arc<dyn SecretStore> = Arc::new(secrets::LazyVaultStore::keyring_backed(
-            gavmo_data_dir.join("secrets.vault"),
+        // There is no plaintext fallback. The key store (OS keyring, or
+        // Windows DPAPI on WSL) is picked on each open attempt, so fixing the
+        // environment takes effect without a restart.
+        let vault_path = gavmo_data_dir.join("secrets.vault");
+        let key_resolver = secrets::KeyResolver::new(&vault_path, key_store);
+        log_key_store(&key_resolver);
+        let secret_store: Arc<dyn SecretStore> = Arc::new(secrets::LazyVaultStore::new(
+            vault_path,
+            Box::new(key_resolver),
         ));
         Self::with_data_dir(
             base_image,
@@ -338,5 +346,19 @@ impl AppState {
             .await
             .get(id)
             .map_or(WorkspaceStatus::Stopped, slot_status)
+    }
+}
+
+/// Logs which key store the vault would use if it opened now (it decides
+/// again on each open), so the choice shows up at startup rather than at
+/// the first secret operation.
+fn log_key_store(resolver: &secrets::KeyResolver) {
+    match resolver.facts() {
+        Ok(facts) => tracing::info!(
+            host = %facts.wsl,
+            "vault key store: {}",
+            secrets::choose(&facts)
+        ),
+        Err(e) => tracing::warn!(error = %e, "cannot tell which vault key store to use"),
     }
 }
