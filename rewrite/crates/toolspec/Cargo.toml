@@ -1,0 +1,20 @@
+[package]
+name = "toolspec"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Pure-Rust YAML with resource budgets, for the untrusted gavmo.yaml (the
+# libyaml ports are unmaintained and have no alias-expansion budget). Pinned:
+# re-check `yaml_options` and the error wording tests before bumping.
+serde-saphyr = { version = "=2.0.0", default-features = false, features = ["deserialize"] }
+thiserror = "2"
+# Spec-compliant URL parsing for the host-lock; string prefixing is bypassable.
+url = "2"
