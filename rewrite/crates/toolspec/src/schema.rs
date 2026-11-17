@@ -2,41 +2,15 @@
 //! check runs while deserializing, so a value that exists has passed them,
 //! and errors carry their position in the file.
 
-use std::borrow::Borrow;
 use std::collections::BTreeMap;
-use std::fmt;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 
-use crate::BaseUrl;
+use crate::{BaseUrl, HeaderName, SecretName, ToolId};
 
 /// Most tools one `gavmo.yaml` may request.
 const MAX_TOOLS: usize = 64;
-/// Tool ids become MCP tool names, which are at most 64 characters.
-const MAX_TOOL_ID_LEN: usize = 64;
-/// Reserved for GAVMO's own tools (e.g. `gavmo_ping`), so a repo can't
-/// shadow or duplicate them.
-const RESERVED_TOOL_PREFIX: &str = "gavmo_";
-const MAX_SECRET_NAME_LEN: usize = 128;
-const MAX_HEADER_NAME_LEN: usize = 128;
-
-/// Headers that can't carry a credential: they control HTTP framing,
-/// routing or connection handling, or carry other credentials, so setting
-/// them could smuggle or retarget requests or mix credentials. Anything
-/// starting with `proxy-` is refused as well.
-const FORBIDDEN_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "upgrade",
-    "te",
-    "trailer",
-    "expect",
-    "cookie",
-];
 
 /// The per-repo `gavmo.yaml`. Untrusted: a repo can request a tool and name
 /// the secret it needs, but never supply a credential.
@@ -54,7 +28,6 @@ pub struct ToolDef {
     /// Every forwarded request is host-locked to this URL's origin and path.
     pub base_url: BaseUrl,
     pub auth: Auth,
-    /// The secret the user is asked for (a name, not a value).
     pub secret: SecretName,
     /// Shown in the control panel and the MCP tool description.
     pub description: Option<String>,
@@ -96,33 +69,9 @@ impl Auth {
     }
 }
 
-/// A tool id: 1-64 of `[A-Za-z0-9_-]`, not starting with `gavmo_`. Becomes
-/// the MCP tool name, so it follows MCP's naming rule.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ToolId(String);
-
-/// A secret's name: 1-128 of `[A-Za-z0-9_.-]`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SecretName(String);
-
-/// An HTTP header name (an RFC 9110 token) that may carry a credential.
-/// Compares case-insensitively, as HTTP does; displays as written.
-#[derive(Debug, Clone)]
-pub struct HeaderName(String);
-
-/// Why a value in `gavmo.yaml` was rejected. Only ever seen as a message.
+/// Checks on more than one value at once. Only ever seen as a message.
 #[derive(Debug, thiserror::Error)]
 enum Invalid {
-    #[error("tool id {0:?} must be 1-64 characters of A-Z, a-z, 0-9, _ and -")]
-    ToolId(String),
-    #[error("tool id {0:?} is reserved (ids starting with gavmo_ are GAVMO's own)")]
-    ReservedToolId(String),
-    #[error("secret name {0:?} must be 1-128 characters of A-Z, a-z, 0-9, _, - and .")]
-    SecretName(String),
-    #[error("header_name {0:?} is not a valid HTTP header name")]
-    HeaderName(String),
-    #[error("header_name {0:?} controls the request itself and can't carry a credential")]
-    ForbiddenHeader(String),
     #[error("auth: header needs a header_name")]
     MissingHeaderName,
     #[error("header_name is only allowed with auth: header")]
@@ -131,102 +80,7 @@ enum Invalid {
     TooManyTools(usize),
 }
 
-/// `true` if `s` is 1..=`max` bytes, every char accepted by `ok`.
-fn is_name(s: &str, max: usize, ok: impl Fn(char) -> bool) -> bool {
-    !s.is_empty() && s.len() <= max && s.chars().all(ok)
-}
-
-impl ToolId {
-    fn new(id: String) -> Result<Self, Invalid> {
-        if !is_name(&id, MAX_TOOL_ID_LEN, |c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '-')
-        }) {
-            return Err(Invalid::ToolId(id));
-        }
-        if id.starts_with(RESERVED_TOOL_PREFIX) {
-            return Err(Invalid::ReservedToolId(id));
-        }
-        Ok(Self(id))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl SecretName {
-    fn new(name: String) -> Result<Self, Invalid> {
-        if is_name(&name, MAX_SECRET_NAME_LEN, |c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
-        }) {
-            Ok(Self(name))
-        } else {
-            Err(Invalid::SecretName(name))
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl HeaderName {
-    fn new(name: String) -> Result<Self, Invalid> {
-        let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
-        if !is_name(&name, MAX_HEADER_NAME_LEN, is_token_char) {
-            return Err(Invalid::HeaderName(name));
-        }
-        let lower = name.to_ascii_lowercase();
-        if FORBIDDEN_HEADERS.contains(&lower.as_str()) || lower.starts_with("proxy-") {
-            return Err(Invalid::ForbiddenHeader(name));
-        }
-        Ok(Self(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl PartialEq for HeaderName {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
-    }
-}
-
-impl Eq for HeaderName {}
-
-/// Lets `tools.get("jira")` look up by plain string.
-impl Borrow<str> for ToolId {
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-macro_rules! display_as_str {
-    ($($ty:ty),*) => {$(
-        impl fmt::Display for $ty {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(self.as_str())
-            }
-        }
-    )*};
-}
-display_as_str!(ToolId, SecretName, HeaderName);
-
 // --- Deserializing ---
-
-/// Deserializes a string, then checks it with `new`.
-macro_rules! deserialize_checked {
-    ($($ty:ty),*) => {$(
-        impl<'de> Deserialize<'de> for $ty {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-            }
-        }
-    )*};
-}
-deserialize_checked!(ToolId, SecretName, HeaderName);
 
 /// `gavmo.yaml` as written. Unknown keys are rejected, so a typo is an error
 /// rather than silently ignored.
@@ -298,6 +152,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+    use crate::header_name::header_name;
     use crate::parse_config;
 
     /// A valid one-tool config; `fields` replaces the default `auth` and
@@ -310,13 +165,6 @@ mod tests {
 
     fn error(yaml: &str) -> String {
         parse_config(yaml).unwrap_err().to_string()
-    }
-
-    fn header_auth(name: &str) -> String {
-        tool(
-            "t",
-            &format!("    auth: header\n    header_name: \"{name}\"\n    secret: s\n"),
-        )
     }
 
     #[test]
@@ -352,10 +200,7 @@ tools:
         assert_eq!(jira.test_path.as_deref(), Some("/rest/api/3/myself"));
 
         let docs = &config.tools["docs"];
-        let Auth::Header(name) = &docs.auth else {
-            panic!("expected header auth, got {:?}", docs.auth);
-        };
-        assert_eq!(name.as_str(), "X-API-Key");
+        assert_eq!(docs.auth, Auth::Header(header_name("X-API-Key")));
         assert_eq!(docs.description, None);
     }
 
@@ -381,7 +226,7 @@ tools:
             .unwrap()
             .tools
             .into_keys()
-            .map(|id| id.to_string())
+            .map(ToolId::into_inner)
             .collect();
         assert_eq!(ids, ["alpha", "zeta"]);
     }
@@ -397,74 +242,25 @@ tools:
         assert_eq!(error(&yaml), "too many tools (65); at most 64 are allowed");
     }
 
+    /// Each value's own checks are tested next to its type; here, that they
+    /// run while parsing and report where the value is.
     #[test]
-    fn tool_ids_must_be_mcp_names() {
-        for good in ["jira", "dafni-jira", "a_b-9", &"x".repeat(64)] {
-            assert!(parse_config(&tool(good, BEARER)).is_ok(), "{good}");
-        }
-        for bad in [
-            "\"has space\"",
-            "\"ünicode\"",
-            "\"a.b\"",
-            &"x".repeat(65),
-            "\"\"",
-        ] {
-            let err = error(&tool(bad, BEARER));
-            assert!(err.contains("must be 1-64 characters"), "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn gavmo_tool_ids_are_reserved() {
+    fn invalid_values_are_reported_where_they_are() {
         assert_eq!(
             error(&tool("gavmo_ping", BEARER)),
-            "tool id \"gavmo_ping\" is reserved (ids starting with gavmo_ are GAVMO's own) at line 2, column 3"
+            "tool id \"gavmo_ping\" is not allowed: ids starting with gavmo_ are reserved for GAVMO's own tools at line 2, column 3"
         );
-    }
-
-    #[test]
-    fn secret_names_are_restricted() {
-        for bad in ["\"a\\x1fb\"", "\"a b\"", "\"\"", &"x".repeat(129)] {
-            let err = error(&tool(
+        assert_eq!(
+            error(&tool("t", "    auth: bearer\n    secret: \"a b\"\n")),
+            "secret name \"a b\" contains ' ' (allowed: A-Z, a-z, 0-9, _, - and .) at line 6, column 13"
+        );
+        assert_eq!(
+            error(&tool(
                 "t",
-                &format!("    auth: bearer\n    secret: {bad}\n"),
-            ));
-            assert!(
-                err.contains("secret name") && err.contains("line 6"),
-                "{bad}: {err}"
-            );
-        }
-        let ok = tool("t", "    auth: bearer\n    secret: my.secret_name-2\n");
-        assert!(parse_config(&ok).is_ok());
-    }
-
-    #[test]
-    fn header_names_are_validated() {
-        for good in ["X-API-Key", "Authorization", "x!#$%&'*+.^_`|~"] {
-            assert!(parse_config(&header_auth(good)).is_ok(), "{good}");
-        }
-        for bad in ["X Bad", "X:Y", "Ünicode", "", &"x".repeat(129)] {
-            let err = error(&header_auth(bad));
-            assert!(
-                err.contains("is not a valid HTTP header name"),
-                "{bad:?}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn headers_that_control_the_request_are_refused() {
-        for bad in [
-            "Host",
-            "content-length",
-            "Transfer-Encoding",
-            "Cookie",
-            "Proxy-Authorization",
-            "Proxy-Foo",
-        ] {
-            let err = error(&header_auth(bad));
-            assert!(err.contains("can't carry a credential"), "{bad}: {err}");
-        }
+                "    auth: header\n    header_name: Host\n    secret: s\n"
+            )),
+            "header_name \"Host\" is not allowed: it controls the request itself and can't carry a credential at line 6, column 18"
+        );
     }
 
     #[test]
@@ -486,19 +282,10 @@ tools:
     }
 
     #[test]
-    fn header_names_compare_case_insensitively_but_display_as_written() {
-        let name = |s: &str| HeaderName::new(s.to_owned()).unwrap();
-        assert_eq!(name("X-API-Key"), name("x-api-key"));
-        assert_ne!(name("X-API-Key"), name("X-Other"));
-        assert_eq!(name("X-API-Key").to_string(), "X-API-Key");
-    }
-
-    #[test]
     fn auth_scheme_is_the_yaml_value() {
-        let header = Auth::Header(HeaderName::new("X-Key".to_owned()).unwrap());
         assert_eq!(Auth::Basic.scheme(), "basic");
         assert_eq!(Auth::Bearer.scheme(), "bearer");
-        assert_eq!(header.scheme(), "header");
+        assert_eq!(Auth::Header(header_name("X-Key")).scheme(), "header");
     }
 
     #[test]

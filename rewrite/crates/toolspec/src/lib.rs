@@ -4,10 +4,16 @@
 //! ([`BaseUrl::lock`]).
 
 mod base_url;
+mod header_name;
 mod schema;
+mod secret_name;
+mod tool_id;
 
 pub use base_url::{BaseUrl, BaseUrlError, HostLockError};
-pub use schema::{Auth, GavmoConfig, HeaderName, SecretName, ToolDef, ToolId, ToolKind};
+pub use header_name::HeaderName;
+pub use schema::{Auth, GavmoConfig, ToolDef, ToolKind};
+pub use secret_name::SecretName;
+pub use tool_id::ToolId;
 
 /// A `gavmo.yaml` that isn't valid YAML, doesn't match the schema, fails a
 /// check, or goes over a parser budget. The message is one line, with the

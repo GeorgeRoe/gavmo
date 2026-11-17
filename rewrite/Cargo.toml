@@ -14,7 +14,11 @@ rust-version = "1.98"
 # Only dependencies used by two or more crates, plus the internal crates.
 # Members opt in with `foo.workspace = true` and may add features.
 [workspace.dependencies]
+serde = "1"
+thiserror = "2"
+
 toolspec = { path = "crates/toolspec" }
+validated = { path = "crates/validated" }
 
 [workspace.lints.rust]
 # `deny`, not `forbid`, so a reviewed use can opt out locally with
