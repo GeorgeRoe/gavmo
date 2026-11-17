@@ -7,7 +7,7 @@
 
 use std::marker::PhantomData;
 
-use crate::{Problem, Rule};
+use crate::Rule;
 
 /// The characters [`Chars`] allows.
 pub trait CharSet {
@@ -46,37 +46,34 @@ pub struct NotPrefixed<S>(PhantomData<fn() -> S>);
 pub struct Named<L, R>(PhantomData<fn() -> (L, R)>);
 
 impl<const MIN: usize, const MAX: usize> Rule for Len<MIN, MAX> {
-    fn check(value: &str) -> Result<(), Problem> {
+    fn check(value: &str) -> Result<(), String> {
         // Stop counting past MAX: the value may be long and untrusted.
         let len = value.chars().take(MAX.saturating_add(1)).count();
         if len > MAX {
-            Err(Problem::TooLong { max: MAX })
+            Err(format!("is longer than {MAX} characters"))
         } else if len >= MIN {
             Ok(())
         } else if len == 0 {
-            Err(Problem::Empty)
+            Err("must not be empty".to_owned())
         } else {
-            Err(Problem::TooShort { min: MIN })
+            Err(format!("is shorter than {MIN} characters"))
         }
     }
 }
 
 impl<C: CharSet> Rule for Chars<C> {
-    fn check(value: &str) -> Result<(), Problem> {
+    fn check(value: &str) -> Result<(), String> {
         match value.chars().find(|&c| !C::contains(c)) {
-            Some(ch) => Err(Problem::BadChar {
-                ch,
-                allowed: C::ALLOWED,
-            }),
+            Some(c) => Err(format!("contains {c:?} (allowed: {})", C::ALLOWED)),
             None => Ok(()),
         }
     }
 }
 
 impl<S: Strings> Rule for NoneOf<S> {
-    fn check(value: &str) -> Result<(), Problem> {
+    fn check(value: &str) -> Result<(), String> {
         if S::LIST.iter().any(|s| s.eq_ignore_ascii_case(value)) {
-            Err(Problem::NotAllowed { reason: S::REASON })
+            Err(format!("is not allowed: {}", S::REASON))
         } else {
             Ok(())
         }
@@ -84,14 +81,14 @@ impl<S: Strings> Rule for NoneOf<S> {
 }
 
 impl<S: Strings> Rule for NotPrefixed<S> {
-    fn check(value: &str) -> Result<(), Problem> {
+    fn check(value: &str) -> Result<(), String> {
         let has_prefix = |prefix: &str| {
             value
                 .get(..prefix.len())
                 .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
         };
         if S::LIST.iter().copied().any(has_prefix) {
-            Err(Problem::NotAllowed { reason: S::REASON })
+            Err(format!("is not allowed: {}", S::REASON))
         } else {
             Ok(())
         }
@@ -101,7 +98,7 @@ impl<S: Strings> Rule for NotPrefixed<S> {
 impl<L: Label, R: Rule> Rule for Named<L, R> {
     const SUBJECT: &'static str = L::NAME;
 
-    fn check(value: &str) -> Result<(), Problem> {
+    fn check(value: &str) -> Result<(), String> {
         R::check(value)
     }
 }
@@ -110,7 +107,7 @@ impl<L: Label, R: Rule> Rule for Named<L, R> {
 macro_rules! all_of {
     ($($rule:ident),+) => {
         impl<$($rule: Rule),+> Rule for ($($rule,)+) {
-            fn check(value: &str) -> Result<(), Problem> {
+            fn check(value: &str) -> Result<(), String> {
                 $($rule::check(value)?;)+
                 Ok(())
             }
@@ -148,60 +145,62 @@ mod tests {
         const NAME: &'static str = "PIN";
     }
 
-    fn check<R: Rule>(value: &str) -> Result<(), Problem> {
-        R::check(value)
+    fn passes<R: Rule>(value: &str) -> bool {
+        R::check(value).is_ok()
+    }
+
+    fn problem<R: Rule>(value: &str) -> String {
+        R::check(value).unwrap_err()
     }
 
     #[test]
     fn len_counts_characters_inclusively() {
         type L = Len<2, 4>;
-        assert_eq!(check::<L>(""), Err(Problem::Empty));
-        assert_eq!(check::<L>("a"), Err(Problem::TooShort { min: 2 }));
-        assert_eq!(check::<L>("ab"), Ok(()));
-        assert_eq!(check::<L>("abcd"), Ok(()));
-        assert_eq!(check::<L>("éééé"), Ok(()), "characters, not bytes");
-        assert_eq!(check::<L>("abcde"), Err(Problem::TooLong { max: 4 }));
-        assert_eq!(check::<Len<0, 1>>(""), Ok(()));
-        assert_eq!(check::<Len<0, { usize::MAX }>>("anything"), Ok(()));
+        assert_eq!(problem::<L>(""), "must not be empty");
+        assert_eq!(problem::<L>("a"), "is shorter than 2 characters");
+        assert!(passes::<L>("ab"));
+        assert!(passes::<L>("abcd"));
+        assert!(passes::<L>("éééé"), "characters, not bytes");
+        assert_eq!(problem::<L>("abcde"), "is longer than 4 characters");
+        assert!(passes::<Len<0, 1>>(""));
+        assert!(passes::<Len<0, { usize::MAX }>>("anything"));
     }
 
     #[test]
     fn chars_reports_the_first_character_not_in_the_set() {
-        assert_eq!(check::<Chars<Digits>>("0123"), Ok(()));
-        assert_eq!(check::<Chars<Digits>>(""), Ok(()));
+        assert!(passes::<Chars<Digits>>("0123"));
+        assert!(passes::<Chars<Digits>>(""));
         assert_eq!(
-            check::<Chars<Digits>>("12a b"),
-            Err(Problem::BadChar {
-                ch: 'a',
-                allowed: "0-9"
-            })
+            problem::<Chars<Digits>>("12a b"),
+            "contains 'a' (allowed: 0-9)"
         );
     }
 
     #[test]
     fn none_of_ignores_ascii_case() {
-        let refused = Err(Problem::NotAllowed {
-            reason: "colours are taken",
-        });
-        assert_eq!(check::<NoneOf<Colours>>("RED"), refused);
-        assert_eq!(check::<NoneOf<Colours>>("green"), refused);
-        assert_eq!(check::<NoneOf<Colours>>("reddish"), Ok(()));
-        assert_eq!(check::<NoneOf<Colours>>("blue"), Ok(()));
+        for refused in ["RED", "green"] {
+            assert_eq!(
+                problem::<NoneOf<Colours>>(refused),
+                "is not allowed: colours are taken"
+            );
+        }
+        assert!(passes::<NoneOf<Colours>>("reddish"));
+        assert!(passes::<NoneOf<Colours>>("blue"));
     }
 
     #[test]
     fn not_prefixed_ignores_ascii_case() {
-        let refused = Err(Problem::NotAllowed {
-            reason: "colours are taken",
-        });
-        assert_eq!(check::<NotPrefixed<Colours>>("reddish"), refused);
-        assert_eq!(check::<NotPrefixed<Colours>>("Green-ish"), refused);
-        assert_eq!(check::<NotPrefixed<Colours>>("red"), refused);
-        assert_eq!(check::<NotPrefixed<Colours>>("re"), Ok(()));
-        assert_eq!(check::<NotPrefixed<Colours>>("bored"), Ok(()));
+        for refused in ["reddish", "Green-ish", "red"] {
+            assert_eq!(
+                problem::<NotPrefixed<Colours>>(refused),
+                "is not allowed: colours are taken"
+            );
+        }
+        assert!(passes::<NotPrefixed<Colours>>("re"));
+        assert!(passes::<NotPrefixed<Colours>>("bored"));
         // A multi-byte character where the prefix would end is no panic.
-        assert_eq!(check::<NotPrefixed<Colours>>("ré"), Ok(()));
-        assert_eq!(check::<NotPrefixed<Colours>>("éé"), Ok(()));
+        assert!(passes::<NotPrefixed<Colours>>("ré"));
+        assert!(passes::<NotPrefixed<Colours>>("éé"));
     }
 
     #[test]
@@ -217,12 +216,12 @@ mod tests {
             Chars<Digits>,
         );
 
-        assert_eq!(check::<Pin>("1234"), Ok(()));
-        assert_eq!(check::<Pin>("12a"), Err(Problem::TooShort { min: 4 }));
-        assert!(matches!(check::<Pin>("12a4"), Err(Problem::BadChar { .. })));
-        assert_eq!(check::<One>("1"), Ok(()));
-        assert_eq!(check::<Six>("123"), Ok(()));
-        assert_eq!(check::<Six>(""), Err(Problem::Empty));
+        assert!(passes::<Pin>("1234"));
+        assert_eq!(problem::<Pin>("12a"), "is shorter than 4 characters");
+        assert_eq!(problem::<Pin>("12a4"), "contains 'a' (allowed: 0-9)");
+        assert!(passes::<One>("1"));
+        assert!(passes::<Six>("123"));
+        assert_eq!(problem::<Six>(""), "must not be empty");
     }
 
     #[test]

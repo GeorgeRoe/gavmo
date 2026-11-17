@@ -47,22 +47,9 @@ pub trait Rule {
     /// What the value is called in error messages. Set with [`Named`].
     const SUBJECT: &'static str = "value";
 
-    fn check(value: &str) -> Result<(), Problem>;
-}
-
-/// What a [`Rule`] found wrong. Phrased to follow the value in a message.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum Problem {
-    #[error("must not be empty")]
-    Empty,
-    #[error("is shorter than {min} characters")]
-    TooShort { min: usize },
-    #[error("is longer than {max} characters")]
-    TooLong { max: usize },
-    #[error("contains {ch:?} (allowed: {allowed})")]
-    BadChar { ch: char, allowed: &'static str },
-    #[error("is not allowed: {reason}")]
-    NotAllowed { reason: &'static str },
+    /// On failure, what's wrong, phrased to follow the value in a sentence:
+    /// `"is longer than 64 characters"`.
+    fn check(value: &str) -> Result<(), String>;
 }
 
 /// A value that failed its rule, e.g. `tool id "a b" contains ' ' (allowed: ...)`.
@@ -71,7 +58,7 @@ pub enum Problem {
 pub struct Invalid {
     pub subject: &'static str,
     pub value: String,
-    pub problem: Problem,
+    pub problem: String,
 }
 
 /// A `T` that has passed rule `R`. Read-only: it derefs to `T`, and the only
@@ -190,9 +177,9 @@ mod tests {
     /// Accepts anything except "bad".
     struct NotBad;
     impl Rule for NotBad {
-        fn check(value: &str) -> Result<(), Problem> {
+        fn check(value: &str) -> Result<(), String> {
             if value == "bad" {
-                Err(Problem::NotAllowed { reason: "it's bad" })
+                Err("is not allowed: it's bad".to_owned())
             } else {
                 Ok(())
             }
@@ -221,7 +208,7 @@ mod tests {
             Invalid {
                 subject: "value",
                 value: "bad".to_owned(),
-                problem: Problem::NotAllowed { reason: "it's bad" },
+                problem: "is not allowed: it's bad".to_owned(),
             }
         );
         assert_eq!(err.to_string(), "value \"bad\" is not allowed: it's bad");
@@ -263,24 +250,5 @@ mod tests {
         let map = BTreeMap::from([(checked("key"), 1)]);
         assert_eq!(map.get("key"), Some(&1));
         assert_eq!(map["key"], 1);
-    }
-
-    #[test]
-    fn problems_read_as_the_end_of_a_sentence() {
-        for (problem, want) in [
-            (Problem::Empty, "must not be empty"),
-            (Problem::TooShort { min: 3 }, "is shorter than 3 characters"),
-            (Problem::TooLong { max: 9 }, "is longer than 9 characters"),
-            (
-                Problem::BadChar {
-                    ch: ' ',
-                    allowed: "a-z",
-                },
-                "contains ' ' (allowed: a-z)",
-            ),
-            (Problem::NotAllowed { reason: "why" }, "is not allowed: why"),
-        ] {
-            assert_eq!(problem.to_string(), want);
-        }
     }
 }
