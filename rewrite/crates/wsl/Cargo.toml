@@ -1,0 +1,20 @@
+[package]
+name = "wsl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# PowerShell's -EncodedCommand is base64 of UTF-16LE.
+base64.workspace = true
+thiserror.workspace = true
+# A script's output may be key material: it is wiped when dropped.
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

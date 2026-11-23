@@ -14,14 +14,18 @@ rust-version = "1.98"
 # Only dependencies used by two or more crates, plus the internal crates.
 # Members opt in with `foo.workspace = true` and may add features.
 [workspace.dependencies]
+base64 = "0.23"
 serde = "1"
 # private_fs's atomic writes; most crates' tests, for scratch directories.
 tempfile = "3"
 thiserror = "2"
+# Wipes key material and secrets from memory when dropped.
+zeroize = "1"
 
 private_fs = { path = "crates/private_fs" }
 toolspec = { path = "crates/toolspec" }
 validated = { path = "crates/validated" }
+wsl = { path = "crates/wsl" }
 
 [workspace.lints.rust]
 # `deny`, not `forbid`, so a reviewed use can opt out locally with
