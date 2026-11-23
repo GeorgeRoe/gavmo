@@ -15,8 +15,11 @@ rust-version = "1.98"
 # Members opt in with `foo.workspace = true` and may add features.
 [workspace.dependencies]
 serde = "1"
+# private_fs's atomic writes; most crates' tests, for scratch directories.
+tempfile = "3"
 thiserror = "2"
 
+private_fs = { path = "crates/private_fs" }
 toolspec = { path = "crates/toolspec" }
 validated = { path = "crates/validated" }
 
