@@ -1,9 +1,9 @@
-//! The building blocks rules are made of. None of them is ever constructed:
-//! they only exist as type parameters.
+//! Rules for strings. Each works on anything that is `AsRef<str>`, so the
+//! same rule checks a `String`, a `&str` or a `Box<str>`.
 //!
-//! Strings can't be type parameters, so the data a block needs (a character
-//! set, a list, a name) comes from a small marker type implementing
-//! [`CharSet`], [`Strings`] or [`Label`].
+//! Strings can't be type parameters, so the data a rule needs (a character
+//! set, a list) comes from a small marker type implementing [`CharSet`] or
+//! [`Strings`].
 
 use std::marker::PhantomData;
 
@@ -25,11 +25,6 @@ pub trait Strings {
     const REASON: &'static str;
 }
 
-/// What a value is called in error messages; see [`Named`].
-pub trait Label {
-    const NAME: &'static str;
-}
-
 /// Between `MIN` and `MAX` characters long, inclusive.
 pub struct Len<const MIN: usize, const MAX: usize>;
 
@@ -42,13 +37,13 @@ pub struct NoneOf<S>(PhantomData<fn() -> S>);
 /// Not starting with any of `S`'s strings, ignoring ASCII case.
 pub struct NotPrefixed<S>(PhantomData<fn() -> S>);
 
-/// Rule `R`, with errors calling the value `L::NAME`.
-pub struct Named<L, R>(PhantomData<fn() -> (L, R)>);
-
-impl<const MIN: usize, const MAX: usize> Rule for Len<MIN, MAX> {
-    fn check(value: &str) -> Result<(), String> {
+impl<V, const MIN: usize, const MAX: usize> Rule<V> for Len<MIN, MAX>
+where
+    V: AsRef<str> + ?Sized,
+{
+    fn check(value: &V) -> Result<(), String> {
         // Stop counting past MAX: the value may be long and untrusted.
-        let len = value.chars().take(MAX.saturating_add(1)).count();
+        let len = value.as_ref().chars().take(MAX.saturating_add(1)).count();
         if len > MAX {
             Err(format!("is longer than {MAX} characters"))
         } else if len >= MIN {
@@ -61,17 +56,18 @@ impl<const MIN: usize, const MAX: usize> Rule for Len<MIN, MAX> {
     }
 }
 
-impl<C: CharSet> Rule for Chars<C> {
-    fn check(value: &str) -> Result<(), String> {
-        match value.chars().find(|&c| !C::contains(c)) {
+impl<V: AsRef<str> + ?Sized, C: CharSet> Rule<V> for Chars<C> {
+    fn check(value: &V) -> Result<(), String> {
+        match value.as_ref().chars().find(|&c| !C::contains(c)) {
             Some(c) => Err(format!("contains {c:?} (allowed: {})", C::ALLOWED)),
             None => Ok(()),
         }
     }
 }
 
-impl<S: Strings> Rule for NoneOf<S> {
-    fn check(value: &str) -> Result<(), String> {
+impl<V: AsRef<str> + ?Sized, S: Strings> Rule<V> for NoneOf<S> {
+    fn check(value: &V) -> Result<(), String> {
+        let value = value.as_ref();
         if S::LIST.iter().any(|s| s.eq_ignore_ascii_case(value)) {
             Err(format!("is not allowed: {}", S::REASON))
         } else {
@@ -80,8 +76,9 @@ impl<S: Strings> Rule for NoneOf<S> {
     }
 }
 
-impl<S: Strings> Rule for NotPrefixed<S> {
-    fn check(value: &str) -> Result<(), String> {
+impl<V: AsRef<str> + ?Sized, S: Strings> Rule<V> for NotPrefixed<S> {
+    fn check(value: &V) -> Result<(), String> {
+        let value = value.as_ref();
         let has_prefix = |prefix: &str| {
             value
                 .get(..prefix.len())
@@ -95,36 +92,10 @@ impl<S: Strings> Rule for NotPrefixed<S> {
     }
 }
 
-impl<L: Label, R: Rule> Rule for Named<L, R> {
-    const SUBJECT: &'static str = L::NAME;
-
-    fn check(value: &str) -> Result<(), String> {
-        R::check(value)
-    }
-}
-
-/// `(A, B, ...)`: every rule must pass, checked left to right.
-macro_rules! all_of {
-    ($($rule:ident),+) => {
-        impl<$($rule: Rule),+> Rule for ($($rule,)+) {
-            fn check(value: &str) -> Result<(), String> {
-                $($rule::check(value)?;)+
-                Ok(())
-            }
-        }
-    };
-}
-all_of!(A);
-all_of!(A, B);
-all_of!(A, B, C);
-all_of!(A, B, C, D);
-all_of!(A, B, C, D, E);
-all_of!(A, B, C, D, E, F);
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Validated;
+    use crate::{Label, Named, Validated};
 
     struct Digits;
     impl CharSet for Digits {
@@ -140,16 +111,11 @@ mod tests {
         const REASON: &'static str = "colours are taken";
     }
 
-    struct PinLabel;
-    impl Label for PinLabel {
-        const NAME: &'static str = "PIN";
-    }
-
-    fn passes<R: Rule>(value: &str) -> bool {
+    fn passes<R: Rule<str>>(value: &str) -> bool {
         R::check(value).is_ok()
     }
 
-    fn problem<R: Rule>(value: &str) -> String {
+    fn problem<R: Rule<str>>(value: &str) -> String {
         R::check(value).unwrap_err()
     }
 
@@ -204,40 +170,21 @@ mod tests {
     }
 
     #[test]
-    fn tuples_check_left_to_right_and_stop_at_the_first_failure() {
-        type Pin = (Len<4, 4>, Chars<Digits>);
-        type One = (Chars<Digits>,);
-        type Six = (
-            Len<1, 9>,
-            Chars<Digits>,
-            NoneOf<Colours>,
-            NotPrefixed<Colours>,
-            Len<0, 9>,
-            Chars<Digits>,
-        );
+    fn work_on_any_string_type() {
+        struct PinLabel;
+        impl Label for PinLabel {
+            const NAME: &'static str = "PIN";
+        }
+        type Rules = Named<PinLabel, (Len<4, 4>, Chars<Digits>)>;
 
-        assert!(passes::<Pin>("1234"));
-        assert_eq!(problem::<Pin>("12a"), "is shorter than 4 characters");
-        assert_eq!(problem::<Pin>("12a4"), "contains 'a' (allowed: 0-9)");
-        assert!(passes::<One>("1"));
-        assert!(passes::<Six>("123"));
-        assert_eq!(problem::<Six>(""), "must not be empty");
-    }
-
-    #[test]
-    fn named_sets_the_subject_of_errors() {
-        type Pin = Validated<String, Named<PinLabel, (Len<4, 4>, Chars<Digits>)>>;
-        assert!(Pin::new("1234".to_owned()).is_ok());
+        assert!(Validated::<String, Rules>::new("1234".to_owned()).is_ok());
+        assert!(Validated::<&str, Rules>::new("1234").is_ok());
+        assert!(Validated::<Box<str>, Rules>::new("1234".into()).is_ok());
         assert_eq!(
-            Pin::new("12x4".to_owned()).unwrap_err().to_string(),
-            "PIN \"12x4\" contains 'x' (allowed: 0-9)"
-        );
-        assert_eq!(
-            Validated::<String, Len<1, 2>>::new(String::new())
+            Validated::<&str, Rules>::new("12x4")
                 .unwrap_err()
-                .subject,
-            "value",
-            "unnamed rules call it a value"
+                .to_string(),
+            "PIN \"12x4\" contains 'x' (allowed: 0-9)"
         );
     }
 }

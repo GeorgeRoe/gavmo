@@ -1,10 +1,10 @@
-//! Strings that are checked once, when created, against a [`Rule`] chosen by
+//! Values that are checked once, when created, against a [`Rule`] chosen by
 //! type parameter, so holding a value means it passed.
 //!
 //! Rules are built from small parts, for example:
 //!
 //! ```
-//! use validated::{CharSet, Chars, Label, Len, Named, Validated};
+//! use validated::{CharSet, Chars, InRange, Label, Len, Named, Validated};
 //!
 //! struct Lowercase;
 //! impl CharSet for Lowercase {
@@ -20,15 +20,25 @@
 //! }
 //!
 //! type Username = Validated<String, Named<UsernameLabel, (Len<1, 16>, Chars<Lowercase>)>>;
+//! type Percent = Validated<u8, InRange<0, 100>>;
 //!
 //! assert!(Username::new("george".to_owned()).is_ok());
 //! assert_eq!(
 //!     Username::new("George".to_owned()).unwrap_err().to_string(),
 //!     "username \"George\" contains 'G' (allowed: a-z)"
 //! );
+//! assert_eq!(
+//!     Percent::new(101).unwrap_err().to_string(),
+//!     "value 101 is greater than 100"
+//! );
 //! ```
+//!
+//! A rule of your own implements [`Rule`] for the types it can check; for
+//! strings, usually every `S: AsRef<str>`, so it works on `String` and `&str`.
 
-mod rules;
+mod combine;
+mod numbers;
+mod strings;
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -39,24 +49,27 @@ use std::ops::Deref;
 
 use serde::{Deserialize, Deserializer};
 
-pub use rules::{CharSet, Chars, Label, Len, Named, NoneOf, NotPrefixed, Strings};
+pub use combine::{Label, Named};
+pub use numbers::InRange;
+pub use strings::{CharSet, Chars, Len, NoneOf, NotPrefixed, Strings};
 
-/// A check on a string. Tuples of rules are rules too: every one must pass,
+/// A check on a `T`. Tuples of rules are rules too: every one must pass,
 /// checked left to right, and the first failure is reported.
-pub trait Rule {
+pub trait Rule<T: ?Sized> {
     /// What the value is called in error messages. Set with [`Named`].
     const SUBJECT: &'static str = "value";
 
     /// On failure, what's wrong, phrased to follow the value in a sentence:
     /// `"is longer than 64 characters"`.
-    fn check(value: &str) -> Result<(), String>;
+    fn check(value: &T) -> Result<(), String>;
 }
 
 /// A value that failed its rule, e.g. `tool id "a b" contains ' ' (allowed: ...)`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{subject} {value:?} {problem}")]
+#[error("{subject} {value} {problem}")]
 pub struct Invalid {
     pub subject: &'static str,
+    /// The value as `{:?}` shows it: strings quoted, numbers plain.
     pub value: String,
     pub problem: String,
 }
@@ -71,16 +84,16 @@ pub struct Validated<T, R> {
     rule: PhantomData<fn() -> R>,
 }
 
-impl<T: AsRef<str>, R: Rule> Validated<T, R> {
+impl<T: fmt::Debug, R: Rule<T>> Validated<T, R> {
     pub fn new(value: T) -> Result<Self, Invalid> {
-        match R::check(value.as_ref()) {
+        match R::check(&value) {
             Ok(()) => Ok(Self {
                 value,
                 rule: PhantomData,
             }),
             Err(problem) => Err(Invalid {
                 subject: R::SUBJECT,
-                value: value.as_ref().to_owned(),
+                value: format!("{value:?}"),
                 problem,
             }),
         }
@@ -110,8 +123,8 @@ impl<T: Borrow<str>, R> Borrow<str> for Validated<T, R> {
 
 impl<'de, T, R> Deserialize<'de> for Validated<T, R>
 where
-    T: Deserialize<'de> + AsRef<str>,
-    R: Rule,
+    T: Deserialize<'de> + fmt::Debug,
+    R: Rule<T>,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Self::new(T::deserialize(deserializer)?).map_err(serde::de::Error::custom)
@@ -170,18 +183,30 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use serde::de::IntoDeserializer;
-    use serde::de::value::{Error as DeError, StrDeserializer};
+    use serde::de::value::{Error as DeError, StrDeserializer, U32Deserializer};
 
     use super::*;
 
-    /// Accepts anything except "bad".
+    /// Accepts any string except "bad".
     struct NotBad;
-    impl Rule for NotBad {
-        fn check(value: &str) -> Result<(), String> {
-            if value == "bad" {
+    impl<S: AsRef<str> + ?Sized> Rule<S> for NotBad {
+        fn check(value: &S) -> Result<(), String> {
+            if value.as_ref() == "bad" {
                 Err("is not allowed: it's bad".to_owned())
             } else {
                 Ok(())
+            }
+        }
+    }
+
+    /// Accepts even numbers.
+    struct Even;
+    impl Rule<u32> for Even {
+        fn check(value: &u32) -> Result<(), String> {
+            if value.is_multiple_of(2) {
+                Ok(())
+            } else {
+                Err("is odd".to_owned())
             }
         }
     }
@@ -207,7 +232,7 @@ mod tests {
             err,
             Invalid {
                 subject: "value",
-                value: "bad".to_owned(),
+                value: "\"bad\"".to_owned(),
                 problem: "is not allowed: it's bad".to_owned(),
             }
         );
@@ -221,12 +246,30 @@ mod tests {
     }
 
     #[test]
+    fn works_over_any_type_with_a_rule() {
+        assert_eq!(*Validated::<u32, Even>::new(4).unwrap(), 4);
+        assert_eq!(
+            Validated::<u32, Even>::new(3).unwrap_err().to_string(),
+            "value 3 is odd"
+        );
+    }
+
+    #[test]
     fn deserializing_checks_the_rule() {
         let de = |s: &'static str| -> StrDeserializer<'static, DeError> { s.into_deserializer() };
         assert_eq!(Checked::deserialize(de("good")).unwrap(), checked("good"));
         assert_eq!(
             Checked::deserialize(de("bad")).unwrap_err().to_string(),
             "value \"bad\" is not allowed: it's bad"
+        );
+
+        let de = |n: u32| -> U32Deserializer<DeError> { n.into_deserializer() };
+        assert_eq!(*Validated::<u32, Even>::deserialize(de(2)).unwrap(), 2);
+        assert_eq!(
+            Validated::<u32, Even>::deserialize(de(1))
+                .unwrap_err()
+                .to_string(),
+            "value 1 is odd"
         );
     }
 
