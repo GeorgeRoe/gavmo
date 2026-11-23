@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# Crates are listed, not globbed: a folder of crates (one trait and its
+# implementations, e.g. `crates/keystore/`) isn't a crate itself, which
+# `crates/*` would require. Each such folder gets its own glob.
+members = [
+    "crates/private_fs",
+    "crates/toolspec",
+    "crates/validated",
+    "crates/wsl",
+    "crates/keystore/*",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,6 +31,7 @@ thiserror = "2"
 # Wipes key material and secrets from memory when dropped.
 zeroize = "1"
 
+keystore = { path = "crates/keystore/keystore" }
 private_fs = { path = "crates/private_fs" }
 toolspec = { path = "crates/toolspec" }
 validated = { path = "crates/validated" }
