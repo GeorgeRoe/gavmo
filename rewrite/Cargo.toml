@@ -5,6 +5,7 @@ resolver = "3"
 # `crates/*` would require. Each such folder gets its own glob.
 members = [
     "crates/private_fs",
+    "crates/secrets",
     "crates/toolspec",
     "crates/validated",
     "crates/wsl",
@@ -35,6 +36,7 @@ keystore = { path = "crates/keystore/keystore" }
 keystore-secret-service = { path = "crates/keystore/keystore-secret-service" }
 keystore-wsl = { path = "crates/keystore/keystore-wsl" }
 private_fs = { path = "crates/private_fs" }
+secrets = { path = "crates/secrets" }
 toolspec = { path = "crates/toolspec" }
 validated = { path = "crates/validated" }
 wsl = { path = "crates/wsl" }
