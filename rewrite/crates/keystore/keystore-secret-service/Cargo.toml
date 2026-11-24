@@ -1,0 +1,28 @@
+[package]
+name = "keystore-secret-service"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Keyring values are strings; the key is stored base64-encoded.
+base64.workspace = true
+keystore.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+# keyring-core plus the one store used, as keyring 4 recommends over the
+# all-in-one `keyring` crate. Finds keys written by keyring 3: it searches
+# on `service` + `username` only, which keyring 3's items also carry.
+keyring-core = "1"
+# zbus: pure Rust, no C libdbus. `rt-async-io`, not tokio: zbus's tokio
+# `block_on` panics inside a tokio runtime. Rust crypto for the DH session.
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
+# Only to recognize its errors (the store above boxes them): no features of
+# its own, the store's are unified in.
+secret-service = "5"
