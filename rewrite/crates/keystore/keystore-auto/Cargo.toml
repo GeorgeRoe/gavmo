@@ -1,0 +1,21 @@
+[package]
+name = "keystore-auto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+keystore.workspace = true
+keystore-secret-service.workspace = true
+keystore-wsl.workspace = true
+private_fs.workspace = true
+thiserror.workspace = true
+wsl.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

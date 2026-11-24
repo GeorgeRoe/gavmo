@@ -717,6 +717,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "keystore-auto"
+version = "0.1.0"
+dependencies = [
+ "keystore",
+ "keystore-secret-service",
+ "keystore-wsl",
+ "private_fs",
+ "tempfile",
+ "thiserror",
+ "wsl",
+]
+
+[[package]]
 name = "keystore-secret-service"
 version = "0.1.0"
 dependencies = [
