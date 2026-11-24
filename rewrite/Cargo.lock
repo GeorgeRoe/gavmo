@@ -730,6 +730,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "keystore-wsl"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "keystore",
+ "private_fs",
+ "tempfile",
+ "thiserror",
+ "wsl",
+ "zeroize",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

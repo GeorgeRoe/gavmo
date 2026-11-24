@@ -1,0 +1,22 @@
+[package]
+name = "keystore-wsl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The key crosses to PowerShell, and the sealed blob is stored, as base64.
+base64.workspace = true
+keystore.workspace = true
+private_fs.workspace = true
+thiserror.workspace = true
+wsl.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

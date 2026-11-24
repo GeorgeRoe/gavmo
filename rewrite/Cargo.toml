@@ -32,6 +32,7 @@ thiserror = "2"
 zeroize = "1"
 
 keystore = { path = "crates/keystore/keystore" }
+keystore-wsl = { path = "crates/keystore/keystore-wsl" }
 private_fs = { path = "crates/private_fs" }
 toolspec = { path = "crates/toolspec" }
 validated = { path = "crates/validated" }
