@@ -1,0 +1,19 @@
+[package]
+name = "keystore"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+zeroize.workspace = true
+
+[features]
+# Exposes `MemoryKeystore`, an in-process keystore for other crates' tests.
+# Never enable outside dev-dependencies.
+test-util = []

@@ -1,0 +1,5 @@
+# `cargo test --target wasm32-unknown-unknown` runs the hydrate browser tests
+# through wasm-bindgen's runner, which drives headless Firefox via geckodriver
+# (both on PATH in this repo's gavmo.nix). See TESTING.md.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
