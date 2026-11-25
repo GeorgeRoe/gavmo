@@ -8,7 +8,8 @@ well as) a markdown report with screenshots:
 - full-screen title cards and on-screen chapter labels
 - a synthesized British voice-over ([Piper](https://github.com/OHF-Voice/piper1-gpl)),
   timed so each sentence plays while the matching thing happens on screen
-- a separate `.srt` subtitle file (nothing burned into the picture)
+- English subtitles inside the same `.mp4`, as a track viewers can switch on (off by
+  default, nothing burned into the picture)
 
 Everything runs inside the VM: no API keys, and the narration text never leaves it.
 
@@ -30,7 +31,7 @@ rest comes from the Nix cache) and downloads the voice (63 MB).
 
 Then ask the agent for a video, e.g. *"make a demo video of the new invoice flow"*. It
 explores the feature with the browser, writes a scene script, renders it, checks the
-frames and links `demo-videos/<name>.mp4` and `.srt` from its report.
+frames and links `demo-videos/<name>.mp4` from its report.
 
 To try it without your own app:
 
@@ -58,7 +59,9 @@ text and Playwright actions (see the skill's `SKILL.md` for the format). Then
    which is what keeps voice and picture together.
 3. **Assembles with ffmpeg.** Builds a constant-25-fps video from the captured frames,
    places each scene's narration at its start, evens out the volume (`loudnorm`), adds
-   chapters, and writes the `.srt` from the exact sentence timings.
+   chapters, and adds a subtitle track (`mov_text`) timed from the exact sentence
+   timings. ffmpeg always marks the first subtitle track in an MP4 as "enabled", which
+   players treat as "show by default", so `render.mjs` clears that flag afterwards.
 4. **Checks itself.** A 200 ms black flash at a logged time at each end is found again in
    the video (`blackdetect`) and used to line audio and picture up (then cut out). The
    render reports the measured sync, checks that speech starts where planned, and writes
@@ -115,6 +118,10 @@ Speed: the voice's natural pace is the default. `--length-scale 1.1` makes it 10
   runs longer.
 - **Licences:** Piper itself is GPL-3. It runs as a separate program, so this doesn't
   affect your code. The voice has its own licence (below).
+- **Subtitles need a desktop player.** VLC, QuickTime, Windows Media Player / Films &
+  TV and mpv let you switch the built-in subtitles on. Browser-based players (an
+  editor's markdown preview, a web page, Chrome or Firefox opened on the file) ignore
+  subtitle tracks inside an `.mp4`; the video and voice-over still play.
 - The default font for cards is DejaVu Sans (what the VM has).
 
 ## Troubleshooting

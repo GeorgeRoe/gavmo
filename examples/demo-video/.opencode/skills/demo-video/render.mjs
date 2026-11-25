@@ -13,14 +13,14 @@
 //   --storage-state <file> Playwright storageState JSON (signed-in session)
 //   --keep-work            keep the raw frames/audio in ~/.cache/demo-video/work/<name>
 //
-// Output: <out>/<name>.mp4 (H.264/AAC, chapters), <out>/<name>.srt, and
-//         <out>/<name>/ with contact.png, stills/ and report.json for checking.
+// Output: <out>/<name>.mp4 (H.264/AAC, chapters, English subtitle track, off by default),
+//         and <out>/<name>/ with contact.png, stills/ and report.json for checking.
 //
 // How it works: 1) narration for every scene is made first, so each scene's length is
 // known; 2) the scenes are replayed while page.screencast captures frames; each scene
 // runs its actions while its narration plays, then waits until the narration ends;
 // 3) ffmpeg builds the video from the frames, places each narration clip at its scene's
-// start, and writes subtitles and chapters. A short black flash at each end, logged and
+// start, and adds subtitles and chapters. A short black flash at each end, logged and
 // then found again in the video, lines audio and picture up (and is cut out).
 import fs from 'node:fs';
 import path from 'node:path';
@@ -299,6 +299,45 @@ function srtTime(s) {
   return `${p(Math.floor(ms / 3600000))}:${p(Math.floor(ms / 60000) % 60)}:${p(Math.floor(ms / 1000) % 60)},${p(ms % 1000, 3)}`;
 }
 
+// Turn the subtitle track off by default. ffmpeg's MP4 writer always sets the "enabled"
+// flag on the first subtitle track (movenc.c enable_tracks, whatever -disposition says),
+// and players read that as "show it". So clear bit 0x1 of the tkhd flags of every track
+// whose handler is 'sbtl' (mov_text): one byte changed in place, nothing moves.
+function disableSubtitleTracks(file) {
+  const buf = fs.readFileSync(file);
+  const boxes = (start, end) => {
+    const out = [];
+    for (let p = start; p + 8 <= end;) {
+      let size = buf.readUInt32BE(p), header = 8;
+      if (size === 1) { size = Number(buf.readBigUInt64BE(p + 8)); header = 16; }
+      else if (size === 0) size = end - p;
+      if (size < header || p + size > end) break;
+      out.push({ type: buf.toString('latin1', p + 4, p + 8), start: p, body: p + header, end: p + size });
+      p += size;
+    }
+    return out;
+  };
+  const child = (box, type) => boxes(box.body, box.end).find((b) => b.type === type);
+  const moov = boxes(0, buf.length).find((b) => b.type === 'moov');
+  const fd = fs.openSync(file, 'r+');
+  let patched = 0;
+  try {
+    for (const trak of moov ? boxes(moov.body, moov.end).filter((b) => b.type === 'trak') : []) {
+      const tkhd = child(trak, 'tkhd');
+      const mdia = child(trak, 'mdia');
+      const hdlr = mdia && child(mdia, 'hdlr');
+      // hdlr: version+flags (4), pre_defined (4), handler_type (4)
+      if (!tkhd || !hdlr || buf.toString('latin1', hdlr.body + 8, hdlr.body + 12) !== 'sbtl') continue;
+      const at = tkhd.body + 3; // tkhd: version (1), flags (3): lowest byte holds "enabled"
+      fs.writeSync(fd, Buffer.from([buf[at] & ~0x01]), 0, 1, at);
+      patched++;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return patched;
+}
+
 function assemble(tl, tts) {
   const { events, frames } = tl;
   const t0 = frames[0].ts;
@@ -338,11 +377,12 @@ function assemble(tl, tts) {
   fs.mkdirSync(OUT, { recursive: true });
   fs.mkdirSync(CHECK, { recursive: true });
 
-  // Subtitles: exact sentence times from the narration; long sentences split.
+  // Subtitles: exact sentence times from the narration; long sentences split. Only an
+  // input to ffmpeg, which stores them inside the .mp4 as a subtitle track.
   let n = 0;
   const srt = scenes.flatMap((s) => s.item.segments.flatMap(splitCue).map((g) =>
     `${++n}\n${srtTime(s.voiceAt + g.start)} --> ${srtTime(s.voiceAt + g.end)}\n${wrap(g.text)}\n`)).join('\n');
-  const srtFile = path.join(OUT, `${NAME}.srt`);
+  const srtFile = path.join(WORK, 'subtitles.srt');
   fs.writeFileSync(srtFile, srt);
 
   // Chapters.
@@ -364,17 +404,25 @@ function assemble(tl, tts) {
   });
   filters.push(`${scenes.map((_, k) => `[a${k}]`).join('')}amix=inputs=${scenes.length}:normalize=0:dropout_transition=0,` +
     'loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,apad[aout]');
+  // Subtitles go in as a switchable mov_text track (not burned into the picture).
+  const subIn = scenes.length + 2;
+  inputs.push('-i', srtFile);
   const mp4 = path.join(OUT, `${NAME}.mp4`);
   run('ffmpeg', ['-v', 'error', '-y', ...inputs, '-filter_complex', filters.join(';'),
-    '-map', '0:v', '-map', '[aout]', '-map_metadata', '1', '-map_chapters', '1',
+    '-map', '0:v', '-map', '[aout]', '-map', `${subIn}:s`, '-map_metadata', '1', '-map_chapters', '1',
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-r', String(FPS),
-    '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-t', duration.toFixed(3), '-movflags', '+faststart', mp4]);
+    '-c:a', 'aac', '-b:a', '160k', '-ar', '48000',
+    '-c:s', 'mov_text', '-metadata:s:s:0', 'language=eng', '-metadata:s:s:0', 'handler_name=English',
+    '-t', duration.toFixed(3), '-movflags', '+faststart', mp4]);
+  disableSubtitleTracks(mp4);
 
   // --- Checks ---------------------------------------------------------------------
   const probe = JSON.parse(run('ffprobe', ['-v', 'error', '-show_entries',
-    'stream=codec_type,duration:format=duration,size', '-of', 'json', mp4]));
+    'stream=codec_type,codec_name,duration:stream_disposition=default:stream_tags=language:format=duration,size',
+    '-of', 'json', mp4]));
   const vDur = Number(probe.streams.find((x) => x.codec_type === 'video').duration);
   const aDur = Number(probe.streams.find((x) => x.codec_type === 'audio').duration);
+  const subs = probe.streams.find((x) => x.codec_type === 'subtitle');
   const sd = spawnSync('ffmpeg', ['-hide_banner', '-i', mp4, '-vn', '-af', 'silencedetect=n=-40dB:d=0.25', '-f', 'null', '-'],
     { encoding: 'utf8', maxBuffer: 1 << 26 }).stderr;
   const onsets = [...sd.matchAll(/silence_end: ([\d.]+)/g)].map((m) => +m[1]);
@@ -404,11 +452,13 @@ function assemble(tl, tts) {
     ['every scene\'s narration starts within 100 ms of plan', voice.every((v) => Math.abs(v.errMs) < 100)],
     ['video and audio the same length (within 50 ms)', Math.abs(vDur - aDur) < 0.05],
     ['no scene\'s actions outlast its narration', tl.overruns.length === 0],
+    ['subtitles built in (mov_text, English)', subs?.codec_name === 'mov_text' && subs?.tags?.language === 'eng'],
+    ['subtitles off by default', subs?.disposition?.default === 0],
   ].map(([what, ok]) => ({ what, ok }));
 
   const report = {
     name: NAME, sceneFile, voice: opt.voice, lengthScale: opt['length-scale'] ?? null,
-    mp4, srt: srtFile, duration: +duration.toFixed(3), sizeBytes: Number(probe.format.size),
+    mp4, duration: +duration.toFixed(3), sizeBytes: Number(probe.format.size), subtitleCues: n,
     sync, voiceOnsetErrMs: voice, overruns: tl.overruns,
     scenes: scenes.map((s) => ({ id: s.id, start: +s.start.toFixed(2), end: +s.end.toFixed(2), narrationSec: +s.item.audioSec.toFixed(2) })),
     checks,
@@ -425,7 +475,6 @@ const report = assemble(tl, tts);
 if (!opt['keep-work']) fs.rmSync(WORK, { recursive: true, force: true });
 
 console.log(`\n${report.mp4}  (${report.duration.toFixed(1)} s, ${(report.sizeBytes / 1e6).toFixed(1)} MB)`);
-console.log(`${report.srt}`);
 console.log(`${path.join(CHECK, 'contact.png')}  <- look at this`);
 for (const c of report.checks) console.log(`  ${c.ok ? 'PASS' : 'WARN'}  ${c.what}`);
 if (report.overruns.length) console.log(`  overran: ${report.overruns.map((o) => `${o.id} +${o.seconds}s`).join(', ')} (lengthen its narration or trim its actions)`);

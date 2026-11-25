@@ -1,13 +1,14 @@
 ---
 name: demo-video
-description: Use when asked to make a demo video, screencast, walkthrough, tutorial video or narrated recording of a web app or feature, or to "show it working" on video. Produces a narrated 1080p .mp4 (animated cursor, click highlights, title cards, chapters, synthesized voice-over) plus an .srt, from a scripted replay in headless Chromium.
+description: Use when asked to make a demo video, screencast, walkthrough, tutorial video or narrated recording of a web app or feature, or to "show it working" on video. Produces a narrated 1080p .mp4 (animated cursor, click highlights, title cards, chapters, synthesized voice-over, built-in subtitles) from a scripted replay in headless Chromium.
 ---
 
 # Narrated demo videos
 
 Make a short "corporate tutorial" style video of a feature working: animated cursor,
 highlighted clicks, title cards, a voice-over that matches what's on screen, chapters,
-and a separate `.srt` subtitle file.
+and subtitles. Everything is in one `.mp4`: the subtitles are an English track
+inside it, off by default, which viewers can switch on in their player.
 
 **Don't record while driving the browser live** (`browser_start_video`): every pause
 between your tool calls ends up in the video as a frozen screen. Use the live browser
@@ -36,9 +37,12 @@ to *explore*, then write a scene script and let `render.mjs` replay it at a stea
    - *sync flashes not found / timing*: rerun; if it keeps happening, report it.
    - *a scene failed*: the error names the scene and writes `demo-videos/<name>/error.png`.
    Change the script and re-render until it's right. A render is cheap.
-5. **Deliver**: link `demo-videos/<name>.mp4` and `.srt` from your markdown report
-   and give the length. Don't commit the videos unless asked. They're build output, so
-   suggest adding `demo-videos/*.mp4` (or the folder) to `.gitignore`.
+5. **Deliver**: link `demo-videos/<name>.mp4` from your markdown report and give the
+   length. Mention that subtitles can be switched on in the player (desktop players
+   such as VLC, QuickTime, Windows Media Player and mpv; browser-based previews, e.g.
+   an editor's markdown preview, don't show them). Don't commit the videos unless
+   asked. They're build output, so suggest adding `demo-videos/*.mp4` (or the folder)
+   to `.gitignore`.
 
 ## Scene script
 
@@ -120,8 +124,9 @@ Never show or say credentials in a video. Sign in **before** recording:
 `render.mjs <scenes.mjs> [--name N] [--out DIR] [--voice model.onnx] [--length-scale X]
 [--gap S] [--width W --height H --fps F] [--storage-state FILE] [--keep-work]`
 
-- Output defaults to `demo-videos/` in the current directory: `<name>.mp4`, `<name>.srt`,
-  and `<name>/` (contact sheet, stills, `report.json`).
+- Output defaults to `demo-videos/` in the current directory: `<name>.mp4` (with
+  chapters and subtitles inside) and `<name>/` (contact sheet, stills, `report.json`).
+  To read the subtitles as text: `ffmpeg -i demo-videos/<name>.mp4 -map 0:s /tmp/<name>.srt`.
 - The voice comes from `$DEMO_VIDEO_PIPER_VOICE` (set in `gavmo.nix`). Its natural pace is
   the default; `--length-scale 1.1` is 10% slower. Viewers can speed playback up themselves.
 - Default 1920×1080 at 25 fps. Pages are shown at that viewport size and 100% zoom.
